@@ -15,11 +15,11 @@ CONTAINER_NAME="devbox"
 DOCKER_ARGS=(
     --rm -it
     --name "$CONTAINER_NAME"
-    --privileged
+    --cap-add=NET_ADMIN
+    --cap-add=NET_RAW
     # Persistent volumes
     -v devbox-bashhistory:/commandhistory
     -v devbox-claude-config:/home/node/.claude
-    -v devbox-docker:/var/lib/docker
     # SSH config only (no private keys)
     -v "$HOME/.ssh/config:/home/node/.ssh/config:ro"
     -v "$HOME/.ssh/known_hosts:/home/node/.ssh/known_hosts:ro"
@@ -62,4 +62,4 @@ fi
 
 echo "Starting devbox..."
 exec docker run "${DOCKER_ARGS[@]}" "$IMAGE" \
-    zsh -c 'sudo /usr/local/bin/init-firewall.sh && sudo dockerd &>/var/log/dockerd.log & /usr/local/bin/setup-chezmoi.sh && exec zsh'
+    zsh -c 'sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/setup-chezmoi.sh && exec zsh'

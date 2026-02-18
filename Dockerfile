@@ -15,13 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # User packages
     ncdu mc nala libfuse2 xauth xclip ripgrep fd-find \
     build-essential zsh-autosuggestions zsh-syntax-highlighting \
-    grc curl wget fuse-overlayfs \
+    grc curl wget \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && ln -s "$(which fdfind)" /usr/local/bin/fd
-
-# Docker CE (for Docker-in-Docker)
-RUN curl -fsSL https://get.docker.com | sh && \
-    usermod -aG docker node
 
 # =============================================================================
 # Layer 2: Binary installs (root)

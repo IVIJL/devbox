@@ -43,10 +43,7 @@ cat > /path/to/project/.devcontainer/devcontainer.json << 'EOF'
 {
   "name": "Devbox",
   "image": "vlcak/devbox:latest",
-  "runArgs": ["--privileged"],
-  "features": {
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
-  },
+  "runArgs": ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW"],
   "remoteUser": "node",
   "mounts": [
     "source=${localEnv:HOME}/.ssh/config,target=/home/node/.ssh/config,type=bind,readonly",
@@ -103,7 +100,6 @@ DEVBOX_EXTRA_DOMAINS="pypi.org,files.pythonhosted.org" ./docker-run.sh
 
 | Tool | Description |
 |---|---|
-| `docker` | Docker-in-Docker (containers inside devbox) |
 | `claude` | Claude Code CLI |
 | `nvim` | Neovim with LazyVim |
 | `git` + `delta` | Git with delta diff viewer |
@@ -162,40 +158,6 @@ This starts one `ssh-agent` per boot, shared across all terminals. Keys are adde
 | npiperelay (Windows agent bridge) | No | `socat` + `npiperelay.exe` | Medium |
 
 </details>
-
-## Docker-in-Docker
-
-Devbox includes Docker CE inside the container, so you can run containers within your dev environment. This is useful for running dev services (databases, web servers) in isolation while keeping them accessible from your host browser.
-
-### How it works
-
-- **Cursor/VS Code**: The devcontainer feature `docker-in-docker:2` handles starting dockerd automatically. Just use `docker` commands normally.
-- **docker-run.sh**: dockerd is started in the background on container launch. Docker data is persisted in the `devbox-docker` volume.
-
-### Port forwarding
-
-- **Cursor/VS Code**: Ports are forwarded automatically. VS Code detects listening ports and tunnels them to `localhost` on the host.
-- **docker-run.sh**: Add `-p` flags before the image name for port forwarding:
-  ```bash
-  # Edit docker-run.sh DOCKER_ARGS or pass ports manually:
-  docker run -p 3000:3000 -p 5432:5432 ...
-  ```
-
-### Example usage
-
-```bash
-# Inside devbox:
-docker run hello-world                          # verify DinD works
-docker run -d -p 5432:5432 postgres:16          # start a dev database
-docker compose up -d                            # start a full dev stack
-```
-
-### Security note
-
-DinD requires `--privileged` mode, which is a significant escalation from the previous `NET_ADMIN + NET_RAW` capabilities. This is acceptable because:
-- This is a local dev environment on WSL2
-- WSL2 itself provides a hypervisor boundary
-- The firewall script still works (privileged includes all capabilities)
 
 ## Dotfiles
 

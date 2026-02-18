@@ -5,8 +5,11 @@ set -euo pipefail
 # Devbox - Docker run convenience script
 # =============================================================================
 # Usage:
-#   ./docker-run.sh                        # standalone, persistent workspace volume
-#   ./docker-run.sh /path/to/project       # mount project as /workspace
+#   devbox                                  # mount current directory as /workspace
+#   devbox /path/to/project                 # mount project as /workspace
+#
+# Install globally:
+#   sudo ln -s /path/to/devbox/docker-run.sh /usr/local/bin/devbox
 # =============================================================================
 
 IMAGE="vlcak/devbox:latest"
@@ -15,11 +18,18 @@ CONTAINER_NAME="devbox"
 DOCKER_ARGS=(
     --rm -it
     --name "$CONTAINER_NAME"
+    --cap-add=SYS_ADMIN
     --cap-add=NET_ADMIN
     --cap-add=NET_RAW
+    --security-opt seccomp=unconfined
+    --security-opt apparmor=unconfined
+    --security-opt systempaths=unconfined
+    --device=/dev/net/tun
+    --device=/dev/fuse
     # Persistent volumes
     -v devbox-bashhistory:/commandhistory
     -v devbox-claude-config:/home/node/.claude
+    -v devbox-docker:/home/node/.local/share/docker
     # SSH config only (no private keys)
     -v "$HOME/.ssh/config:/home/node/.ssh/config:ro"
     -v "$HOME/.ssh/known_hosts:/home/node/.ssh/known_hosts:ro"
@@ -46,20 +56,15 @@ if [ -n "${DEVBOX_EXTRA_DOMAINS:-}" ]; then
     DOCKER_ARGS+=(-e "DEVBOX_EXTRA_DOMAINS=$DEVBOX_EXTRA_DOMAINS")
 fi
 
-# Workspace: project mount or named volume
-if [ -n "${1:-}" ]; then
-    PROJECT_PATH=$(realpath "$1")
-    if [ ! -d "$PROJECT_PATH" ]; then
-        echo "ERROR: Directory $PROJECT_PATH does not exist"
-        exit 1
-    fi
-    echo "Mounting project: $PROJECT_PATH -> /workspace"
-    DOCKER_ARGS+=(-v "$PROJECT_PATH:/workspace")
-else
-    echo "Standalone mode: using persistent workspace volume"
-    DOCKER_ARGS+=(-v devbox-workspace:/workspace)
+# Workspace: argument or current directory
+PROJECT_PATH=$(realpath "${1:-$PWD}")
+if [ ! -d "$PROJECT_PATH" ]; then
+    echo "ERROR: Directory $PROJECT_PATH does not exist"
+    exit 1
 fi
+echo "Mounting project: $PROJECT_PATH -> /workspace"
+DOCKER_ARGS+=(-v "$PROJECT_PATH:/workspace")
 
 echo "Starting devbox..."
 exec docker run "${DOCKER_ARGS[@]}" "$IMAGE" \
-    zsh -c 'sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/setup-chezmoi.sh && exec zsh'
+    zsh -c 'sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && exec zsh'

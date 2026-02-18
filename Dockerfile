@@ -12,10 +12,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Claude Code packages
     less git procps sudo fzf zsh man-db unzip gnupg2 gh \
     iptables ipset iproute2 dnsutils aggregate jq nano vim \
+    # Rootless Docker prerequisites
+    uidmap fuse-overlayfs slirp4netns \
     # User packages
     ncdu mc nala libfuse2 xauth xclip ripgrep fd-find \
     build-essential zsh-autosuggestions zsh-syntax-highlighting \
-    grc curl wget \
+    grc curl wget ca-certificates \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && ln -s "$(which fdfind)" /usr/local/bin/fd
 
@@ -49,7 +51,32 @@ RUN ARCH=$(dpkg --print-architecture) && \
     rm "eza_${EZA_ARCH}-unknown-linux-gnu.tar.gz"
 
 # =============================================================================
-# Layer 3: NPM/directories/env setup (root)
+# Layer 3: Docker CE (rootless)
+# =============================================================================
+RUN install -m 0755 -d /etc/apt/keyrings && \
+    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && \
+    chmod a+r /etc/apt/keyrings/docker.asc && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+    $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    docker-ce docker-ce-cli containerd.io \
+    docker-buildx-plugin docker-compose-plugin \
+    docker-ce-rootless-extras && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Rootless Docker: subordinate UID/GID mapping
+RUN echo "node:100000:65536" >> /etc/subuid && \
+    echo "node:100000:65536" >> /etc/subgid
+
+# Rootless Docker: runtime directories and config
+RUN mkdir -p /run/user/1000 && chown node:node /run/user/1000 && \
+    mkdir -p /home/node/.local/share/docker && chown -R node:node /home/node/.local && \
+    mkdir -p /home/node/.config/docker && \
+    echo '{"storage-driver": "fuse-overlayfs"}' > /home/node/.config/docker/daemon.json && \
+    chown -R node:node /home/node/.config
+
+# =============================================================================
+# Layer 4: NPM/directories/env setup (root)
 # =============================================================================
 RUN mkdir -p /usr/local/share/npm-global && \
     chown -R node:node /usr/local/share/npm-global
@@ -73,7 +100,7 @@ ENV TERM=xterm-256color
 WORKDIR /workspace
 
 # =============================================================================
-# Layer 4: User-level tools (as node)
+# Layer 5: User-level tools (as node)
 # =============================================================================
 USER node
 
@@ -129,23 +156,28 @@ RUN /home/node/.local/bin/uv tool install python-lsp-server \
     --with pylsp-mypy
 
 # =============================================================================
-# Layer 5: Firewall + scripts (root)
+# Layer 6: Firewall + scripts (root)
 # =============================================================================
 USER root
 
 COPY init-firewall.sh /usr/local/bin/
 COPY extra-domains.conf /usr/local/etc/devbox-extra-domains.conf
 COPY scripts/setup-chezmoi.sh /usr/local/bin/
+COPY scripts/n scripts/nx /usr/local/bin/
+COPY scripts/start-rootless-docker.sh /usr/local/bin/
 
-RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh && \
+RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
+    /usr/local/bin/n /usr/local/bin/nx /usr/local/bin/start-rootless-docker.sh && \
     echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/node-firewall && \
     chmod 0440 /etc/sudoers.d/node-firewall
 
 # =============================================================================
-# Layer 6: Final ENV
+# Layer 7: Final ENV
 # =============================================================================
 USER node
 
 ENV PATH="/home/node/.local/bin:/home/node/.cargo/bin:/home/node/.atuin/bin:$PATH"
 ENV EDITOR=nvim
 ENV VISUAL=nvim
+ENV XDG_RUNTIME_DIR=/run/user/1000
+ENV DOCKER_HOST=unix:///run/user/1000/docker.sock

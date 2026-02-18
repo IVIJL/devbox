@@ -12,19 +12,25 @@ docker build -t vlcak/devbox:latest .
 
 ### 2. Run standalone (terminal)
 
-```bash
-# Standalone with persistent workspace volume
-./docker-run.sh
+Install the `devbox` command globally:
 
-# Mount a project directory
-./docker-run.sh /path/to/project
+```bash
+sudo ln -s $(realpath docker-run.sh) /usr/local/bin/devbox
+```
+
+Then use it from any project directory:
+
+```bash
+cd ~/projects/my-app
+devbox                          # mounts current directory as /workspace
+devbox /path/to/other/project   # mount a specific directory
 ```
 
 Set `ANTHROPIC_API_KEY` before running:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-./docker-run.sh
+devbox
 ```
 
 ### 3. Use with Cursor / VS Code
@@ -43,13 +49,23 @@ cat > /path/to/project/.devcontainer/devcontainer.json << 'EOF'
 {
   "name": "Devbox",
   "image": "vlcak/devbox:latest",
-  "runArgs": ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW"],
+  "runArgs": [
+    "--security-opt", "seccomp=unconfined",
+    "--security-opt", "apparmor=unconfined",
+    "--security-opt", "systempaths=unconfined",
+    "--cap-add=SYS_ADMIN",
+    "--cap-add=NET_ADMIN",
+    "--cap-add=NET_RAW",
+    "--device=/dev/net/tun",
+    "--device=/dev/fuse"
+  ],
   "remoteUser": "node",
   "mounts": [
     "source=${localEnv:HOME}/.ssh/config,target=/home/node/.ssh/config,type=bind,readonly",
     "source=${localEnv:HOME}/.ssh/known_hosts,target=/home/node/.ssh/known_hosts,type=bind,readonly",
     "source=devbox-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
-    "source=devbox-claude-config-${devcontainerId},target=/home/node/.claude,type=volume"
+    "source=devbox-claude-config-${devcontainerId},target=/home/node/.claude,type=volume",
+    "source=devbox-docker-${devcontainerId},target=/home/node/.local/share/docker,type=volume"
   ],
   "containerEnv": {
     "NODE_OPTIONS": "--max-old-space-size=4096",
@@ -58,7 +74,7 @@ cat > /path/to/project/.devcontainer/devcontainer.json << 'EOF'
   },
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
   "workspaceFolder": "/workspace",
-  "postStartCommand": "sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/setup-chezmoi.sh",
+  "postStartCommand": "sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh",
   "waitFor": "postStartCommand"
 }
 EOF
@@ -112,7 +128,38 @@ DEVBOX_EXTRA_DOMAINS="pypi.org,files.pythonhosted.org" ./docker-run.sh
 | `uv` | Python package manager |
 | `rustc` / `cargo` | Rust toolchain |
 | `chezmoi` | Dotfile manager |
+| `docker` | Docker CE (rootless DinD) with compose and buildx |
 | `mc`, `ncdu`, `jq`, `grc` | Utilities |
+
+## Docker-in-Docker (Rootless)
+
+The container includes a full rootless Docker daemon. It starts automatically on container launch and supports `docker build`, `docker run`, and `docker compose`.
+
+```bash
+# Inside devbox:
+docker run hello-world
+docker compose up -d
+docker build -t myapp .
+```
+
+### How it works
+
+Docker runs as the `node` user via `dockerd-rootless.sh` — no `--privileged` flag, no host socket mounting. The daemon uses `fuse-overlayfs` as the storage driver and `slirp4netns` for networking.
+
+**Security:** The container runs with `seccomp=unconfined`, `apparmor=unconfined`, `systempaths=unconfined`, and `CAP_SYS_ADMIN` (all required by rootless Docker for user namespaces and sysctl access). Devices `/dev/net/tun` and `/dev/fuse` are exposed for networking and storage. The container is **not** privileged. An escape would require a kernel exploit.
+
+### Port forwarding
+
+Ports exposed by inner containers are available on the devbox's network. In Cursor/VS Code, use the Ports tab to forward them to your host. With `docker-run.sh`, add `-p` flags:
+
+```bash
+# Forward port 3000 from inner container to host
+docker run -p 3000:3000 ... vlcak/devbox:latest ...
+```
+
+### Docker data persistence
+
+Docker images and containers are stored in a named volume (`devbox-docker`), so they survive container restarts without re-pulling images.
 
 ## SSH (Agent Forwarding)
 
@@ -187,5 +234,6 @@ devbox/
 ├── extra-domains.conf              # Extra allowed domains
 ├── docker-run.sh                   # Terminal convenience script
 └── scripts/
-    └── setup-chezmoi.sh            # postStart: chezmoi init + apply
+    ├── setup-chezmoi.sh            # postStart: chezmoi init + apply
+    └── start-rootless-docker.sh    # postStart: rootless Docker daemon
 ```

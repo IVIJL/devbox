@@ -77,7 +77,26 @@ BASE_DOMAINS=(
     "vscode.blob.core.windows.net"
     "update.code.visualstudio.com"
     "rep.gaiagroup.cz"
+    # Docker Hub (rootless DinD) - registry API on AWS
+    "registry-1.docker.io"
+    "auth.docker.io"
+    "production.cloudflare.docker.com"
+    "docker.io"
 )
+
+# Cloudflare CDN ranges used by Docker Hub blob storage and npm registry.
+# Docker Hub redirects layer downloads to Cloudflare, and IPs rotate across
+# these ranges. Individual DNS resolution is not sufficient for CDN services.
+# 104.16.0.0/14 covers 104.16-19.x.x (npm, Docker auth, Docker prod cloudflare)
+# 172.64.0.0/13 covers 172.64-71.x.x (Docker Hub blob downloads)
+CLOUDFLARE_CDN_RANGES=(
+    "104.16.0.0/13"
+    "172.64.0.0/13"
+)
+for cidr in "${CLOUDFLARE_CDN_RANGES[@]}"; do
+    echo "Adding Cloudflare CDN range $cidr (Docker Hub / npm)"
+    ipset add allowed-domains "$cidr"
+done
 
 # Extra domains from config file
 EXTRA_DOMAINS_FILE="/usr/local/etc/devbox-extra-domains.conf"
@@ -148,11 +167,11 @@ iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
 
 echo "Firewall configuration complete"
 echo "Verifying firewall rules..."
-if curl --connect-timeout 5 https://example.com >/dev/null 2>&1; then
-    echo "ERROR: Firewall verification failed - was able to reach https://example.com"
+if curl --connect-timeout 5 https://www.google.com >/dev/null 2>&1; then
+    echo "ERROR: Firewall verification failed - was able to reach https://www.google.com"
     exit 1
 else
-    echo "Firewall verification passed - unable to reach https://example.com as expected"
+    echo "Firewall verification passed - unable to reach https://www.google.com as expected"
 fi
 
 if ! curl --connect-timeout 5 https://api.github.com/zen >/dev/null 2>&1; then

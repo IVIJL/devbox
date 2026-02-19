@@ -3,8 +3,6 @@ FROM node:20
 ARG TZ=Europe/Prague
 ENV TZ="$TZ"
 
-ARG CLAUDE_CODE_VERSION=latest
-
 # =============================================================================
 # Layer 1: APT packages (Claude Code base + user tools)
 # =============================================================================
@@ -121,14 +119,16 @@ RUN sh -c "$(wget -O- https://github.com/deluan/zsh-in-docker/releases/download/
     -a "export PROMPT_COMMAND='history -a' && export HISTFILE=/commandhistory/.bash_history" \
     -x
 
-# Claude Code
-RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+# Claude Code (native binary installer)
+RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # Rust + Cargo
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
-# tree-sitter-cli from source (Mason's binary needs GLIBC 2.39, Bookworm has 2.36)
-RUN . "$HOME/.cargo/env" && cargo install tree-sitter-cli
+# tree-sitter-cli from source (pre-built binary AND Mason's binary both need GLIBC 2.39, Bookworm has 2.36)
+# Clean cargo build cache afterwards to reduce image size
+RUN . "$HOME/.cargo/env" && cargo install tree-sitter-cli && \
+    rm -rf "$HOME/.cargo/registry" "$HOME/.cargo/git"
 
 # Starship prompt
 RUN mkdir -p /home/node/.local/bin && \
@@ -161,26 +161,24 @@ COPY --chown=node:node config/nvim/lua/plugins/pylsp.lua /home/node/.config/nvim
 COPY --chown=node:node config/nvim/lua/plugins/treesitter-parsers.lua /home/node/.config/nvim/lua/plugins/treesitter-parsers.lua
 COPY --chown=node:node config/nvim/lua/plugins/ruff.lua /home/node/.config/nvim/lua/plugins/ruff.lua
 
-# Set PATH early so cargo's tree-sitter-cli is available for headless steps
-ENV PATH="/home/node/.local/bin:/home/node/.cargo/bin:/home/node/.atuin/bin:$PATH"
+# Set PATH early so tree-sitter-cli + claude are available for headless steps
+ENV PATH="/home/node/.claude/local/bin:/home/node/.local/bin:/home/node/.cargo/bin:/home/node/.atuin/bin:$PATH"
 
 # Pre-install LazyVim plugins (headless, with retry)
 RUN for i in 1 2 3; do \
       nvim --headless "+Lazy! sync" +qa 2>/dev/null && break || sleep 2; \
     done
 
-# Pre-install Mason LSP servers + tools explicitly
+# Pre-install Mason LSP servers + tools, then trigger blink.cmp + treesitter parsers
 # (auto-install needs FileType events that don't fire in headless mode)
+# Mason is lazy-loaded, so defer the command to let plugins finish loading first
 RUN nvim --headless \
-    -c "MasonInstall lua-language-server bash-language-server pyright marksman dockerfile-language-server docker-compose-language-service stylua shfmt shellcheck" \
+    -c 'lua vim.defer_fn(function() require("lazy").load({plugins={"mason.nvim","mason-lspconfig.nvim"}}) vim.schedule(function() local ok, err = pcall(vim.cmd, "MasonInstall lua-language-server bash-language-server pyright marksman dockerfile-language-server docker-compose-language-service stylua shfmt shellcheck") if not ok then vim.notify("MasonInstall: " .. err, vim.log.levels.WARN) end end) end, 5000)' \
     -c 'lua vim.defer_fn(function() vim.cmd("qall") end, 120000)' \
-    2>&1 | tail -30 || true
-
-# Trigger blink.cmp binary download + treesitter parser compilation
-# (PATH now includes cargo's tree-sitter, ensure_installed parsers will compile)
-RUN nvim --headless \
+    2>&1 && \
+    nvim --headless \
     -c 'lua vim.defer_fn(function() vim.cmd("qall") end, 90000)' \
-    2>&1 | tail -20 || true
+    2>&1
 
 # Python LSP
 RUN /home/node/.local/bin/uv tool install python-lsp-server \

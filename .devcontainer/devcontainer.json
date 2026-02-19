@@ -45,15 +45,17 @@
     "source=${localEnv:HOME}/.ssh/known_hosts,target=/home/node/.ssh/known_hosts,type=bind,readonly",
     "source=devbox-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
     "source=devbox-claude-config-${devcontainerId},target=/home/node/.claude,type=volume",
-    "source=devbox-docker-${devcontainerId},target=/home/node/.local/share/docker,type=volume"
+    "source=devbox-docker-${devcontainerId},target=/home/node/.local/share/docker,type=volume",
+    "source=devbox-nvim-data-${devcontainerId},target=/home/node/.local/share/nvim,type=volume"
   ],
   "containerEnv": {
     "NODE_OPTIONS": "--max-old-space-size=4096",
     "CLAUDE_CONFIG_DIR": "/home/node/.claude",
-    "TZ": "${localEnv:TZ:Europe/Prague}"
+    "TZ": "${localEnv:TZ:Europe/Prague}",
+    "NTFY_TOKEN": "${localEnv:NTFY_TOKEN}"
   },
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
   "workspaceFolder": "/workspace",
-  "postStartCommand": "sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh",
+  "postStartCommand": "sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh",
   "waitFor": "postStartCommand"
 }

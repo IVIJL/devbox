@@ -11,12 +11,12 @@ ARG CLAUDE_CODE_VERSION=latest
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # Claude Code packages
     less git procps sudo fzf zsh man-db unzip gnupg2 gh \
-    iptables ipset iproute2 dnsutils aggregate jq nano vim \
+    iptables ipset iproute2 dnsutils aggregate jq nano vim dnsmasq iputils-ping \
     # Rootless Docker prerequisites
     uidmap fuse-overlayfs slirp4netns \
     # User packages
     ncdu mc nala libfuse2 xauth xclip ripgrep fd-find \
-    build-essential zsh-autosuggestions zsh-syntax-highlighting \
+    build-essential libclang-dev zsh-autosuggestions zsh-syntax-highlighting \
     grc curl wget ca-certificates \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && ln -s "$(which fdfind)" /usr/local/bin/fd
@@ -93,6 +93,10 @@ RUN SNIPPET="export PROMPT_COMMAND='history -a' && export HISTFILE=/commandhisto
 RUN mkdir -p /workspace /home/node/.claude && \
     chown -R node:node /workspace /home/node/.claude
 
+# Claude Code config defaults (template — seeded into volume at startup)
+COPY --chown=node:node config/claude/ /etc/claude-defaults/
+RUN chmod +x /etc/claude-defaults/hooks/*.sh /etc/claude-defaults/statusline-info.sh
+
 ENV DEVCONTAINER=true
 ENV SHELL=/bin/zsh
 ENV TERM=xterm-256color
@@ -123,6 +127,9 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 # Rust + Cargo
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
+# tree-sitter-cli from source (Mason's binary needs GLIBC 2.39, Bookworm has 2.36)
+RUN . "$HOME/.cargo/env" && cargo install tree-sitter-cli
+
 # Starship prompt
 RUN mkdir -p /home/node/.local/bin && \
     curl -sS https://starship.rs/install.sh | sh -s -- --yes --bin-dir /home/node/.local/bin
@@ -142,18 +149,47 @@ RUN git clone --depth 1 https://github.com/Aloxaf/fzf-tab /home/node/.oh-my-zsh/
 # zsh-z plugin
 RUN git clone --depth 1 https://github.com/agkozak/zsh-z /home/node/.oh-my-zsh/custom/plugins/zsh-z
 
-# LazyVim
+# LazyVim starter + cleanup
 RUN git clone --depth 1 https://github.com/LazyVim/starter /home/node/.config/nvim && \
-    rm -rf /home/node/.config/nvim/.git
+    rm -rf /home/node/.config/nvim/.git && \
+    rm -f /home/node/.config/nvim/lua/plugins/example.lua
 
-# Custom nvim config (baked into image)
+# Custom nvim configs (baked into image)
 COPY --chown=node:node config/nvim/lua/config/options.lua /home/node/.config/nvim/lua/config/options.lua
+COPY --chown=node:node config/nvim/lua/config/lazy.lua /home/node/.config/nvim/lua/config/lazy.lua
+COPY --chown=node:node config/nvim/lua/plugins/pylsp.lua /home/node/.config/nvim/lua/plugins/pylsp.lua
+COPY --chown=node:node config/nvim/lua/plugins/treesitter-parsers.lua /home/node/.config/nvim/lua/plugins/treesitter-parsers.lua
+COPY --chown=node:node config/nvim/lua/plugins/ruff.lua /home/node/.config/nvim/lua/plugins/ruff.lua
+
+# Set PATH early so cargo's tree-sitter-cli is available for headless steps
+ENV PATH="/home/node/.local/bin:/home/node/.cargo/bin:/home/node/.atuin/bin:$PATH"
+
+# Pre-install LazyVim plugins (headless, with retry)
+RUN for i in 1 2 3; do \
+      nvim --headless "+Lazy! sync" +qa 2>/dev/null && break || sleep 2; \
+    done
+
+# Pre-install Mason LSP servers + tools explicitly
+# (auto-install needs FileType events that don't fire in headless mode)
+RUN nvim --headless \
+    -c "MasonInstall lua-language-server bash-language-server pyright marksman dockerfile-language-server docker-compose-language-service stylua shfmt shellcheck" \
+    -c 'lua vim.defer_fn(function() vim.cmd("qall") end, 120000)' \
+    2>&1 | tail -30 || true
+
+# Trigger blink.cmp binary download + treesitter parser compilation
+# (PATH now includes cargo's tree-sitter, ensure_installed parsers will compile)
+RUN nvim --headless \
+    -c 'lua vim.defer_fn(function() vim.cmd("qall") end, 90000)' \
+    2>&1 | tail -20 || true
 
 # Python LSP
 RUN /home/node/.local/bin/uv tool install python-lsp-server \
     --with python-lsp-black \
     --with python-lsp-isort \
     --with pylsp-mypy
+
+# Ruff linter/formatter
+RUN /home/node/.local/bin/uv tool install ruff
 
 # =============================================================================
 # Layer 6: Firewall + scripts (root)
@@ -165,18 +201,26 @@ COPY extra-domains.conf /usr/local/etc/devbox-extra-domains.conf
 COPY scripts/setup-chezmoi.sh /usr/local/bin/
 COPY scripts/n scripts/nx /usr/local/bin/
 COPY scripts/start-rootless-docker.sh /usr/local/bin/
+COPY scripts/setup-claude.sh /usr/local/bin/
 
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
-    /usr/local/bin/n /usr/local/bin/nx /usr/local/bin/start-rootless-docker.sh && \
-    echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/node-firewall && \
-    chmod 0440 /etc/sudoers.d/node-firewall
+    /usr/local/bin/n /usr/local/bin/nx /usr/local/bin/start-rootless-docker.sh \
+    /usr/local/bin/setup-claude.sh
+
+RUN printf '%s\n' 'node ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/node-nopasswd && \
+    chmod 0440 /etc/sudoers.d/node-nopasswd
+
+# X11 forwarding support
+RUN printf '%s\n' 'Defaults env_keep += "DISPLAY XAUTHORITY"' > /etc/sudoers.d/x11-forward && \
+    chmod 440 /etc/sudoers.d/x11-forward && \
+    touch /home/node/.Xauthority && chmod 600 /home/node/.Xauthority && \
+    chown node:node /home/node/.Xauthority
 
 # =============================================================================
 # Layer 7: Final ENV
 # =============================================================================
 USER node
 
-ENV PATH="/home/node/.local/bin:/home/node/.cargo/bin:/home/node/.atuin/bin:$PATH"
 ENV EDITOR=nvim
 ENV VISUAL=nvim
 ENV XDG_RUNTIME_DIR=/run/user/1000

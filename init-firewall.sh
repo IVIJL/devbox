@@ -63,11 +63,14 @@ while read -r cidr; do
 done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q)
 
 # =============================================================================
-# Resolve and add allowed domains
+# Allowed domains — all resolved dynamically via dnsmasq
 # =============================================================================
+# dnsmasq ipset= directive adds resolved IPs to the ipset at DNS lookup time.
+# This handles CDN IP rotation, wildcard subdomains, and everything else
+# without static dig resolution or hardcoded CIDR workarounds.
 
 # Base domains (Claude Code + devbox)
-BASE_DOMAINS=(
+DNSMASQ_DOMAINS=(
     "registry.npmjs.org"
     "api.anthropic.com"
     "sentry.io"
@@ -76,35 +79,19 @@ BASE_DOMAINS=(
     "marketplace.visualstudio.com"
     "vscode.blob.core.windows.net"
     "update.code.visualstudio.com"
-    "rep.gaiagroup.cz"
-    # Docker Hub (rootless DinD) - registry API on AWS
+    # Docker Hub (rootless DinD)
     "registry-1.docker.io"
     "auth.docker.io"
     "production.cloudflare.docker.com"
     "docker.io"
 )
 
-# Cloudflare CDN ranges used by Docker Hub blob storage and npm registry.
-# Docker Hub redirects layer downloads to Cloudflare, and IPs rotate across
-# these ranges. Individual DNS resolution is not sufficient for CDN services.
-# 104.16.0.0/14 covers 104.16-19.x.x (npm, Docker auth, Docker prod cloudflare)
-# 172.64.0.0/13 covers 172.64-71.x.x (Docker Hub blob downloads)
-CLOUDFLARE_CDN_RANGES=(
-    "104.16.0.0/13"
-    "172.64.0.0/13"
-)
-for cidr in "${CLOUDFLARE_CDN_RANGES[@]}"; do
-    echo "Adding Cloudflare CDN range $cidr (Docker Hub / npm)"
-    ipset add allowed-domains "$cidr"
-done
-
 # Extra domains from config file
 EXTRA_DOMAINS_FILE="/usr/local/etc/devbox-extra-domains.conf"
 if [ -f "$EXTRA_DOMAINS_FILE" ]; then
     while IFS= read -r line; do
-        # Skip comments and empty lines
         line=$(echo "$line" | sed 's/#.*//' | xargs)
-        [ -n "$line" ] && BASE_DOMAINS+=("$line")
+        [ -n "$line" ] && DNSMASQ_DOMAINS+=("$line")
     done < "$EXTRA_DOMAINS_FILE"
 fi
 
@@ -113,28 +100,9 @@ if [ -n "${DEVBOX_EXTRA_DOMAINS:-}" ]; then
     IFS=',' read -ra ENV_DOMAINS <<< "$DEVBOX_EXTRA_DOMAINS"
     for domain in "${ENV_DOMAINS[@]}"; do
         domain=$(echo "$domain" | xargs)
-        [ -n "$domain" ] && BASE_DOMAINS+=("$domain")
+        [ -n "$domain" ] && DNSMASQ_DOMAINS+=("$domain")
     done
 fi
-
-# Resolve all domains
-for domain in "${BASE_DOMAINS[@]}"; do
-    echo "Resolving $domain..."
-    ips=$(dig +noall +answer A "$domain" | awk '$4 == "A" {print $5}')
-    if [ -z "$ips" ]; then
-        echo "WARNING: Failed to resolve $domain (skipping)"
-        continue
-    fi
-
-    while read -r ip; do
-        if [[ ! "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            echo "ERROR: Invalid IP from DNS for $domain: $ip"
-            exit 1
-        fi
-        echo "Adding $ip for $domain"
-        ipset add allowed-domains "$ip" 2>/dev/null || true
-    done < <(echo "$ips")
-done
 
 # Get host IP from default route
 HOST_IP=$(ip route | grep default | cut -d" " -f3)
@@ -164,6 +132,53 @@ iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT
 
 # Reject all other outbound traffic for immediate feedback
 iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
+
+# =============================================================================
+# dnsmasq — dynamic DNS-to-ipset resolution for all allowed domains
+# =============================================================================
+echo "Configuring dnsmasq for ${#DNSMASQ_DOMAINS[@]} domain(s)..."
+
+# Save Docker's upstream DNS before overwriting resolv.conf
+UPSTREAM_DNS=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf)
+
+# Generate dnsmasq config
+mkdir -p /etc/dnsmasq.d
+cat > /etc/dnsmasq.d/devbox-firewall.conf <<DNSCONF
+# Devbox firewall — dynamic DNS-to-ipset resolution
+bind-interfaces
+listen-address=127.0.0.1
+port=53
+no-resolv
+server=${UPSTREAM_DNS}
+DNSCONF
+
+for domain in "${DNSMASQ_DOMAINS[@]}"; do
+    # Wildcard *.example.com → ipset rule for /example.com/ (matches all subdomains)
+    # Regular example.com  → ipset rule for /example.com/ (matches exact + subdomains)
+    if [[ "$domain" == \*.* ]]; then
+        base="${domain#\*.}"
+        echo "ipset=/${base}/allowed-domains" >> /etc/dnsmasq.d/devbox-firewall.conf
+        echo "  Wildcard: ${domain} → dnsmasq ipset for ${base}"
+    else
+        echo "ipset=/${domain}/allowed-domains" >> /etc/dnsmasq.d/devbox-firewall.conf
+        echo "  Domain: ${domain} → dnsmasq ipset"
+    fi
+done
+
+# Start dnsmasq
+dnsmasq --conf-dir=/etc/dnsmasq.d --keep-in-foreground &
+DNSMASQ_PID=$!
+sleep 0.5
+
+if kill -0 "$DNSMASQ_PID" 2>/dev/null; then
+    echo "dnsmasq started (PID $DNSMASQ_PID)"
+    # Redirect container DNS through dnsmasq
+    echo "nameserver 127.0.0.1" > /etc/resolv.conf
+else
+    echo "ERROR: dnsmasq failed to start"
+    wait "$DNSMASQ_PID" || true
+    exit 1
+fi
 
 echo "Firewall configuration complete"
 echo "Verifying firewall rules..."

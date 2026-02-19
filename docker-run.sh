@@ -30,6 +30,8 @@ DOCKER_ARGS=(
     -v devbox-bashhistory:/commandhistory
     -v devbox-claude-config:/home/node/.claude
     -v devbox-docker:/home/node/.local/share/docker
+    -v devbox-nvim-data:/home/node/.local/share/nvim
+    -e CLAUDE_CONFIG_DIR=/home/node/.claude
     # SSH config only (no private keys)
     -v "$HOME/.ssh/config:/home/node/.ssh/config:ro"
     -v "$HOME/.ssh/known_hosts:/home/node/.ssh/known_hosts:ro"
@@ -56,6 +58,15 @@ if [ -n "${DEVBOX_EXTRA_DOMAINS:-}" ]; then
     DOCKER_ARGS+=(-e "DEVBOX_EXTRA_DOMAINS=$DEVBOX_EXTRA_DOMAINS")
 fi
 
+# Auto-detect NTFY_TOKEN from host's Claude hooks if not set
+if [ -z "${NTFY_TOKEN:-}" ] && [ -d "$HOME/.claude/hooks" ]; then
+    NTFY_TOKEN=$(grep -ohm1 'TOKEN="tk_[^"]*"' "$HOME/.claude/hooks/"*.sh 2>/dev/null | head -1 | cut -d'"' -f2 || true)
+fi
+
+if [ -n "${NTFY_TOKEN:-}" ]; then
+    DOCKER_ARGS+=(-e "NTFY_TOKEN=$NTFY_TOKEN")
+fi
+
 # Workspace: argument or current directory
 PROJECT_PATH=$(realpath "${1:-$PWD}")
 if [ ! -d "$PROJECT_PATH" ]; then
@@ -67,4 +78,4 @@ DOCKER_ARGS+=(-v "$PROJECT_PATH:/workspace")
 
 echo "Starting devbox..."
 exec docker run "${DOCKER_ARGS[@]}" "$IMAGE" \
-    zsh -c 'sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && exec zsh'
+    zsh -c 'sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh && exec zsh'

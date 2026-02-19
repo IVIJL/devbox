@@ -46,14 +46,16 @@
     "source=devbox-bashhistory,target=/commandhistory,type=volume",
     "source=devbox-claude-config,target=/home/node/.claude,type=volume",
     "source=devbox-workspace,target=/workspace,type=volume",
-    "source=devbox-docker,target=/home/node/.local/share/docker,type=volume"
+    "source=devbox-docker,target=/home/node/.local/share/docker,type=volume",
+    "source=devbox-nvim-data,target=/home/node/.local/share/nvim,type=volume"
   ],
   "containerEnv": {
     "NODE_OPTIONS": "--max-old-space-size=4096",
     "CLAUDE_CONFIG_DIR": "/home/node/.claude",
-    "TZ": "${localEnv:TZ:Europe/Prague}"
+    "TZ": "${localEnv:TZ:Europe/Prague}",
+    "NTFY_TOKEN": "${localEnv:NTFY_TOKEN}"
   },
   "workspaceFolder": "/workspace",
-  "postStartCommand": "sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh",
+  "postStartCommand": "sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh",
   "waitFor": "postStartCommand"
 }

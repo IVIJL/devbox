@@ -8,13 +8,13 @@ ENV TZ="$TZ"
 # =============================================================================
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # Claude Code packages
-    less git procps sudo fzf zsh man-db unzip gnupg2 gh \
+    less git procps sudo zsh man-db unzip gnupg2 gh \
     iptables ipset iproute2 dnsutils aggregate jq nano vim dnsmasq iputils-ping \
     # Rootless Docker prerequisites
     uidmap fuse-overlayfs slirp4netns \
     # User packages
     ncdu mc nala libfuse2 xauth xclip ripgrep fd-find \
-    build-essential libclang-dev zsh-autosuggestions zsh-syntax-highlighting \
+    build-essential libclang-dev \
     grc curl wget ca-certificates \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && ln -s "$(which fdfind)" /usr/local/bin/fd
@@ -101,6 +101,12 @@ ENV TERM=xterm-256color
 
 WORKDIR /workspace
 
+# ZSH plugins (installed to /usr/share/ for chezmoi .zshrc sourcing)
+RUN git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions /usr/share/zsh-autosuggestions && \
+    git clone --depth 1 https://github.com/agkozak/zsh-z.git /usr/share/zsh-z && \
+    git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git /usr/share/zsh-syntax-highlighting && \
+    git clone --depth 1 https://github.com/Aloxaf/fzf-tab /usr/share/fzf-tab
+
 # =============================================================================
 # Layer 5: User-level tools (as node)
 # =============================================================================
@@ -109,15 +115,9 @@ USER node
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
 ENV PATH=$PATH:/usr/local/share/npm-global/bin
 
-# zsh-in-docker (Powerlevel10k + plugins)
-ARG ZSH_IN_DOCKER_VERSION=1.2.0
-RUN sh -c "$(wget -O- https://github.com/deluan/zsh-in-docker/releases/download/v${ZSH_IN_DOCKER_VERSION}/zsh-in-docker.sh)" -- \
-    -p git \
-    -p fzf \
-    -a "source /usr/share/doc/fzf/examples/key-bindings.zsh" \
-    -a "source /usr/share/doc/fzf/examples/completion.zsh" \
-    -a "export PROMPT_COMMAND='history -a' && export HISTFILE=/commandhistory/.bash_history" \
-    -x
+# fzf keybindings + completion (CTRL-R, CTRL-T, **(TAB))
+RUN git clone --depth 1 https://github.com/junegunn/fzf.git /home/node/.fzf && \
+    /home/node/.fzf/install --all
 
 # Claude Code (native binary installer)
 RUN curl -fsSL https://claude.ai/install.sh | bash
@@ -142,12 +142,6 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Chezmoi
 RUN sh -c "$(curl -fsLS get.chezmoi.io)" -- -b /home/node/.local/bin
-
-# fzf-tab plugin
-RUN git clone --depth 1 https://github.com/Aloxaf/fzf-tab /home/node/.oh-my-zsh/custom/plugins/fzf-tab
-
-# zsh-z plugin
-RUN git clone --depth 1 https://github.com/agkozak/zsh-z /home/node/.oh-my-zsh/custom/plugins/zsh-z
 
 # LazyVim starter + cleanup
 RUN git clone --depth 1 https://github.com/LazyVim/starter /home/node/.config/nvim && \

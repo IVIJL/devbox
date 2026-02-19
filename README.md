@@ -61,7 +61,7 @@ cat > /path/to/project/.devcontainer/devcontainer.json << 'EOF'
   ],
   "remoteUser": "node",
   "mounts": [
-    "source=${localEnv:HOME}/.gitconfig,target=/home/node/.gitconfig,type=bind,readonly",
+    "source=${localEnv:HOME}/.gitconfig,target=/etc/gitconfig,type=bind,readonly",
     "source=${localEnv:HOME}/.ssh/config,target=/home/node/.ssh/config,type=bind,readonly",
     "source=${localEnv:HOME}/.ssh/known_hosts,target=/home/node/.ssh/known_hosts,type=bind,readonly",
     "source=devbox-bashhistory-${devcontainerId},target=/commandhistory,type=volume",

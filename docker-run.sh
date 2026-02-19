@@ -32,8 +32,8 @@ DOCKER_ARGS=(
     -v devbox-docker:/home/node/.local/share/docker
     -v devbox-nvim-data:/home/node/.local/share/nvim
     -e CLAUDE_CONFIG_DIR=/home/node/.claude
-    # Git config from host
-    -v "$HOME/.gitconfig:/home/node/.gitconfig:ro"
+    # Git config from host (system-level so Cursor/VS Code can write to ~/.gitconfig)
+    -v "$HOME/.gitconfig:/etc/gitconfig:ro"
     # SSH config only (no private keys)
     -v "$HOME/.ssh/config:/home/node/.ssh/config:ro"
     -v "$HOME/.ssh/known_hosts:/home/node/.ssh/known_hosts:ro"

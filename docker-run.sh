@@ -31,6 +31,7 @@ DOCKER_ARGS=(
     -v devbox-claude-config:/home/node/.claude
     -v devbox-docker:/home/node/.local/share/docker
     -v devbox-nvim-data:/home/node/.local/share/nvim
+    -v devbox-cursor-server:/home/node/.cursor-server
     -e CLAUDE_CONFIG_DIR=/home/node/.claude
     # Git config from host (system-level so Cursor/VS Code can write to ~/.gitconfig)
     -v "$HOME/.gitconfig:/etc/gitconfig:ro"

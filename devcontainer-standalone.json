@@ -47,7 +47,8 @@
     "source=devbox-claude-config,target=/home/node/.claude,type=volume",
     "source=devbox-workspace,target=/workspace,type=volume",
     "source=devbox-docker,target=/home/node/.local/share/docker,type=volume",
-    "source=devbox-nvim-data,target=/home/node/.local/share/nvim,type=volume"
+    "source=devbox-nvim-data,target=/home/node/.local/share/nvim,type=volume",
+    "source=devbox-cursor-server,target=/home/node/.cursor-server,type=volume"
   ],
   "containerEnv": {
     "NODE_OPTIONS": "--max-old-space-size=4096",

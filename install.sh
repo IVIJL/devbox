@@ -161,7 +161,7 @@ pkg_update() {
     case "$PM" in
         apt-get) sudo apt-get update ;;
         dnf)     ;; # dnf auto-refreshes
-        pacman)  sudo pacman -Sy ;;
+        pacman)  ;; # pacman -Sy without -u is unsafe; pacman -S handles it
         zypper)  sudo zypper refresh ;;
         apk)     sudo apk update ;;
         brew)    brew update ;;
@@ -208,11 +208,26 @@ install_docker() {
             sudo apt-get install -y ca-certificates curl gnupg
             sudo install -m 0755 -d /etc/apt/keyrings
             if [ ! -f /etc/apt/keyrings/docker.asc ]; then
-                curl -fsSL https://download.docker.com/linux/$(. /etc/os-release && echo "$ID")/gpg | sudo tee /etc/apt/keyrings/docker.asc > /dev/null
+                # shellcheck disable=SC1091
+                local docker_id
+                docker_id=$(. /etc/os-release && echo "$ID")
+                [[ "$docker_id" =~ ^[a-z]+$ ]] || error "Invalid OS ID for Docker repo: $docker_id"
+                curl -fsSL "https://download.docker.com/linux/${docker_id}/gpg" | sudo tee /etc/apt/keyrings/docker.asc > /dev/null
                 sudo chmod a+r /etc/apt/keyrings/docker.asc
+                # Verify Docker GPG key fingerprint
+                if has gpg; then
+                    local fingerprint
+                    fingerprint=$(gpg --dry-run --quiet --import --import-options import-show /etc/apt/keyrings/docker.asc 2>/dev/null | grep -oE '[0-9A-F]{40}' | head -1)
+                    if [ "$fingerprint" != "9DC858229FC7DD38854AE2D88D81803C0EBFCD88" ]; then
+                        sudo rm -f /etc/apt/keyrings/docker.asc
+                        error "Docker GPG key fingerprint mismatch! Expected 9DC8...CD88, got ${fingerprint:-none}"
+                    fi
+                    msg "Docker GPG key fingerprint verified."
+                else
+                    warn "gpg not available, skipping Docker GPG key fingerprint verification."
+                fi
             fi
-            # shellcheck disable=SC1091
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$(. /etc/os-release && echo "$ID") $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${docker_id} $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
                 sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
             sudo apt-get update
             sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
@@ -326,7 +341,7 @@ SSH_EOF
         if [ -f "$ssh_config" ]; then
             # Prepend to existing config
             local tmp
-            tmp=$(mktemp)
+            tmp=$(mktemp "$ssh_dir/config.XXXXXX")
             printf '%s\n' "$ssh_block" | cat - "$ssh_config" > "$tmp"
             mv "$tmp" "$ssh_config"
         else

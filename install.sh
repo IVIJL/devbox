@@ -47,6 +47,11 @@ confirm() {
 
 has() { command -v "$1" &>/dev/null; }
 
+is_wsl2() { grep -qi microsoft /proc/version 2>/dev/null; }
+
+# Docker state after check_docker(): "running", "installed", "desktop", "missing"
+DOCKER_STATE="missing"
+
 # --- Argument parsing --------------------------------------------------------
 
 usage() {
@@ -60,11 +65,11 @@ Options:
   --help, -h   Show this help message
 
 What this script does:
-  1. Installs git, Docker, and keychain (if missing)
+  1. Installs git and keychain (if missing)
   2. Configures SSH agent via keychain (no key scanning)
   3. Adds AddKeysToAgent to ~/.ssh/config
   4. Clones devbox to ~/.local/share/devbox
-  5. Builds the Docker image (optional, takes 10-20 min)
+  5. Checks Docker availability (never installs automatically)
   6. Installs 'devbox' command to /usr/local/bin
 
 This script NEVER accesses or scans your private SSH keys.
@@ -182,25 +187,7 @@ install_git() {
     INSTALLED+=("git")
 }
 
-install_docker() {
-    info "Checking Docker..."
-    if has docker; then
-        SKIPPED+=("Docker ($(docker --version 2>/dev/null | head -c 60))")
-        return
-    fi
-
-    if [ "$OS" = "macos" ]; then
-        warn "Docker is not installed."
-        msg "On macOS, install Docker manually via one of:"
-        msg "  - Docker Desktop: https://www.docker.com/products/docker-desktop/"
-        msg "  - OrbStack:       https://orbstack.dev"
-        msg "  - Colima:         brew install colima docker docker-compose"
-        msg ""
-        msg "After installing, re-run this script."
-        SKIPPED+=("Docker (manual install needed on macOS)")
-        return
-    fi
-
+install_docker_ce() {
     # Linux: install Docker CE from official repo
     msg "Installing Docker CE from official repository..."
 
@@ -259,7 +246,84 @@ install_docker() {
         sudo systemctl start docker 2>/dev/null || true
     fi
 
-    INSTALLED+=("Docker")
+    INSTALLED+=("Docker CE")
+    DOCKER_STATE="running"
+}
+
+check_docker() {
+    info "Checking Docker..."
+
+    # 1. Docker binary exists and daemon responds
+    if has docker && docker info &>/dev/null 2>&1; then
+        DOCKER_STATE="running"
+        SKIPPED+=("Docker ($(docker --version 2>/dev/null | head -c 60))")
+        return
+    fi
+
+    # 2. Docker binary exists but daemon not responding
+    if has docker; then
+        DOCKER_STATE="installed"
+        warn "Docker is installed but not running."
+        if is_wsl2; then
+            msg "Start Docker Desktop on Windows, or start the Docker daemon."
+        else
+            msg "Start the Docker daemon (e.g. sudo systemctl start docker)."
+        fi
+        SKIPPED+=("Docker (installed but not running)")
+        return
+    fi
+
+    # 3. Docker Desktop detected but binary not available
+    if is_wsl2 && [ -d "/mnt/c/Program Files/Docker" ]; then
+        DOCKER_STATE="desktop"
+        warn "Docker Desktop is installed on Windows but not available in WSL2."
+        msg "Start Docker Desktop and enable WSL2 integration in Settings."
+        SKIPPED+=("Docker (Desktop installed, not available in WSL2)")
+        return
+    fi
+
+    if [ "$OS" = "macos" ] && [ -d "/Applications/Docker.app" ]; then
+        DOCKER_STATE="desktop"
+        warn "Docker Desktop is installed but not running."
+        msg "Start Docker Desktop from Applications."
+        SKIPPED+=("Docker (Desktop installed, not running)")
+        return
+    fi
+
+    # 4. Docker not found at all
+    DOCKER_STATE="missing"
+
+    if [ "$OS" = "macos" ]; then
+        warn "Docker is not installed."
+        msg "Install Docker via one of:"
+        msg "  - Docker Desktop: https://www.docker.com/products/docker-desktop/"
+        msg "  - OrbStack:       https://orbstack.dev"
+        msg "  - Colima:         brew install colima docker docker-compose"
+        SKIPPED+=("Docker (not installed)")
+        return
+    fi
+
+    if is_wsl2; then
+        warn "Docker is not installed."
+        msg "Recommended: Install Docker Desktop for Windows with WSL2 integration."
+        msg "  https://www.docker.com/products/docker-desktop/"
+        msg ""
+        if confirm "Install Docker CE inside WSL2 instead?"; then
+            install_docker_ce
+        else
+            SKIPPED+=("Docker (not installed)")
+        fi
+        return
+    fi
+
+    # Native Linux
+    if $AUTO_YES; then
+        install_docker_ce
+    elif confirm "Install Docker CE?"; then
+        install_docker_ce
+    else
+        SKIPPED+=("Docker (not installed)")
+    fi
 }
 
 add_docker_group() {
@@ -384,37 +448,6 @@ setup_devbox_repo() {
     INSTALLED+=("devbox repo")
 }
 
-# --- Build Docker image -----------------------------------------------------
-
-build_image() {
-    info "Docker image build"
-
-    if ! has docker; then
-        warn "Docker not available, skipping image build."
-        msg "Build manually later: cd $DEVBOX_DIR && ./build.sh"
-        return
-    fi
-
-    if docker image inspect vlcak/devbox:latest &>/dev/null; then
-        SKIPPED+=("Docker image (already built)")
-        msg "Image vlcak/devbox:latest already exists."
-        if ! confirm "Rebuild the Docker image?"; then
-            return
-        fi
-    else
-        msg "The Docker image needs to be built (this takes 10-20 minutes)."
-        if ! confirm "Build the Docker image now?"; then
-            msg "You can build later: cd $DEVBOX_DIR && ./build.sh"
-            SKIPPED+=("Docker image (deferred)")
-            return
-        fi
-    fi
-
-    msg "Building Docker image..."
-    "$DEVBOX_DIR/build.sh"
-    INSTALLED+=("Docker image")
-}
-
 # --- Install devbox command --------------------------------------------------
 
 install_command() {
@@ -480,23 +513,67 @@ print_summary() {
         for item in "${SKIPPED[@]}"; do msg "  - $item"; done
     fi
 
-    echo ""
-    msg "Quick start:"
-    msg "  devbox                        # start devbox in current directory"
-    msg "  devbox /path/to/project       # start devbox in a specific directory"
-    echo ""
-    msg "Set your API key before running:"
-    msg "  export ANTHROPIC_API_KEY=sk-ant-..."
-    echo ""
-
     if $NEED_RELOGIN; then
+        echo ""
         warn "You were added to the 'docker' group."
         msg "Log out and back in (or run: newgrp docker) for this to take effect."
-        echo ""
     fi
 
+    echo ""
     msg "SSH keys will be added to the agent automatically on first use"
     msg "(you'll be prompted for your passphrase once per session)."
+
+    # --- Next steps ---
+    echo ""
+    info "Next steps:"
+
+    local step=1
+
+    case "$DOCKER_STATE" in
+        running)
+            ;;
+        installed)
+            msg "  ${step}. Start Docker daemon"
+            if is_wsl2; then
+                msg "     Start Docker Desktop on Windows, or: sudo systemctl start docker"
+            elif [ "$OS" = "macos" ]; then
+                msg "     Open Docker Desktop from Applications"
+            else
+                msg "     sudo systemctl start docker"
+            fi
+            step=$((step + 1))
+            ;;
+        desktop)
+            msg "  ${step}. Start Docker Desktop"
+            if is_wsl2; then
+                msg "     Start Docker Desktop on Windows and enable WSL2 integration"
+            else
+                msg "     Open Docker Desktop from Applications"
+            fi
+            step=$((step + 1))
+            ;;
+        missing)
+            msg "  ${step}. Install Docker"
+            if [ "$OS" = "macos" ]; then
+                msg "     Docker Desktop: https://www.docker.com/products/docker-desktop/"
+                msg "     OrbStack:       https://orbstack.dev"
+            elif is_wsl2; then
+                msg "     Docker Desktop for Windows: https://www.docker.com/products/docker-desktop/"
+                msg "     Or install Docker CE: see https://docs.docker.com/engine/install/"
+            else
+                msg "     See https://docs.docker.com/engine/install/"
+            fi
+            step=$((step + 1))
+            ;;
+    esac
+
+    msg "  ${step}. Build the image:  cd $DEVBOX_DIR && ./build.sh"
+    step=$((step + 1))
+
+    msg "  ${step}. Set your API key: export ANTHROPIC_API_KEY=sk-ant-..."
+    step=$((step + 1))
+
+    msg "  ${step}. Run devbox:       devbox"
 }
 
 # --- Main --------------------------------------------------------------------
@@ -511,10 +588,10 @@ main() {
 
     if ! $AUTO_YES; then
         msg "This script will:"
-        msg "  1. Install git, Docker, and keychain (if missing)"
+        msg "  1. Install git and keychain (if missing)"
         msg "  2. Configure SSH agent via keychain"
         msg "  3. Clone devbox to $DEVBOX_DIR"
-        msg "  4. Optionally build the Docker image"
+        msg "  4. Check Docker availability"
         msg "  5. Install 'devbox' command to $SYMLINK_PATH"
         echo ""
         if ! confirm "Continue?"; then
@@ -527,8 +604,6 @@ main() {
     pkg_update
 
     install_git
-    install_docker
-    add_docker_group
     install_keychain
 
     echo ""
@@ -538,10 +613,11 @@ main() {
     setup_devbox_repo
 
     echo ""
-    build_image
+    install_command
 
     echo ""
-    install_command
+    check_docker
+    add_docker_group
 
     print_summary
 }

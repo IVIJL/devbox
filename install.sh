@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+trap 'printf "\033[1;31m==> ERROR: Script failed at line %s (exit code %s)\033[0m\n" "$LINENO" "$?"' ERR
 
 # =============================================================================
 # Devbox Installer
@@ -203,15 +204,18 @@ install_docker() {
     # Linux: install Docker CE from official repo
     msg "Installing Docker CE from official repository..."
 
+    # shellcheck disable=SC1091
+    local docker_id=""
+    if [ "$PM" = "apt-get" ]; then
+        docker_id=$(. /etc/os-release && echo "$ID")
+        [[ "$docker_id" =~ ^[a-z]+$ ]] || error "Invalid OS ID for Docker repo: $docker_id"
+    fi
+
     case "$PM" in
         apt-get)
             sudo apt-get install -y ca-certificates curl gnupg
             sudo install -m 0755 -d /etc/apt/keyrings
             if [ ! -f /etc/apt/keyrings/docker.asc ]; then
-                # shellcheck disable=SC1091
-                local docker_id
-                docker_id=$(. /etc/os-release && echo "$ID")
-                [[ "$docker_id" =~ ^[a-z]+$ ]] || error "Invalid OS ID for Docker repo: $docker_id"
                 curl -fsSL "https://download.docker.com/linux/${docker_id}/gpg" | sudo tee /etc/apt/keyrings/docker.asc > /dev/null
                 sudo chmod a+r /etc/apt/keyrings/docker.asc
                 # Verify Docker GPG key fingerprint

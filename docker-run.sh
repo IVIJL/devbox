@@ -13,8 +13,16 @@ set -euo pipefail
 # =============================================================================
 
 IMAGE="vlcak/devbox:latest"
-CONTAINER_NAME="devbox"
 SSH_WARNING=""
+
+# Workspace: argument or current directory
+PROJECT_PATH=$(realpath "${1:-$PWD}")
+if [ ! -d "$PROJECT_PATH" ]; then
+    echo "ERROR: Directory $PROJECT_PATH does not exist"
+    exit 1
+fi
+PROJECT_NAME=$(basename "$PROJECT_PATH")
+CONTAINER_NAME="devbox-$(echo "$PROJECT_NAME" | tr -cs 'a-zA-Z0-9_.-' '-' | sed 's/^-//;s/-$//')"
 
 DOCKER_ARGS=(
     --rm -it
@@ -27,10 +35,11 @@ DOCKER_ARGS=(
     --security-opt systempaths=unconfined
     --device=/dev/net/tun
     --device=/dev/fuse
-    # Persistent volumes
-    -v devbox-bashhistory:/commandhistory
+    # Per-project volumes
+    -v "devbox-${PROJECT_NAME}-bashhistory:/commandhistory"
+    -v "devbox-${PROJECT_NAME}-docker:/home/node/.local/share/docker"
+    # Shared volumes
     -v devbox-claude-config:/home/node/.claude
-    -v devbox-docker:/home/node/.local/share/docker
     -v devbox-nvim-data:/home/node/.local/share/nvim
     -v devbox-cursor-server:/home/node/.cursor-server
     -e CLAUDE_CONFIG_DIR=/home/node/.claude
@@ -68,6 +77,14 @@ if [ -z "${SSH_AUTH_SOCK:-}" ]; then
     echo "  Add your keys with: ssh-add"
 fi
 
+# Ensure agent has keys loaded
+if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+    if ! ssh-add -l &>/dev/null; then
+        echo "SSH agent has no keys, adding default keys..."
+        ssh-add
+    fi
+fi
+
 # SSH agent forwarding (private keys never enter the container)
 if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
     DOCKER_ARGS+=(
@@ -98,13 +115,7 @@ if [ -n "${NTFY_TOKEN:-}" ]; then
     DOCKER_ARGS+=(-e "NTFY_TOKEN=$NTFY_TOKEN")
 fi
 
-# Workspace: argument or current directory
-PROJECT_PATH=$(realpath "${1:-$PWD}")
-if [ ! -d "$PROJECT_PATH" ]; then
-    echo "ERROR: Directory $PROJECT_PATH does not exist"
-    exit 1
-fi
-echo "Mounting project: $PROJECT_PATH -> /workspace"
+# Mount workspace
 DOCKER_ARGS+=(-v "$PROJECT_PATH:/workspace")
 
 # Print warnings just before starting container (so they're visible)
@@ -112,6 +123,14 @@ if [ -n "$SSH_WARNING" ]; then
     echo "$SSH_WARNING"
 fi
 
+echo "Mounting project: $PROJECT_PATH -> /workspace ($CONTAINER_NAME)"
 echo "Starting devbox..."
-exec docker run "${DOCKER_ARGS[@]}" "$IMAGE" \
+
+# Cleanup docker daemon volume after container exits (images/cache re-download on next run)
+cleanup_docker_volume() {
+    docker volume rm "devbox-${PROJECT_NAME}-docker" 2>/dev/null || true
+}
+trap cleanup_docker_volume EXIT
+
+docker run "${DOCKER_ARGS[@]}" "$IMAGE" \
     zsh -c 'sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh && exec zsh'

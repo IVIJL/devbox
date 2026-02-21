@@ -4,13 +4,29 @@ Portable development environment built on Claude Code devcontainer (node:20/Debi
 
 ## Quick Start
 
-### 1. Build the image
+### Automated Install
+
+```bash
+# Download and review first (recommended):
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/IVIJL/devbox/main/install.sh -o install.sh
+less install.sh
+bash install.sh
+
+# Or one-liner:
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/IVIJL/devbox/main/install.sh | bash -s -- --yes
+```
+
+This installs git, Docker, and keychain, configures SSH agent, clones the repo, builds the image, and installs the `devbox` command. Run `install.sh --help` for details.
+
+### Manual Install
+
+#### 1. Build the image
 
 ```bash
 docker build -t vlcak/devbox:latest .
 ```
 
-### 2. Run standalone (terminal)
+#### 2. Run standalone (terminal)
 
 Install the `devbox` command globally:
 
@@ -33,7 +49,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 devbox
 ```
 
-### 3. Use with Cursor / VS Code
+#### 3. Use with Cursor / VS Code
 
 #### A) This repository (devbox itself)
 

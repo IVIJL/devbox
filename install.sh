@@ -358,11 +358,11 @@ install_keychain() {
 configure_ssh_agent() {
     info "Configuring SSH agent..."
 
-    # Determine shell RC file
+    # Determine login shell profile (runs once per session, not managed by dotfiles)
     local rc_file
     case "$(basename "${SHELL:-/bin/bash}")" in
-        zsh)  rc_file="$HOME/.zshrc" ;;
-        bash) rc_file="$HOME/.bashrc" ;;
+        zsh)  rc_file="$HOME/.zprofile" ;;
+        bash) rc_file="$HOME/.bash_profile" ;;
         *)    rc_file="$HOME/.profile" ;;
     esac
 

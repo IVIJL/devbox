@@ -14,6 +14,7 @@ set -euo pipefail
 
 IMAGE="vlcak/devbox:latest"
 CONTAINER_NAME="devbox"
+SSH_WARNING=""
 
 DOCKER_ARGS=(
     --rm -it
@@ -40,15 +41,42 @@ DOCKER_ARGS=(
     -v "$HOME/.ssh/known_hosts:/home/node/.ssh/known_hosts:ro"
 )
 
+# SSH agent recovery - try to restore agent before giving up
+if [ -z "${SSH_AUTH_SOCK:-}" ]; then
+    # Try keychain's saved agent info
+    keychain_sh="$HOME/.keychain/$(hostname)-sh"
+    if [ -f "$keychain_sh" ]; then
+        # shellcheck disable=SC1090
+        . "$keychain_sh"
+    fi
+fi
+
+# Verify agent is alive (socket path set but socket is dead)
+if [ -n "${SSH_AUTH_SOCK:-}" ] && [ ! -S "$SSH_AUTH_SOCK" ]; then
+    unset SSH_AUTH_SOCK
+fi
+
+# If still no agent, try to start one via keychain
+if [ -z "${SSH_AUTH_SOCK:-}" ] && command -v keychain &>/dev/null; then
+    eval $(keychain --eval --quiet --agents ssh)
+fi
+
+# Final fallback: start plain ssh-agent
+if [ -z "${SSH_AUTH_SOCK:-}" ]; then
+    echo "Starting SSH agent..."
+    eval $(ssh-agent -s) > /dev/null
+    echo "  Add your keys with: ssh-add"
+fi
+
 # SSH agent forwarding (private keys never enter the container)
-if [ -n "${SSH_AUTH_SOCK:-}" ]; then
+if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
     DOCKER_ARGS+=(
         -v "$SSH_AUTH_SOCK:/tmp/ssh-agent.sock"
         -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock
     )
 else
-    echo "WARNING: SSH_AUTH_SOCK not set - SSH agent forwarding won't work"
-    echo "  Start your agent with: eval \$(ssh-agent) && ssh-add"
+    SSH_WARNING="WARNING: SSH agent not available - SSH forwarding won't work inside devbox
+  Ensure keychain or ssh-agent is running, then restart devbox"
 fi
 
 # Pass through API key
@@ -78,6 +106,11 @@ if [ ! -d "$PROJECT_PATH" ]; then
 fi
 echo "Mounting project: $PROJECT_PATH -> /workspace"
 DOCKER_ARGS+=(-v "$PROJECT_PATH:/workspace")
+
+# Print warnings just before starting container (so they're visible)
+if [ -n "$SSH_WARNING" ]; then
+    echo "$SSH_WARNING"
+fi
 
 echo "Starting devbox..."
 exec docker run "${DOCKER_ARGS[@]}" "$IMAGE" \

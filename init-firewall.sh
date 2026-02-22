@@ -73,6 +73,8 @@ done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q)
 DNSMASQ_DOMAINS=(
     "registry.npmjs.org"
     "api.anthropic.com"
+    "platform.claude.com"
+    "claude.ai"
     "sentry.io"
     "statsig.anthropic.com"
     "statsig.com"

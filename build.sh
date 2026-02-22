@@ -8,9 +8,20 @@ set -euo pipefail
 #   ./build.sh                    # normal build (uses cache)
 #   ./build.sh --no-cache         # full rebuild without cache
 #   ./build.sh --progress=plain   # show full build log
+#   ./build.sh --clean-cache      # prune build cache after build
 #
-# All arguments are passed through to docker build.
+# All arguments are passed through to docker build (except --clean-cache).
 # =============================================================================
+
+CLEAN_CACHE=false
+DOCKER_ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "--clean-cache" ]; then
+        CLEAN_CACHE=true
+    else
+        DOCKER_ARGS+=("$arg")
+    fi
+done
 
 IMAGE="vlcak/devbox:latest"
 
@@ -18,7 +29,7 @@ IMAGE="vlcak/devbox:latest"
 OLD_IMAGE_ID=$(docker images -q "$IMAGE" 2>/dev/null || true)
 
 echo "=== Building $IMAGE ==="
-docker build -t "$IMAGE" "$@" "$(dirname "$0")"
+docker build -t "$IMAGE" "${DOCKER_ARGS[@]}" "$(dirname "$0")"
 
 NEW_IMAGE_ID=$(docker images -q "$IMAGE" 2>/dev/null || true)
 
@@ -38,11 +49,17 @@ if [ -n "$DANGLING" ]; then
     docker rmi $DANGLING 2>/dev/null || true
 fi
 
-# Prune build cache (only unreferenced layers)
-echo "Pruning build cache..."
-docker builder prune -f 2>/dev/null || true
+# Prune build cache only when explicitly requested
+if [ "$CLEAN_CACHE" = true ]; then
+    echo "Pruning build cache..."
+    docker builder prune -f 2>/dev/null || true
+fi
 
 echo ""
 echo "=== Done ==="
 docker images "$IMAGE" --format "Image: {{.Repository}}:{{.Tag}}  Size: {{.Size}}  Created: {{.CreatedSince}}"
-docker system df 2>/dev/null | head -5
+echo ""
+echo "Build cache usage:"
+docker system df --format '{{.Type}}\t{{.Size}} total, {{.Reclaimable}} reclaimable' 2>/dev/null | grep -i "build" || true
+echo ""
+echo "Tip: run './build.sh --clean-cache' to prune build cache"

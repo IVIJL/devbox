@@ -86,6 +86,7 @@ DNSMASQ_DOMAINS=(
     "auth.docker.io"
     "production.cloudflare.docker.com"
     "docker.io"
+    "docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com"
 )
 
 # Extra domains from config file

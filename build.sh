@@ -8,22 +8,52 @@ set -euo pipefail
 #   ./build.sh                    # normal build (uses cache)
 #   ./build.sh --no-cache         # full rebuild without cache
 #   ./build.sh --progress=plain   # show full build log
-#   ./build.sh --clean-cache      # prune build cache after build
+#   ./build.sh --clean            # full reset: remove volumes + cache + images, then build
 #
-# All arguments are passed through to docker build (except --clean-cache).
+# All arguments are passed through to docker build (except --clean).
 # =============================================================================
 
-CLEAN_CACHE=false
+CLEAN=false
 DOCKER_ARGS=()
 for arg in "$@"; do
-    if [ "$arg" = "--clean-cache" ]; then
-        CLEAN_CACHE=true
+    if [ "$arg" = "--clean" ]; then
+        CLEAN=true
     else
         DOCKER_ARGS+=("$arg")
     fi
 done
 
 IMAGE="vlcak/devbox:latest"
+
+# Full reset before build: volumes, cache, dangling images
+if [ "$CLEAN" = true ]; then
+    echo "=== Clean: full reset ==="
+
+    VOLUMES=$(docker volume ls -q --filter "name=devbox-" 2>/dev/null || true)
+    if [ -n "$VOLUMES" ]; then
+        echo "Removing devbox volumes:"
+        echo "$VOLUMES"
+        docker volume rm $VOLUMES || true
+        # Verify deletion
+        REMAINING=$(docker volume ls -q --filter "name=devbox-" 2>/dev/null || true)
+        if [ -n "$REMAINING" ]; then
+            echo "ERROR: Failed to remove volumes (containers still running?):"
+            echo "$REMAINING"
+            exit 1
+        fi
+        echo "All devbox volumes removed"
+    else
+        echo "No devbox volumes found"
+    fi
+
+    echo "Pruning all build cache..."
+    docker builder prune --all -f 2>/dev/null || true
+
+    echo "Pruning dangling images..."
+    docker image prune -f 2>/dev/null || true
+
+    echo ""
+fi
 
 # Capture old image ID before build (for dangling cleanup)
 OLD_IMAGE_ID=$(docker images -q "$IMAGE" 2>/dev/null || true)
@@ -49,11 +79,6 @@ if [ -n "$DANGLING" ]; then
     docker rmi $DANGLING 2>/dev/null || true
 fi
 
-# Prune build cache only when explicitly requested
-if [ "$CLEAN_CACHE" = true ]; then
-    echo "Pruning build cache..."
-    docker builder prune -f 2>/dev/null || true
-fi
 
 echo ""
 echo "=== Done ==="
@@ -62,4 +87,9 @@ echo ""
 echo "Build cache usage:"
 docker system df --format '{{.Type}}\t{{.Size}} total, {{.Reclaimable}} reclaimable' 2>/dev/null | grep -i "build" || true
 echo ""
-echo "Tip: run './build.sh --clean-cache' to prune build cache"
+echo "Tip: run './build.sh --clean' for full reset (volumes + cache + images)"
+echo "Manual cleanup:"
+echo "  docker volume ls --filter \"name=devbox-\"                              # list devbox volumes"
+echo "  docker volume rm \$(docker volume ls -q --filter \"name=devbox-\")       # remove all"
+echo "  docker builder prune -f                                               # clear build cache"
+echo "  docker system prune -a                                                # remove everything unused"

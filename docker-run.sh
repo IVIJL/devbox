@@ -27,6 +27,7 @@ CONTAINER_NAME="devbox-$(echo "$PROJECT_NAME" | tr -cs 'a-zA-Z0-9_.-' '-' | sed 
 DOCKER_ARGS=(
     --rm -it
     --name "$CONTAINER_NAME"
+    --hostname "$PROJECT_NAME"
     --cap-add=SYS_ADMIN
     --cap-add=NET_ADMIN
     --cap-add=NET_RAW
@@ -36,7 +37,7 @@ DOCKER_ARGS=(
     --device=/dev/net/tun
     --device=/dev/fuse
     # Per-project volumes
-    -v "devbox-${PROJECT_NAME}-bashhistory:/commandhistory"
+    -v "devbox-${PROJECT_NAME}-history:/home/node/.local/share/atuin"
     -v "devbox-${PROJECT_NAME}-docker:/home/node/.local/share/docker"
     # Shared volumes
     -v devbox-claude-config:/home/node/.claude

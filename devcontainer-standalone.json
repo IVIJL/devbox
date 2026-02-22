@@ -43,7 +43,7 @@
     "source=${localEnv:HOME}/.gitconfig,target=/etc/gitconfig,type=bind,readonly",
     "source=${localEnv:HOME}/.ssh/config,target=/home/node/.ssh/config,type=bind,readonly",
     "source=${localEnv:HOME}/.ssh/known_hosts,target=/home/node/.ssh/known_hosts,type=bind,readonly",
-    "source=devbox-bashhistory,target=/commandhistory,type=volume",
+    "source=devbox-history,target=/home/node/.local/share/atuin,type=volume",
     "source=devbox-claude-config,target=/home/node/.claude,type=volume",
     "source=devbox-workspace,target=/workspace,type=volume",
     "source=devbox-docker,target=/home/node/.local/share/docker,type=volume",

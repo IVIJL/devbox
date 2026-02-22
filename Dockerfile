@@ -1,4 +1,4 @@
-FROM node:20
+FROM node:22
 
 ARG TZ=Europe/Prague
 ENV TZ="$TZ"
@@ -81,11 +81,6 @@ RUN mkdir -p /usr/local/share/npm-global && \
 
 ARG USERNAME=node
 
-# Persist bash history
-RUN SNIPPET="export PROMPT_COMMAND='history -a' && export HISTFILE=/commandhistory/.bash_history" && \
-    mkdir /commandhistory && \
-    touch /commandhistory/.bash_history && \
-    chown -R $USERNAME /commandhistory
 
 # Create workspace and config directories
 RUN mkdir -p /workspace /home/node/.claude && \
@@ -136,7 +131,8 @@ RUN mkdir -p /home/node/.local/bin && \
     curl -sS https://starship.rs/install.sh | sh -s -- --yes --bin-dir /home/node/.local/bin
 
 # Atuin shell history
-RUN curl --proto '=https' --tlsv1.2 -LsSf https://setup.atuin.sh | sh
+RUN curl --proto '=https' --tlsv1.2 -LsSf https://setup.atuin.sh | sh && \
+    mkdir -p /home/node/.local/share/atuin
 
 # UV Python package manager
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -164,22 +160,92 @@ RUN for i in 1 2 3; do \
       nvim --headless "+Lazy! sync" +qa 2>/dev/null && break || sleep 2; \
     done
 
-# Pre-install Mason LSP servers + tools, then trigger blink.cmp + treesitter parsers
-# (auto-install needs FileType events that don't fire in headless mode)
-# Mason is lazy-loaded, so defer the command to let plugins finish loading first
+# Pre-install Mason LSP servers + tools with filesystem-based polling
+# Mason API is_installed() has stale-cache issues, so check package dirs on disk instead
 RUN nvim --headless \
-    -c 'lua vim.defer_fn(function() require("lazy").load({plugins={"mason.nvim","mason-lspconfig.nvim"}}) vim.schedule(function() local ok, err = pcall(vim.cmd, "MasonInstall lua-language-server bash-language-server pyright marksman dockerfile-language-server docker-compose-language-service stylua shfmt shellcheck") if not ok then vim.notify("MasonInstall: " .. err, vim.log.levels.WARN) end end) end, 5000)' \
-    -c 'lua vim.defer_fn(function() vim.cmd("qall") end, 120000)' \
-    2>&1 && \
-    nvim --headless \
-    -c 'lua vim.defer_fn(function() vim.cmd("qall") end, 90000)' \
+    -c 'lua (function() \
+      local pkgs = {"lua-language-server","bash-language-server","pyright","marksman","dockerfile-language-server","docker-compose-language-service","stylua","shfmt","shellcheck"} \
+      local mason_dir = vim.fn.stdpath("data") .. "/mason/packages/" \
+      local function is_pkg_installed(name) return vim.fn.isdirectory(mason_dir .. name) == 1 end \
+      local max_passes = 3 \
+      local pass = 0 \
+      local function run_pass() \
+        pass = pass + 1 \
+        local missing = {} \
+        for _, name in ipairs(pkgs) do \
+          if not is_pkg_installed(name) then missing[#missing+1] = name end \
+        end \
+        if #missing == 0 then \
+          print("All " .. #pkgs .. " Mason packages installed") \
+          vim.cmd("qall"); return \
+        end \
+        if pass > max_passes then \
+          print("Max passes reached, " .. #missing .. " still missing: " .. table.concat(missing, ", ")) \
+          vim.cmd("qall"); return \
+        end \
+        print("Pass " .. pass .. ": installing " .. #missing .. " packages: " .. table.concat(missing, ", ")) \
+        vim.cmd("MasonInstall " .. table.concat(missing, " ")) \
+        local timer = vim.uv.new_timer() \
+        local elapsed = 0 \
+        timer:start(15000, 5000, vim.schedule_wrap(function() \
+          elapsed = elapsed + 5000 \
+          local all_done = true \
+          for _, name in ipairs(missing) do \
+            if not is_pkg_installed(name) then all_done = false; break end \
+          end \
+          if all_done or elapsed >= 90000 then \
+            timer:stop(); timer:close() \
+            if not all_done then print("Pass " .. pass .. " timed out, retrying remaining...") end \
+            run_pass() \
+          end \
+        end)) \
+      end \
+      vim.defer_fn(function() \
+        require("lazy").load({plugins={"mason.nvim","mason-lspconfig.nvim"}}) \
+        vim.schedule(run_pass) \
+      end, 5000) \
+    end)()' \
+    2>&1
+
+# Pre-compile Treesitter parsers
+# TSInstall completes quickly (~15s), use a simple defer to quit after it finishes
+RUN nvim --headless \
+    -c 'lua vim.defer_fn(function() \
+      require("lazy").load({plugins={"nvim-treesitter"}}) \
+      vim.schedule(function() \
+        local langs = {"bash","python","lua","dockerfile","markdown","markdown_inline","json","yaml","toml","vim","vimdoc","regex","query"} \
+        vim.cmd("TSInstall " .. table.concat(langs, " ")) \
+        local timer = vim.uv.new_timer() \
+        timer:start(15000, 5000, vim.schedule_wrap(function() \
+          local all_done = true \
+          for _, lang in ipairs(langs) do \
+            local ok = pcall(vim.treesitter.language.inspect, lang) \
+            if not ok then all_done = false; break end \
+          end \
+          if all_done then \
+            timer:stop(); timer:close() \
+            print("All treesitter parsers installed") \
+            vim.cmd("qall") \
+          end \
+        end)) \
+        vim.defer_fn(function() \
+          timer:stop(); timer:close() \
+          print("TSInstall safety timeout reached") \
+          vim.cmd("qall") \
+        end, 120000) \
+      end) \
+    end, 3000)' \
     2>&1
 
 # Tmux Plugin Manager + config
-RUN git clone --depth 1 https://github.com/tmux-plugins/tpm /home/node/.tmux/plugins/tpm
+RUN git clone --depth 1 https://github.com/tmux-plugins/tpm /home/node/.config/tmux/plugins/tpm
 COPY --chown=node:node config/tmux/tmux.conf /home/node/.config/tmux/tmux.conf
-RUN TMUX_PLUGIN_MANAGER_PATH="/home/node/.tmux/plugins" \
-    /home/node/.tmux/plugins/tpm/bin/install_plugins
+RUN TMUX_PLUGIN_MANAGER_PATH="/home/node/.config/tmux/plugins" \
+    /home/node/.config/tmux/plugins/tpm/bin/install_plugins
+
+# Symlink for chezmoi dotfiles compatibility (tmux.conf references ~/.tmux/plugins/tpm/tpm)
+RUN mkdir -p /home/node/.tmux && \
+    ln -s /home/node/.config/tmux/plugins /home/node/.tmux/plugins
 
 # Python LSP
 RUN /home/node/.local/bin/uv tool install python-lsp-server \
@@ -195,16 +261,24 @@ RUN /home/node/.local/bin/uv tool install ruff
 # =============================================================================
 USER root
 
+# Build stamp for volume freshness detection (must be after all nvim build steps)
+# Written to both /opt/ (survives volume mount) and nvim data dir (Docker copies to fresh volumes)
+RUN STAMP=$(date +%s) && \
+    echo "$STAMP" > /opt/nvim-build-stamp && \
+    echo "$STAMP" > /home/node/.local/share/nvim/.nvim-build-stamp && \
+    chown node:node /home/node/.local/share/nvim/.nvim-build-stamp
+
 COPY init-firewall.sh /usr/local/bin/
 COPY extra-domains.conf /usr/local/etc/devbox-extra-domains.conf
 COPY scripts/setup-chezmoi.sh /usr/local/bin/
 COPY scripts/n scripts/nx /usr/local/bin/
 COPY scripts/start-rootless-docker.sh /usr/local/bin/
 COPY scripts/setup-claude.sh /usr/local/bin/
+COPY scripts/setup-nvim-data.sh /usr/local/bin/
 
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/n /usr/local/bin/nx /usr/local/bin/start-rootless-docker.sh \
-    /usr/local/bin/setup-claude.sh
+    /usr/local/bin/setup-claude.sh /usr/local/bin/setup-nvim-data.sh
 
 RUN printf '%s\n' 'node ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/node-nopasswd && \
     chmod 0440 /etc/sudoers.d/node-nopasswd

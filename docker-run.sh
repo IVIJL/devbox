@@ -10,6 +10,10 @@ set -euo pipefail
 #   devbox nazev                            # attach to running devbox-nazev container
 #   devbox ls                               # list running devbox containers
 #   devbox stop <nazev>                     # stop container and remove docker volume
+#   devbox port <port>                      # expose port on all containers via Traefik
+#   devbox ports                            # list active port routes
+#   devbox allow <domain>                   # allow domain through firewall (all containers)
+#   devbox blocked                          # show blocked connections, interactively allow
 #
 # Install globally:
 #   sudo ln -s /path/to/devbox/docker-run.sh /usr/local/bin/devbox
@@ -17,11 +21,97 @@ set -euo pipefail
 
 IMAGE="vlcak/devbox:latest"
 SSH_WARNING=""
+TRAEFIK_CONFIG_DIR="$HOME/.devbox/traefik/dynamic"
 
 # --- Helper functions --------------------------------------------------------
 
 sanitize() {
     echo "$1" | tr -cs 'a-zA-Z0-9_.-' '-' | sed 's/^-//;s/-$//'
+}
+
+bootstrap_traefik() {
+    docker network inspect devproxy >/dev/null 2>&1 || docker network create devproxy
+
+    mkdir -p "$TRAEFIK_CONFIG_DIR"
+    seed_default_ports
+
+    if ! docker ps --format '{{.Names}}' | grep -qx devbox-traefik; then
+        echo "Starting Traefik proxy..."
+        docker run -d --name devbox-traefik --restart unless-stopped \
+            --network devproxy \
+            -p 127.0.0.1:80:80 \
+            -v /var/run/docker.sock:/var/run/docker.sock:ro \
+            -v "$TRAEFIK_CONFIG_DIR:/etc/traefik/dynamic:ro" \
+            traefik:v3 \
+            --providers.docker=true \
+            --providers.docker.exposedbydefault=false \
+            --providers.docker.network=devproxy \
+            --providers.file.directory=/etc/traefik/dynamic \
+            --providers.file.watch=true \
+            --entrypoints.web.address=:80
+    fi
+}
+
+seed_default_ports() {
+    local ports_file="$HOME/.devbox/default-ports.conf"
+    [ -f "$ports_file" ] && return 0
+    mkdir -p "$HOME/.devbox"
+    cat > "$ports_file" <<'PORTS'
+3000
+3001
+4173
+4200
+5000
+5173
+5174
+8000
+8080
+8081
+8888
+9000
+9090
+PORTS
+}
+
+apply_port_routes() {
+    local container="$1"
+    local project="${container#devbox-}"
+    local ports_file="$HOME/.devbox/default-ports.conf"
+    [ -f "$ports_file" ] || return 0
+
+    while read -r port _rest; do
+        port="${port%%#*}"
+        [ -z "$port" ] && continue
+
+        local host_rule="${port}.${project}.127.0.0.1.traefik.me"
+        local config_file="${TRAEFIK_CONFIG_DIR}/${container}-${port}.yml"
+        local router_name="${container}-${port}"
+
+        cat > "$config_file" <<YAML
+http:
+  routers:
+    ${router_name}:
+      rule: "Host(\`${host_rule}\`)"
+      entryPoints:
+        - web
+      service: ${router_name}
+  services:
+    ${router_name}:
+      loadBalancer:
+        servers:
+          - url: "http://${container}:${port}"
+YAML
+    done < "$ports_file"
+}
+
+stop_traefik_if_idle() {
+    local remaining
+    remaining=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
+    if [ -z "$remaining" ] && docker ps --format '{{.Names}}' | grep -qx devbox-traefik; then
+        docker stop devbox-traefik > /dev/null
+        docker rm devbox-traefik > /dev/null
+        echo "Zastaven: devbox-traefik (žádné zbývající kontejnery)"
+    fi
 }
 
 attach_to_container() {
@@ -31,7 +121,18 @@ attach_to_container() {
 }
 
 list_running_containers() {
-    docker ps --filter "name=^devbox-" --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}'
+    local containers
+    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}\t{{.Status}}\t{{.RunningFor}}' | grep -v '^devbox-traefik\b')
+    if [ -z "$containers" ]; then
+        echo "Žádné běžící devbox kontejnery."
+        return
+    fi
+    printf '%-25s %-50s %s\n' "NAME" "URL" "STATUS"
+    while IFS=$'\t' read -r name status running; do
+        local project="${name#devbox-}"
+        local url="http://<port>.${project}.127.0.0.1.traefik.me"
+        printf '%-25s %-50s %s\n' "$name" "$url" "$status"
+    done <<< "$containers"
 }
 
 # Interactive container picker
@@ -41,7 +142,7 @@ pick_container() {
     local prompt="$1"
     local with_all="${2:-}"
     local running
-    running=$(docker ps --filter "name=^devbox-" --format '{{.Names}}')
+    running=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$')
 
     if [ -z "$running" ]; then
         echo "Žádné běžící devbox kontejnery." >&2
@@ -73,15 +174,83 @@ pick_container() {
 # --- Subcommand parsing ------------------------------------------------------
 
 case "${1:-}" in
-    ls)    MODE="ls";   shift ;;
-    stop)  MODE="stop"; shift; PROJECT_FILTER="${1:-}" ;;
-    *)     MODE="auto" ;;
+    ls)      MODE="ls";      shift ;;
+    stop)    MODE="stop";    shift; PROJECT_FILTER="${1:-}" ;;
+    port)    MODE="port";    shift; PORT_NUM="${1:-}" ;;
+    ports)   MODE="ports";   shift ;;
+    allow)   MODE="allow";   shift; DOMAIN="${1:-}" ;;
+    blocked) MODE="blocked"; shift ;;
+    *)       MODE="auto" ;;
 esac
 
 # --- devbox ls ---------------------------------------------------------------
 
 if [ "$MODE" = "ls" ]; then
     list_running_containers
+    exit 0
+fi
+
+# --- devbox port <port> ------------------------------------------------------
+
+if [ "$MODE" = "port" ]; then
+    if [ -z "${PORT_NUM:-}" ]; then
+        echo "Usage: devbox port <port>" >&2
+        exit 1
+    fi
+
+    if ! [[ "$PORT_NUM" =~ ^[0-9]+$ ]]; then
+        echo "Port must be a number." >&2
+        exit 1
+    fi
+
+    # Persist to default-ports.conf (deduplicated)
+    ports_file="$HOME/.devbox/default-ports.conf"
+    mkdir -p "$HOME/.devbox"
+    touch "$ports_file"
+    grep -qxF "$PORT_NUM" "$ports_file" 2>/dev/null || echo "$PORT_NUM" >> "$ports_file"
+
+    # Apply to all running containers
+    running=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$')
+    if [ -z "$running" ]; then
+        echo "Port uložen do default-ports.conf. Žádné běžící kontejnery."
+        exit 0
+    fi
+
+    mkdir -p "$TRAEFIK_CONFIG_DIR"
+    while IFS= read -r container; do
+        [ -z "$container" ] && continue
+        apply_port_routes "$container"
+    done <<< "$running"
+
+    # Print summary
+    echo "Route přidána pro všechny běžící kontejnery:"
+    while IFS= read -r container; do
+        [ -z "$container" ] && continue
+        local_project="${container#devbox-}"
+        echo "  http://${PORT_NUM}.${local_project}.127.0.0.1.traefik.me → ${container}:${PORT_NUM}"
+    done <<< "$running"
+    exit 0
+fi
+
+# --- devbox ports ------------------------------------------------------------
+
+if [ "$MODE" = "ports" ]; then
+    if [ ! -d "$TRAEFIK_CONFIG_DIR" ] || [ -z "$(ls -A "$TRAEFIK_CONFIG_DIR" 2>/dev/null)" ]; then
+        echo "Žádné aktivní port routy."
+        exit 0
+    fi
+
+    printf '%-55s %s\n' "URL" "TARGET"
+    for f in "$TRAEFIK_CONFIG_DIR"/*.yml; do
+        [ -f "$f" ] || continue
+        # Parse host rule and target URL from YAML
+        # shellcheck disable=SC2016
+        host=$(grep -oP 'Host\(`\K[^`]+' "$f" 2>/dev/null || true)
+        target=$(grep -oP 'url: "\K[^"]+' "$f" 2>/dev/null || true)
+        if [ -n "$host" ] && [ -n "$target" ]; then
+            printf '%-55s %s\n' "http://${host}" "$target"
+        fi
+    done
     exit 0
 fi
 
@@ -94,7 +263,9 @@ if [ "$MODE" = "stop" ]; then
             docker stop "$name" > /dev/null
             docker rm "$name" > /dev/null
             docker volume rm "devbox-${PROJECT_FILTER}-docker" > /dev/null
+            rm -f "$TRAEFIK_CONFIG_DIR/${name}"*.yml 2>/dev/null
             echo "Zastaven: $name"
+            stop_traefik_if_idle
             exit 0
         fi
         echo "Kontejner $name neběží." >&2
@@ -102,19 +273,141 @@ if [ "$MODE" = "stop" ]; then
     # No argument or container not found → interactive selection
     selected=$(pick_container "Zastavit kontejner: " "with_all") || exit 1
     if [ "$selected" = "* Zastavit všechny" ]; then
-        docker ps --filter "name=^devbox-" --format '{{.Names}}' | while IFS= read -r c; do
+        docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' | while IFS= read -r c; do
             proj="${c#devbox-}"
             docker stop "$c" > /dev/null
             docker rm "$c" > /dev/null
             docker volume rm "devbox-${proj}-docker" > /dev/null
+            rm -f "$TRAEFIK_CONFIG_DIR/${c}"*.yml 2>/dev/null
             echo "Zastaven: $c"
         done
+        stop_traefik_if_idle
     else
         proj="${selected#devbox-}"
         docker stop "$selected" > /dev/null
         docker rm "$selected" > /dev/null
         docker volume rm "devbox-${proj}-docker" > /dev/null
+        rm -f "$TRAEFIK_CONFIG_DIR/${selected}"*.yml 2>/dev/null
         echo "Zastaven: $selected"
+        stop_traefik_if_idle
+    fi
+    exit 0
+fi
+
+# --- devbox blocked -----------------------------------------------------------
+
+if [ "$MODE" = "blocked" ]; then
+    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$')
+    if [ -z "$containers" ]; then
+        echo "Žádné běžící devbox kontejnery."
+        exit 0
+    fi
+
+    # Collect blocked IPs from all containers
+    blocked=""
+    while IFS= read -r container; do
+        result=$(docker exec -u root "$container" bash -c \
+            'dmesg 2>/dev/null | grep "DEVBOX_BLOCKED" | grep -oP "DST=\K[0-9.]+" | sort -u' || true)
+        [ -n "$result" ] && blocked=$(printf '%s\n%s' "$blocked" "$result")
+    done <<< "$containers"
+    blocked=$(echo "$blocked" | grep -v '^$' | sort -u)
+
+    if [ -z "$blocked" ]; then
+        echo "Žádná blokovaná spojení."
+        exit 0
+    fi
+
+    # Pick first container for reverse DNS lookups
+    first_container=$(echo "$containers" | head -1)
+
+    # Reverse-resolve IPs and build menu
+    declare -a ips=()
+    declare -a labels=()
+    while IFS= read -r ip; do
+        [ -z "$ip" ] && continue
+        ips+=("$ip")
+        hostname=$(docker exec "$first_container" bash -c "host $ip 2>/dev/null | grep -oP 'pointer \K.*' | sed 's/\.$//' || true")
+        if [ -n "$hostname" ]; then
+            labels+=("$ip ($hostname)")
+        else
+            labels+=("$ip")
+        fi
+    done <<< "$blocked"
+
+    echo "Blokovaná spojení:"
+    echo ""
+    for i in "${!labels[@]}"; do
+        echo "  $((i + 1))) ${labels[$i]}"
+    done
+    echo "  a) Povolit všechny"
+    echo "  q) Zrušit"
+    echo ""
+    printf "Vyber (číslo/a/q): "
+    read -r choice
+
+    if [ "$choice" = "q" ]; then
+        exit 0
+    elif [ "$choice" = "a" ]; then
+        selected_ips=("${ips[@]}")
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#ips[@]}" ]; then
+        selected_ips=("${ips[$((choice - 1))]}")
+    else
+        echo "Neplatná volba." >&2
+        exit 1
+    fi
+
+    for ip in "${selected_ips[@]}"; do
+        hostname=$(docker exec "$first_container" bash -c "host $ip 2>/dev/null | grep -oP 'pointer \K.*' | sed 's/\.$//' || true")
+        if [ -n "$hostname" ]; then
+            "$0" allow "$hostname"
+        else
+            echo "Nelze přeložit IP $ip na doménu, přidávám přímo do ipset..."
+            while IFS= read -r c; do
+                docker exec -u root "$c" bash -c "ipset add allowed-domains '$ip' 2>/dev/null || true"
+            done <<< "$containers"
+        fi
+    done
+    exit 0
+fi
+
+# --- devbox allow <domain> ----------------------------------------------------
+
+if [ "$MODE" = "allow" ]; then
+    if [ -z "${DOMAIN:-}" ]; then
+        # No domain specified → delegate to blocked for interactive selection
+        exec "$0" blocked
+    fi
+
+    # Write domain to shared host file
+    CONF="$HOME/.devbox/allowed-domains.conf"
+    mkdir -p "$HOME/.devbox"
+    touch "$CONF"
+
+    if grep -qxF "$DOMAIN" "$CONF" 2>/dev/null; then
+        echo "Již povoleno: $DOMAIN"
+    else
+        echo "$DOMAIN" >> "$CONF"
+        echo "Povoleno: $DOMAIN"
+    fi
+
+    # Reload dnsmasq in all running containers
+    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$')
+    if [ -n "$containers" ]; then
+        while IFS= read -r container; do
+            docker exec -u root "$container" bash -c "
+                # Regenerate runtime config from shared file
+                > /etc/dnsmasq.d/devbox-runtime.conf
+                while IFS= read -r line; do
+                    line=\$(echo \"\$line\" | sed 's/#.*//' | xargs)
+                    [ -n \"\$line\" ] && echo \"ipset=/\${line}/allowed-domains\" >> /etc/dnsmasq.d/devbox-runtime.conf
+                done < /etc/devbox-shared/allowed-domains.conf
+                # Restart dnsmasq
+                pkill dnsmasq || true
+                dnsmasq --conf-dir=/etc/dnsmasq.d --keep-in-foreground &
+                sleep 0.5
+                nslookup '$DOMAIN' 127.0.0.1 > /dev/null 2>&1 || true
+            " && echo "  Reloaded: $container" || echo "  Failed: $container" >&2
+        done <<< "$containers"
     fi
     exit 0
 fi
@@ -182,10 +475,15 @@ if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
     fi
 fi
 
+# --- Bootstrap Traefik & devproxy network -----------------------------------
+
+bootstrap_traefik
+
 # --- Build docker arguments -------------------------------------------------
 
 DOCKER_ARGS=(
     --hostname "$PROJECT_NAME"
+    --network devproxy
     --cap-add=SYS_ADMIN
     --cap-add=NET_ADMIN
     --cap-add=NET_RAW
@@ -239,6 +537,12 @@ if [ -n "${NTFY_TOKEN:-}" ]; then
     DOCKER_ARGS+=(-e "NTFY_TOKEN=$NTFY_TOKEN")
 fi
 
+# Shared firewall allowlist (host → all containers, read-only)
+DEVBOX_CONFIG_DIR="$HOME/.devbox"
+mkdir -p "$DEVBOX_CONFIG_DIR"
+touch "$DEVBOX_CONFIG_DIR/allowed-domains.conf"
+DOCKER_ARGS+=(-v "$DEVBOX_CONFIG_DIR/allowed-domains.conf:/etc/devbox-shared/allowed-domains.conf:ro")
+
 # Mount workspace
 DOCKER_ARGS+=(-v "$PROJECT_PATH:/workspace")
 
@@ -255,9 +559,27 @@ echo "Starting devbox..."
 # Start container in background
 docker run -d --name "$CONTAINER_NAME" "${DOCKER_ARGS[@]}" "$IMAGE" tail -f /dev/null
 
-# Run init scripts inside the container
+# Apply default port routes
+apply_port_routes "$CONTAINER_NAME"
+
+# Show URL info
+ports_file="$HOME/.devbox/default-ports.conf"
+if [ -f "$ports_file" ] && [ -s "$ports_file" ]; then
+    echo "Port routes:"
+    while read -r port _rest; do
+        port="${port%%#*}"
+        [ -z "$port" ] && continue
+        echo "  http://${port}.${PROJECT_NAME}.127.0.0.1.traefik.me → ${CONTAINER_NAME}:${port}"
+    done < "$ports_file"
+else
+    echo "  Set port: devbox port <port>"
+fi
+
+# Init scripts: firewall runs as root (no sudo needed), rest as node
+docker exec -u root "$CONTAINER_NAME" bash -c \
+    '/usr/local/bin/init-firewall.sh'
 docker exec "$CONTAINER_NAME" bash -c \
-    'sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh'
+    '/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh'
 
 # Attach first interactive session
 exec docker exec -it -w /workspace "$CONTAINER_NAME" zsh

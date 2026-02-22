@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Rootless Docker prerequisites
     uidmap fuse-overlayfs slirp4netns \
     # User packages
-    ncdu mc nala libfuse2 xauth xclip ripgrep fd-find \
+    ncdu mc nala libfuse2 xauth xclip ripgrep fd-find tmux \
     build-essential libclang-dev \
     grc curl wget ca-certificates \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
@@ -98,6 +98,7 @@ RUN chmod +x /etc/claude-defaults/hooks/*.sh /etc/claude-defaults/statusline-inf
 ENV DEVCONTAINER=true
 ENV SHELL=/bin/zsh
 ENV TERM=xterm-256color
+ENV LANG=C.UTF-8
 
 WORKDIR /workspace
 
@@ -173,6 +174,12 @@ RUN nvim --headless \
     nvim --headless \
     -c 'lua vim.defer_fn(function() vim.cmd("qall") end, 90000)' \
     2>&1
+
+# Tmux Plugin Manager + config
+RUN git clone --depth 1 https://github.com/tmux-plugins/tpm /home/node/.tmux/plugins/tpm
+COPY --chown=node:node config/tmux/tmux.conf /home/node/.config/tmux/tmux.conf
+RUN TMUX_PLUGIN_MANAGER_PATH="/home/node/.tmux/plugins" \
+    /home/node/.tmux/plugins/tpm/bin/install_plugins
 
 # Python LSP
 RUN /home/node/.local/bin/uv tool install python-lsp-server \

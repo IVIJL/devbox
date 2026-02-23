@@ -23,23 +23,13 @@ This installs git, Docker, and keychain, configures SSH agent, clones the repo, 
 #### 1. Build the image
 
 ```bash
-docker build -t vlcak/devbox:latest .
+./build.sh
 ```
 
-#### 2. Run standalone (terminal)
-
-Install the `devbox` command globally:
+#### 2. Install the `devbox` command
 
 ```bash
 sudo ln -s $(realpath docker-run.sh) /usr/local/bin/devbox
-```
-
-Then use it from any project directory:
-
-```bash
-cd ~/projects/my-app
-devbox                          # mounts current directory as /workspace
-devbox /path/to/other/project   # mount a specific directory
 ```
 
 Set `ANTHROPIC_API_KEY` before running:
@@ -51,11 +41,11 @@ devbox
 
 #### 3. Use with Cursor / VS Code
 
-#### A) This repository (devbox itself)
+##### A) This repository (devbox itself)
 
 Open this folder in Cursor/VS Code, then **Dev Containers: Reopen in Container**. It uses `.devcontainer/devcontainer.json` automatically.
 
-#### B) Any other project
+##### B) Any other project
 
 Copy a minimal devcontainer config into your project:
 
@@ -99,35 +89,120 @@ EOF
 
 Then open the project in Cursor/VS Code and **Dev Containers: Reopen in Container**.
 
+## CLI Reference
+
+Run `devbox --help` for the full list. Summary:
+
+| Command | Description |
+|---|---|
+| `devbox [path]` | Start/attach container for project (default: CWD) |
+| `devbox <name>` | Attach to running `devbox-<name>` container |
+| `devbox ls` | List running containers |
+| `devbox stop [name] [--clean]` | Stop container; `--clean` removes Docker/history volumes |
+| `devbox remove [name]` | Remove project data (volumes) interactively |
+| `devbox port <port>` | Expose port via Traefik for all running containers |
+| `devbox ports` | List active port routes |
+| `devbox allow [domain]` | List allowed domains, or add one |
+| `devbox deny [domain]` | Remove allowed domain (interactive if no arg) |
+| `devbox blocked` | Show blocked DNS queries, allow interactively via fzf |
+
+## Build
+
+```bash
+./build.sh                       # Build image (uses cache)
+./build.sh --no-cache            # Full rebuild without cache
+./build.sh --progress=plain      # Show full build log
+./build.sh --clean               # Full reset + rebuild
+./build.sh --uninstall           # Full reset without rebuild
+```
+
+All other flags pass through to `docker build`. Set `DEVBOX_SUDO_PASSWORD` env var for non-interactive builds. Run `./build.sh --help` for details.
+
+## Firewall
+
+The container starts with a default-deny firewall (iptables + ipset + dnsmasq). Only domains listed in `~/.devbox/allowed-domains.conf` can be reached. GitHub is allowed by IP range.
+
+Default allowed domains include Anthropic API, npm, PyPI, crates.io, VS Code marketplace, Cursor, and Docker Hub. The file is seeded on first run and can be edited manually or via CLI commands.
+
+### Managing domains
+
+```bash
+devbox allow                     # List all allowed domains
+devbox allow pypi.org            # Add domain to allowlist
+devbox deny                      # Interactive removal (fzf)
+devbox deny example.com          # Remove specific domain
+devbox blocked                   # Show blocked DNS queries, allow interactively
+```
+
+Changes take effect immediately across all running containers — dnsmasq is reloaded and ipset rules are updated without restart.
+
+## Port Routing
+
+Devbox uses a shared Traefik reverse proxy to route HTTP traffic to containers by hostname.
+
+```bash
+devbox port 3000                 # Expose port 3000 on all containers
+devbox ports                     # List active routes
+```
+
+URL format: `http://<port>.<project>.127.0.0.1.traefik.me`
+
+For example, running `devbox port 3000` in a project called `my-app` creates:
+`http://3000.my-app.127.0.0.1.traefik.me` → `devbox-my-app:3000`
+
+Default ports (3000, 5173, 8080, etc.) are applied automatically on container start. The list is stored in `~/.devbox/default-ports.conf` and can be edited.
+
+## Multi-session
+
+Multiple devbox containers can run simultaneously for different projects. Each gets its own:
+
+- Container (`devbox-<project>`)
+- Docker volume (`devbox-<project>-docker`)
+- Shell history volume (`devbox-<project>-history`)
+- Traefik port routes (namespaced by project name)
+
+Shared across all containers:
+- Claude config volume (`devbox-claude-config`)
+- Neovim data volume (`devbox-nvim-data`)
+- Cursor server volume (`devbox-cursor-server`)
+- Firewall allowlist (`~/.devbox/allowed-domains.conf`)
+- Traefik proxy (`devbox-traefik`)
+
+```bash
+devbox ~/projects/app-a          # Start first project
+devbox ~/projects/app-b          # Start second project (new terminal)
+devbox ls                        # List all running containers
+```
+
 ## Environment Variables
 
 | Variable | Description |
 |---|---|
 | `ANTHROPIC_API_KEY` | API key for Claude Code |
-| `DEVBOX_EXTRA_DOMAINS` | Comma-separated extra domains to allow through the firewall |
+| `DEVBOX_SUDO_PASSWORD` | Sudo password for non-interactive builds (default: `devbox`) |
+| `NTFY_TOKEN` | ntfy.sh notification token (auto-detected from Claude hooks) |
 | `TZ` | Timezone (default: `Europe/Prague`) |
 
-## Firewall
+## Docker-in-Docker (Rootless)
 
-The container starts with a default-deny firewall. Only these destinations are allowed:
-
-- **GitHub** (IP ranges from API)
-- **npm registry** (`registry.npmjs.org`)
-- **Anthropic API** (`api.anthropic.com`)
-- **Sentry, Statsig** (telemetry)
-- **VS Code marketplace** (extensions)
-- **rep.gaiagroup.cz**
-- Anything in `extra-domains.conf` or `DEVBOX_EXTRA_DOMAINS`
-
-### Adding extra domains
-
-Per-image (persistent): edit `extra-domains.conf` and rebuild.
-
-Per-run (temporary):
+The container includes a full rootless Docker daemon. It starts automatically on container launch and supports `docker build`, `docker run`, and `docker compose`.
 
 ```bash
-DEVBOX_EXTRA_DOMAINS="pypi.org,files.pythonhosted.org" ./docker-run.sh
+# Inside devbox:
+docker run hello-world
+docker compose up -d
+docker build -t myapp .
 ```
+
+### How it works
+
+Docker runs as the `node` user via `dockerd-rootless.sh` — no `--privileged` flag, no host socket mounting. The daemon uses `fuse-overlayfs` as the storage driver and `slirp4netns` for networking.
+
+**Security:** The container runs with `seccomp=unconfined`, `apparmor=unconfined`, `systempaths=unconfined`, and `CAP_SYS_ADMIN` (all required by rootless Docker for user namespaces and sysctl access). Devices `/dev/net/tun` and `/dev/fuse` are exposed for networking and storage. The container is **not** privileged. An escape would require a kernel exploit.
+
+### Docker data persistence
+
+Docker images and containers are stored in a per-project named volume (`devbox-<project>-docker`), so they survive container restarts without re-pulling images. Volumes persist across `devbox stop` but can be cleaned with `devbox stop --clean` or `devbox remove`.
 
 ## Included Tools
 
@@ -147,36 +222,6 @@ DEVBOX_EXTRA_DOMAINS="pypi.org,files.pythonhosted.org" ./docker-run.sh
 | `chezmoi` | Dotfile manager |
 | `docker` | Docker CE (rootless DinD) with compose and buildx |
 | `mc`, `ncdu`, `jq`, `grc` | Utilities |
-
-## Docker-in-Docker (Rootless)
-
-The container includes a full rootless Docker daemon. It starts automatically on container launch and supports `docker build`, `docker run`, and `docker compose`.
-
-```bash
-# Inside devbox:
-docker run hello-world
-docker compose up -d
-docker build -t myapp .
-```
-
-### How it works
-
-Docker runs as the `node` user via `dockerd-rootless.sh` — no `--privileged` flag, no host socket mounting. The daemon uses `fuse-overlayfs` as the storage driver and `slirp4netns` for networking.
-
-**Security:** The container runs with `seccomp=unconfined`, `apparmor=unconfined`, `systempaths=unconfined`, and `CAP_SYS_ADMIN` (all required by rootless Docker for user namespaces and sysctl access). Devices `/dev/net/tun` and `/dev/fuse` are exposed for networking and storage. The container is **not** privileged. An escape would require a kernel exploit.
-
-### Port forwarding
-
-Ports exposed by inner containers are available on the devbox's network. In Cursor/VS Code, use the Ports tab to forward them to your host. With `docker-run.sh`, add `-p` flags:
-
-```bash
-# Forward port 3000 from inner container to host
-docker run -p 3000:3000 ... vlcak/devbox:latest ...
-```
-
-### Docker data persistence
-
-Docker images and containers are stored in a named volume (`devbox-docker`), so they survive container restarts without re-pulling images.
 
 ## SSH (Agent Forwarding)
 
@@ -229,16 +274,6 @@ Chezmoi initializes from `github.com/IVIJL/vlci-dotfiles` on every container sta
 
 To update dotfiles without rebuilding: just restart the container.
 
-## Rebuilding
-
-```bash
-# Full rebuild
-docker build -t vlcak/devbox:latest .
-
-# No-cache rebuild (e.g. to get latest Claude Code)
-docker build --no-cache -t vlcak/devbox:latest .
-```
-
 ## File Structure
 
 ```
@@ -247,10 +282,28 @@ devbox/
 ├── .devcontainer/
 │   └── devcontainer.json           # For Cursor/VS Code (this repo)
 ├── devcontainer-standalone.json    # For standalone devcontainer CLI usage
-├── init-firewall.sh                # Default-deny firewall
-├── extra-domains.conf              # Extra allowed domains
-├── docker-run.sh                   # Terminal convenience script
+├── docker-run.sh                   # CLI entrypoint (devbox command)
+├── build.sh                        # Build script with cleanup
+├── install.sh                      # Automated installer
+├── init-firewall.sh                # Default-deny firewall (iptables/ipset/dnsmasq)
+├── extra-domains.conf              # Build-time extra allowed domains
+├── config/
+│   ├── claude/                     # Claude Code config
+│   ├── nvim/                       # Neovim config
+│   └── tmux/                       # Tmux config
 └── scripts/
     ├── setup-chezmoi.sh            # postStart: chezmoi init + apply
+    ├── setup-claude.sh             # postStart: Claude Code setup
+    ├── setup-nvim-data.sh          # Neovim data initialization
     └── start-rootless-docker.sh    # postStart: rootless Docker daemon
+```
+
+### Host-side files
+
+```
+~/.devbox/
+├── allowed-domains.conf            # Firewall allowlist (shared to all containers)
+├── default-ports.conf              # Default ports for Traefik routing
+└── traefik/
+    └── dynamic/                    # Traefik route configs (auto-generated)
 ```

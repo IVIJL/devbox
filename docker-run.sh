@@ -2,22 +2,41 @@
 set -euo pipefail
 
 # =============================================================================
-# Devbox - Docker run convenience script
+# Devbox — portable dev container with default-deny firewall
 # =============================================================================
-# Usage:
-#   devbox                                  # mount current directory as /workspace
-#   devbox /path/to/project                 # mount project as /workspace
-#   devbox nazev                            # attach to running devbox-nazev container
-#   devbox ls                               # list running devbox containers
-#   devbox stop <nazev>                     # stop container and remove docker volume
-#   devbox port <port>                      # expose port on all containers via Traefik
-#   devbox ports                            # list active port routes
-#   devbox allow <domain>                   # allow domain through firewall (all containers)
-#   devbox blocked                          # show blocked connections, interactively allow
-#
-# Install globally:
-#   sudo ln -s /path/to/devbox/docker-run.sh /usr/local/bin/devbox
+# Run 'devbox --help' for usage information.
+# Install: sudo ln -s /path/to/devbox/docker-run.sh /usr/local/bin/devbox
 # =============================================================================
+
+show_help() {
+    cat <<'EOF'
+Devbox — portable dev container with default-deny firewall
+
+Usage:
+  devbox [path]                    Start/attach container for project
+  devbox <name>                    Attach to running devbox-<name>
+  devbox ls                        List running containers
+  devbox stop [name] [--clean]     Stop container (--clean removes volumes)
+  devbox remove [name]             Remove project data (volumes)
+  devbox port <port>               Expose port via Traefik
+  devbox ports                     List active port routes
+  devbox allow [domain]            List or add allowed firewall domain
+  devbox deny [domain]             Remove allowed domain (interactive)
+  devbox blocked                   Show blocked DNS queries, allow interactively
+
+Examples:
+  devbox                           Mount CWD as /workspace
+  devbox ~/projects/app            Mount specific project
+  devbox stop my-app               Stop specific container
+  devbox stop --clean              Stop + remove Docker/history volumes
+  devbox remove                    Interactive project data cleanup
+  devbox port 3000                 Route 3000.<project>.127.0.0.1.traefik.me
+  devbox allow pypi.org            Allow pypi.org through firewall
+  devbox deny                      Interactive domain removal
+  devbox blocked                   See blocked queries, allow with fzf
+EOF
+    exit 0
+}
 
 IMAGE="vlcak/devbox:latest"
 SSH_WARNING=""
@@ -288,6 +307,7 @@ pick_container() {
 CLEAN_VOLUMES=false
 
 case "${1:-}" in
+    -h|--help|help) show_help ;;
     ls)      MODE="ls";      shift ;;
     stop)    MODE="stop";    shift; PROJECT_FILTER=""
              # Parse --clean flag and optional project name (any order)

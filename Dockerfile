@@ -292,6 +292,8 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
 # Password is injected via --mount=type=secret (never stored in image layers/metadata)
 # Build with: docker build --secret id=sudo_password,src=<file> ...
 # Falls back to "devbox" if no secret is provided
+# NOTE: SUDO_CACHE_BUST forces cache invalidation — secret content alone doesn't bust cache
+ARG SUDO_CACHE_BUST
 RUN --mount=type=secret,id=sudo_password \
     PASS=$(cat /run/secrets/sudo_password 2>/dev/null || echo "devbox") && \
     echo "node:${PASS}" | chpasswd && \

@@ -2,17 +2,31 @@
 set -euo pipefail
 
 # =============================================================================
-# Devbox - Build script with automatic cleanup
+# Devbox — build script
 # =============================================================================
-# Usage:
-#   ./build.sh                    # normal build (uses cache)
-#   ./build.sh --no-cache         # full rebuild without cache
-#   ./build.sh --progress=plain   # show full build log
-#   ./build.sh --clean            # full reset: remove volumes + cache + images, then build
-#   ./build.sh --uninstall        # full reset without rebuild (remove volumes + cache + images)
-#
-# All arguments are passed through to docker build (except --clean/--uninstall).
+# Run './build.sh --help' for usage information.
 # =============================================================================
+
+show_help() {
+    cat <<'EOF'
+Devbox — build script
+
+Usage:
+  ./build.sh                       Build image (uses cache)
+  ./build.sh --no-cache            Full rebuild without cache
+  ./build.sh --progress=plain      Show full build log
+  ./build.sh --clean               Full reset + rebuild
+  ./build.sh --uninstall           Full reset without rebuild
+
+All other flags pass through to docker build.
+Set DEVBOX_SUDO_PASSWORD env var for non-interactive builds.
+EOF
+    exit 0
+}
+
+case "${1:-}" in
+    -h|--help) show_help ;;
+esac
 
 CLEAN=false
 UNINSTALL=false
@@ -98,6 +112,8 @@ fi
 printf '%s' "$SUDO_PASSWORD" > "$SUDO_PASSWORD_FILE"
 unset SUDO_PASSWORD SUDO_PASSWORD_CONFIRM
 DOCKER_ARGS+=(--secret "id=sudo_password,src=$SUDO_PASSWORD_FILE")
+# Force cache invalidation — secret content alone doesn't bust Docker build cache
+DOCKER_ARGS+=(--build-arg "SUDO_CACHE_BUST=$(date +%s)")
 
 if [ "$CLEAN" = true ]; then
     echo "=== Clean: full reset ==="

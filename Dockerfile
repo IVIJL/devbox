@@ -153,6 +153,9 @@ COPY --chown=node:node config/nvim/lua/config/lazy.lua /home/node/.config/nvim/l
 COPY --chown=node:node config/nvim/lua/plugins/pylsp.lua /home/node/.config/nvim/lua/plugins/pylsp.lua
 COPY --chown=node:node config/nvim/lua/plugins/treesitter-parsers.lua /home/node/.config/nvim/lua/plugins/treesitter-parsers.lua
 COPY --chown=node:node config/nvim/lua/plugins/ruff.lua /home/node/.config/nvim/lua/plugins/ruff.lua
+COPY --chown=node:node config/nvim/lua/plugins/markdown-preview.lua /home/node/.config/nvim/lua/plugins/markdown-preview.lua
+COPY --chown=node:node config/nvim/lua/plugins/markdown-lint.lua /home/node/.config/nvim/lua/plugins/markdown-lint.lua
+COPY --chown=node:node config/nvim/.markdownlint-cli2.yaml /home/node/.config/nvim/.markdownlint-cli2.yaml
 
 # Set PATH early so tree-sitter-cli + claude are available for headless steps
 ENV PATH="/home/node/.claude/local/bin:/home/node/.local/bin:/home/node/.cargo/bin:/home/node/.atuin/bin:$PATH"
@@ -270,6 +273,9 @@ RUN STAMP=$(date +%s) && \
     echo "$STAMP" > /home/node/.local/share/nvim/.nvim-build-stamp && \
     chown node:node /home/node/.local/share/nvim/.nvim-build-stamp
 
+# Shared firewall allowlist mount point (bind-mounted :ro from host)
+RUN mkdir -p /etc/devbox-shared
+
 COPY init-firewall.sh /usr/local/bin/
 COPY extra-domains.conf /usr/local/etc/devbox-extra-domains.conf
 COPY scripts/setup-chezmoi.sh /usr/local/bin/
@@ -282,8 +288,14 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/n /usr/local/bin/nx /usr/local/bin/start-rootless-docker.sh \
     /usr/local/bin/setup-claude.sh /usr/local/bin/setup-nvim-data.sh
 
-RUN printf '%s\n' 'node ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/node-nopasswd && \
-    chmod 0440 /etc/sudoers.d/node-nopasswd
+# Sudo with password — prevents AI agents from modifying firewall rules
+# Password is injected via --mount=type=secret (never stored in image layers/metadata)
+# Build with: docker build --secret id=sudo_password,src=<file> ...
+# Falls back to "devbox" if no secret is provided
+RUN --mount=type=secret,id=sudo_password \
+    PASS=$(cat /run/secrets/sudo_password 2>/dev/null || echo "devbox") && \
+    echo "node:${PASS}" | chpasswd && \
+    usermod -aG sudo node
 
 # X11 forwarding support
 RUN printf '%s\n' 'Defaults env_keep += "DISPLAY XAUTHORITY"' > /etc/sudoers.d/x11-forward && \

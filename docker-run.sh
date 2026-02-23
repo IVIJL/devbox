@@ -33,6 +33,7 @@ bootstrap_traefik() {
     docker network inspect devproxy >/dev/null 2>&1 || docker network create devproxy
 
     mkdir -p "$TRAEFIK_CONFIG_DIR"
+    seed_allowed_domains
     seed_default_ports
 
     if ! docker ps --format '{{.Names}}' | grep -qx devbox-traefik; then
@@ -49,6 +50,62 @@ bootstrap_traefik() {
             --providers.file.directory=/etc/traefik/dynamic \
             --providers.file.watch=true \
             --entrypoints.web.address=:80
+    fi
+}
+
+seed_allowed_domains() {
+    local domains_file="$HOME/.devbox/allowed-domains.conf"
+    mkdir -p "$HOME/.devbox"
+
+    local defaults
+    defaults=$(cat <<'DOMAINS'
+# Devbox allowed domains — edit freely, one domain per line
+# Claude Code
+api.anthropic.com
+platform.claude.com
+claude.ai
+sentry.io
+statsig.anthropic.com
+statsig.com
+# npm
+registry.npmjs.org
+# PyPI
+pypi.org
+files.pythonhosted.org
+# Rust crates
+crates.io
+static.crates.io
+# VS Code / Cursor
+marketplace.visualstudio.com
+vscode.blob.core.windows.net
+update.code.visualstudio.com
+cursor.com
+cursor.sh
+# Docker Hub (rootless DinD)
+registry-1.docker.io
+auth.docker.io
+production.cloudflare.docker.com
+docker.io
+docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com
+# Custom
+gaiagroup.cz
+DOMAINS
+)
+
+    if [ ! -f "$domains_file" ]; then
+        echo "$defaults" > "$domains_file"
+    elif ! grep -q '^# Devbox allowed domains' "$domains_file" 2>/dev/null; then
+        # Migration: old file without defaults — prepend defaults, keep user entries
+        local user_entries
+        user_entries=$(grep -v '^\s*#' "$domains_file" 2>/dev/null | grep -v '^\s*$' || true)
+        echo "$defaults" > "$domains_file"
+        if [ -n "$user_entries" ]; then
+            echo "" >> "$domains_file"
+            echo "# User-added" >> "$domains_file"
+            while IFS= read -r entry; do
+                grep -qxF "$entry" "$domains_file" 2>/dev/null || echo "$entry" >> "$domains_file"
+            done <<< "$user_entries"
+        fi
     fi
 }
 
@@ -139,6 +196,57 @@ list_running_containers() {
     done <<< "$containers"
 }
 
+# Regenerate dnsmasq runtime config and restart in all running containers
+# $1 = optional domain to resolve after restart (for allow)
+# $2 = optional space-separated domains to remove from ipset (for deny)
+reload_dnsmasq_in_containers() {
+    local resolve_domain="${1:-}"
+    local deny_domains="${2:-}"
+    local containers
+    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$')
+    [ -z "$containers" ] && return 0
+    while IFS= read -r container; do
+        docker exec -u root "$container" bash -c '
+            # Regenerate runtime config from shared file
+            : > /etc/dnsmasq.d/devbox-runtime.conf
+            if [ -f /etc/devbox-shared/allowed-domains.conf ]; then
+                while IFS= read -r line; do
+                    line=$(echo "$line" | sed "s/#.*//" | xargs)
+                    [ -n "$line" ] && echo "ipset=/${line}/allowed-domains" >> /etc/dnsmasq.d/devbox-runtime.conf
+                done < /etc/devbox-shared/allowed-domains.conf
+            fi
+            # Kill dnsmasq reliably
+            pkill -9 dnsmasq 2>/dev/null || true
+            # Wait for process to actually die
+            for _i in 1 2 3 4 5; do
+                pgrep -x dnsmasq >/dev/null 2>&1 || break
+                sleep 0.1
+            done
+            rm -f /run/dnsmasq/dnsmasq.pid /var/run/dnsmasq/dnsmasq.pid 2>/dev/null
+            # Start dnsmasq and verify
+            if ! dnsmasq --conf-dir=/etc/dnsmasq.d 2>&1; then
+                echo "ERROR: dnsmasq failed to start" >&2
+                exit 1
+            fi
+            sleep 0.3
+            if ! pgrep -x dnsmasq >/dev/null 2>&1; then
+                echo "ERROR: dnsmasq not running after start" >&2
+                exit 1
+            fi
+            # Remove denied domains IPs from ipset
+            for deny_domain in '"$deny_domains"'; do
+                nslookup "$deny_domain" 127.0.0.1 2>/dev/null | grep -oP "Address: \K[0-9.]+" | while read -r ip; do
+                    ipset del allowed-domains "$ip" 2>/dev/null || true
+                done
+            done
+            # Resolve new domain to populate ipset (if allow)
+            if [ -n "'"$resolve_domain"'" ]; then
+                nslookup "'"$resolve_domain"'" 127.0.0.1 > /dev/null 2>&1 || true
+            fi
+        ' && echo "  Reloaded: $container" || echo "  Failed: $container" >&2
+    done <<< "$containers"
+}
+
 # Interactive container picker
 # $1 = prompt text, $2 = optionally "with_all" to add "stop all" option
 # Returns selected name on stdout, returns 1 on cancel/empty
@@ -194,6 +302,7 @@ case "${1:-}" in
     port)    MODE="port";    shift; PORT_NUM="${1:-}" ;;
     ports)   MODE="ports";   shift ;;
     allow)   MODE="allow";   shift; DOMAIN="${1:-}" ;;
+    deny)    MODE="deny";    shift; DOMAIN="${1:-}" ;;
     blocked) MODE="blocked"; shift ;;
     *)       MODE="auto" ;;
 esac
@@ -428,86 +537,125 @@ if [ "$MODE" = "blocked" ]; then
         exit 0
     fi
 
-    # Collect blocked IPs from all containers
-    blocked=""
+    # Collect queried domains from dnsmasq logs across all containers
+    # then filter out domains that are already allowed (have ipset rules)
+    all_queried=""
     while IFS= read -r container; do
-        result=$(docker exec -u root "$container" bash -c \
-            'dmesg 2>/dev/null | grep "DEVBOX_BLOCKED" | grep -oP "DST=\K[0-9.]+" | sort -u' || true)
-        [ -n "$result" ] && blocked=$(printf '%s\n%s' "$blocked" "$result")
+        queried=$(docker exec -u root "$container" bash -c '
+            [ -f /var/log/dnsmasq-queries.log ] || exit 0
+            grep "^.*query\[A\]" /var/log/dnsmasq-queries.log \
+                | grep -oP "query\[A\] \K[^ ]+" \
+                | sort -u
+        ' 2>/dev/null || true)
+        [ -n "$queried" ] && all_queried=$(printf '%s\n%s' "$all_queried" "$queried")
     done <<< "$containers"
+    all_queried=$(echo "$all_queried" | grep -v '^$' | sort -u)
+
+    if [ -z "$all_queried" ]; then
+        echo "Žádné DNS dotazy v logu."
+        exit 0
+    fi
+
+    # Get list of allowed domains from dnsmasq ipset config (inside first container)
+    first_container=$(echo "$containers" | head -1)
+    allowed_domains=$(docker exec "$first_container" bash -c '
+        grep "^ipset=" /etc/dnsmasq.d/*.conf 2>/dev/null \
+            | grep -oP "ipset=/\K[^/]+" \
+            | sort -u
+    ' 2>/dev/null || true)
+
+    # Filter: show only domains NOT covered by allowed list
+    blocked=""
+    while IFS= read -r domain; do
+        [ -z "$domain" ] && continue
+        is_allowed=false
+        while IFS= read -r allowed; do
+            [ -z "$allowed" ] && continue
+            # Check exact match or subdomain match (queried is *.allowed)
+            if [ "$domain" = "$allowed" ] || [[ "$domain" == *."$allowed" ]]; then
+                is_allowed=true
+                break
+            fi
+        done <<< "$allowed_domains"
+        if [ "$is_allowed" = false ]; then
+            blocked=$(printf '%s\n%s' "$blocked" "$domain")
+        fi
+    done <<< "$all_queried"
     blocked=$(echo "$blocked" | grep -v '^$' | sort -u)
 
     if [ -z "$blocked" ]; then
-        echo "Žádná blokovaná spojení."
+        echo "Žádné blokované domény."
         exit 0
     fi
 
-    # Pick first container for reverse DNS lookups
-    first_container=$(echo "$containers" | head -1)
-
-    # Reverse-resolve IPs and build menu
-    declare -a ips=()
-    declare -a labels=()
-    while IFS= read -r ip; do
-        [ -z "$ip" ] && continue
-        ips+=("$ip")
-        hostname=$(docker exec "$first_container" bash -c "host $ip 2>/dev/null | grep -oP 'pointer \K.*' | sed 's/\.$//' || true")
-        if [ -n "$hostname" ]; then
-            labels+=("$ip ($hostname)")
-        else
-            labels+=("$ip")
-        fi
+    # Build menu
+    declare -a domains=()
+    while IFS= read -r d; do
+        [ -z "$d" ] && continue
+        domains+=("$d")
     done <<< "$blocked"
 
-    echo "Blokovaná spojení:"
-    echo ""
-    for i in "${!labels[@]}"; do
-        echo "  $((i + 1))) ${labels[$i]}"
-    done
-    echo "  a) Povolit všechny"
-    echo "  q) Zrušit"
-    echo ""
-    printf "Vyber (číslo/a/q): "
-    read -r choice
-
-    if [ "$choice" = "q" ]; then
-        exit 0
-    elif [ "$choice" = "a" ]; then
-        selected_ips=("${ips[@]}")
-    elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#ips[@]}" ]; then
-        selected_ips=("${ips[$((choice - 1))]}")
+    if command -v fzf &>/dev/null; then
+        options=$(printf "* Povolit všechny\n%s" "$blocked")
+        selected=$(echo "$options" | fzf --prompt="Povolit doménu: " --multi) || exit 1
     else
-        echo "Neplatná volba." >&2
-        exit 1
+        echo "Blokované domény:"
+        echo ""
+        for i in "${!domains[@]}"; do
+            echo "  $((i + 1))) ${domains[$i]}"
+        done
+        echo "  a) Povolit všechny"
+        echo "  q) Zrušit"
+        echo ""
+        printf "Vyber (číslo/a/q): "
+        read -r choice
+
+        if [ "$choice" = "q" ]; then
+            exit 0
+        elif [ "$choice" = "a" ]; then
+            selected="* Povolit všechny"
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#domains[@]}" ]; then
+            selected="${domains[$((choice - 1))]}"
+        else
+            echo "Neplatná volba." >&2
+            exit 1
+        fi
     fi
 
-    for ip in "${selected_ips[@]}"; do
-        hostname=$(docker exec "$first_container" bash -c "host $ip 2>/dev/null | grep -oP 'pointer \K.*' | sed 's/\.$//' || true")
-        if [ -n "$hostname" ]; then
-            "$0" allow "$hostname"
+    while IFS= read -r sel; do
+        if [ "$sel" = "* Povolit všechny" ]; then
+            for d in "${domains[@]}"; do
+                "$0" allow "$d"
+            done
         else
-            echo "Nelze přeložit IP $ip na doménu, přidávám přímo do ipset..."
-            while IFS= read -r c; do
-                docker exec -u root "$c" bash -c "ipset add allowed-domains '$ip' 2>/dev/null || true"
-            done <<< "$containers"
+            "$0" allow "$sel"
         fi
-    done
+    done <<< "$selected"
     exit 0
 fi
 
 # --- devbox allow <domain> ----------------------------------------------------
 
 if [ "$MODE" = "allow" ]; then
-    if [ -z "${DOMAIN:-}" ]; then
-        # No domain specified → delegate to blocked for interactive selection
-        exec "$0" blocked
-    fi
-
-    # Write domain to shared host file
     CONF="$HOME/.devbox/allowed-domains.conf"
     mkdir -p "$HOME/.devbox"
     touch "$CONF"
 
+    # No domain specified → list allowed domains
+    if [ -z "${DOMAIN:-}" ]; then
+        echo "Povolené domény (~/.devbox/allowed-domains.conf):"
+        allowed_list=$(grep -v '^\s*#' "$CONF" 2>/dev/null | grep -v '^\s*$' | sort || true)
+        if [ -n "$allowed_list" ]; then
+            echo "$allowed_list" | while read -r d; do echo "  $d"; done
+        else
+            echo "  (žádné)"
+        fi
+        echo ""
+        echo "Použití: devbox allow <domain>  |  devbox deny <domain>"
+        exit 0
+    fi
+
+    # Add domain
     if grep -qxF "$DOMAIN" "$CONF" 2>/dev/null; then
         echo "Již povoleno: $DOMAIN"
     else
@@ -515,25 +663,70 @@ if [ "$MODE" = "allow" ]; then
         echo "Povoleno: $DOMAIN"
     fi
 
-    # Reload dnsmasq in all running containers
-    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$')
-    if [ -n "$containers" ]; then
-        while IFS= read -r container; do
-            docker exec -u root "$container" bash -c "
-                # Regenerate runtime config from shared file
-                > /etc/dnsmasq.d/devbox-runtime.conf
-                while IFS= read -r line; do
-                    line=\$(echo \"\$line\" | sed 's/#.*//' | xargs)
-                    [ -n \"\$line\" ] && echo \"ipset=/\${line}/allowed-domains\" >> /etc/dnsmasq.d/devbox-runtime.conf
-                done < /etc/devbox-shared/allowed-domains.conf
-                # Restart dnsmasq
-                pkill dnsmasq || true
-                dnsmasq --conf-dir=/etc/dnsmasq.d --keep-in-foreground &
-                sleep 0.5
-                nslookup '$DOMAIN' 127.0.0.1 > /dev/null 2>&1 || true
-            " && echo "  Reloaded: $container" || echo "  Failed: $container" >&2
-        done <<< "$containers"
+    reload_dnsmasq_in_containers "$DOMAIN" ""
+    exit 0
+fi
+
+# --- devbox deny [domain] ----------------------------------------------------
+
+if [ "$MODE" = "deny" ]; then
+    CONF="$HOME/.devbox/allowed-domains.conf"
+
+    if [ ! -f "$CONF" ] || ! grep -v '^\s*#' "$CONF" 2>/dev/null | grep -qv '^\s*$'; then
+        echo "Žádné domény k odebrání."
+        exit 0
     fi
+
+    DENIED=""
+
+    if [ -z "${DOMAIN:-}" ]; then
+        # Interactive selection
+        runtime=$(grep -v '^\s*#' "$CONF" | grep -v '^\s*$' | sort)
+        if command -v fzf &>/dev/null; then
+            selected=$(echo "$runtime" | fzf --prompt="Odebrat doménu: " --multi) || exit 1
+        else
+            echo "Runtime domény:"
+            echo ""
+            declare -a items=()
+            while IFS= read -r d; do
+                [ -z "$d" ] && continue
+                items+=("$d")
+            done <<< "$runtime"
+            for i in "${!items[@]}"; do
+                echo "  $((i + 1))) ${items[$i]}"
+            done
+            echo "  q) Zrušit"
+            echo ""
+            printf "Vyber (číslo/q): "
+            read -r choice
+            if [ "$choice" = "q" ]; then
+                exit 0
+            elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#items[@]}" ]; then
+                selected="${items[$((choice - 1))]}"
+            else
+                echo "Neplatná volba." >&2
+                exit 1
+            fi
+        fi
+
+        while IFS= read -r sel; do
+            [ -z "$sel" ] && continue
+            { grep -vxF "$sel" "$CONF" || true; } > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
+            echo "Odebráno: $sel"
+            DENIED+="$sel "
+        done <<< "$selected"
+    else
+        if grep -qxF "$DOMAIN" "$CONF" 2>/dev/null; then
+            { grep -vxF "$DOMAIN" "$CONF" || true; } > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
+            echo "Odebráno: $DOMAIN"
+            DENIED="$DOMAIN"
+        else
+            echo "Doména $DOMAIN není v seznamu." >&2
+            exit 1
+        fi
+    fi
+
+    reload_dnsmasq_in_containers "" "$DENIED"
     exit 0
 fi
 

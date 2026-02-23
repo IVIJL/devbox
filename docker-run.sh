@@ -54,9 +54,9 @@ bootstrap_traefik() {
 
 seed_default_ports() {
     local ports_file="$HOME/.devbox/default-ports.conf"
-    [ -f "$ports_file" ] && return 0
     mkdir -p "$HOME/.devbox"
-    cat > "$ports_file" <<'PORTS'
+    if [ ! -f "$ports_file" ]; then
+        cat > "$ports_file" <<'PORTS'
 3000
 3001
 4173
@@ -67,10 +67,14 @@ seed_default_ports() {
 8000
 8080
 8081
+8090
 8888
 9000
 9090
 PORTS
+    fi
+    # Ensure required ports are present (e.g. markdown-preview on 8090)
+    grep -qxF "8090" "$ports_file" 2>/dev/null || echo "8090" >> "$ports_file"
 }
 
 apply_port_routes() {
@@ -173,9 +177,20 @@ pick_container() {
 
 # --- Subcommand parsing ------------------------------------------------------
 
+CLEAN_VOLUMES=false
+
 case "${1:-}" in
     ls)      MODE="ls";      shift ;;
-    stop)    MODE="stop";    shift; PROJECT_FILTER="${1:-}" ;;
+    stop)    MODE="stop";    shift; PROJECT_FILTER=""
+             # Parse --clean flag and optional project name (any order)
+             for arg in "$@"; do
+                 case "$arg" in
+                     --clean) CLEAN_VOLUMES=true ;;
+                     *)       PROJECT_FILTER="$arg" ;;
+                 esac
+             done
+             ;;
+    remove)  MODE="remove";  shift; PROJECT_FILTER="${1:-}" ;;
     port)    MODE="port";    shift; PORT_NUM="${1:-}" ;;
     ports)   MODE="ports";   shift ;;
     allow)   MODE="allow";   shift; DOMAIN="${1:-}" ;;
@@ -257,14 +272,25 @@ fi
 # --- devbox stop [nazev] -----------------------------------------------------
 
 if [ "$MODE" = "stop" ]; then
+    remove_project_volumes() {
+        local proj="$1"
+        for suffix in docker history; do
+            docker volume rm "devbox-${proj}-${suffix}" > /dev/null 2>&1 || true
+        done
+    }
+
     if [ -n "$PROJECT_FILTER" ]; then
         name="devbox-${PROJECT_FILTER}"
         if docker ps --filter "name=^${name}$" --format '{{.ID}}' | grep -q .; then
             docker stop "$name" > /dev/null
             docker rm "$name" > /dev/null
-            docker volume rm "devbox-${PROJECT_FILTER}-docker" > /dev/null
+            if [ "$CLEAN_VOLUMES" = true ]; then
+                remove_project_volumes "$PROJECT_FILTER"
+                echo "Zastaven + odstraněna data: $name"
+            else
+                echo "Zastaven: $name"
+            fi
             rm -f "$TRAEFIK_CONFIG_DIR/${name}"*.yml 2>/dev/null
-            echo "Zastaven: $name"
             stop_traefik_if_idle
             exit 0
         fi
@@ -277,19 +303,118 @@ if [ "$MODE" = "stop" ]; then
             proj="${c#devbox-}"
             docker stop "$c" > /dev/null
             docker rm "$c" > /dev/null
-            docker volume rm "devbox-${proj}-docker" > /dev/null
+            if [ "$CLEAN_VOLUMES" = true ]; then
+                remove_project_volumes "$proj"
+                echo "Zastaven + odstraněna data: $c"
+            else
+                echo "Zastaven: $c"
+            fi
             rm -f "$TRAEFIK_CONFIG_DIR/${c}"*.yml 2>/dev/null
-            echo "Zastaven: $c"
         done
         stop_traefik_if_idle
     else
         proj="${selected#devbox-}"
         docker stop "$selected" > /dev/null
         docker rm "$selected" > /dev/null
-        docker volume rm "devbox-${proj}-docker" > /dev/null
+        if [ "$CLEAN_VOLUMES" = true ]; then
+            remove_project_volumes "$proj"
+            echo "Zastaven + odstraněna data: $selected"
+        else
+            echo "Zastaven: $selected"
+        fi
         rm -f "$TRAEFIK_CONFIG_DIR/${selected}"*.yml 2>/dev/null
-        echo "Zastaven: $selected"
         stop_traefik_if_idle
+    fi
+    exit 0
+fi
+
+# --- devbox remove [nazev] ----------------------------------------------------
+
+if [ "$MODE" = "remove" ]; then
+    is_project_running() {
+        docker ps --filter "name=^devbox-${1}$" --format '{{.ID}}' | grep -q .
+    }
+
+    remove_project_data() {
+        local proj="$1"
+        local found=false
+        for suffix in docker history; do
+            local vol="devbox-${proj}-${suffix}"
+            if docker volume inspect "$vol" > /dev/null 2>&1; then
+                docker volume rm "$vol" > /dev/null
+                echo "  Smazán volume: $vol"
+                found=true
+            fi
+        done
+        if [ "$found" = false ]; then
+            echo "  Žádné volumes pro projekt $proj." >&2
+            return 1
+        fi
+    }
+
+    # Find projects that have per-project volumes
+    list_projects_with_volumes() {
+        docker volume ls -q --filter "name=devbox-" 2>/dev/null \
+            | grep -E -- '^devbox-.+-(docker|history)$' \
+            | sed 's/^devbox-//;s/-\(docker\|history\)$//' \
+            | sort -u || true
+    }
+
+    if [ -n "$PROJECT_FILTER" ]; then
+        if is_project_running "$PROJECT_FILTER"; then
+            echo "Kontejner devbox-${PROJECT_FILTER} běží — nejdřív ho zastav." >&2
+            exit 1
+        fi
+        echo "Odstraňuji data projektu: $PROJECT_FILTER"
+        remove_project_data "$PROJECT_FILTER"
+        exit $?
+    fi
+
+    # Interactive: list projects with volumes
+    projects=$(list_projects_with_volumes)
+    if [ -z "$projects" ]; then
+        echo "Žádné devbox projektové volumes."
+        exit 0
+    fi
+
+    options=$(printf "* Odstranit všechny\n%s" "$projects")
+    if command -v fzf &>/dev/null; then
+        selected=$(echo "$options" | fzf --prompt="Odstranit projekt: ") || exit 1
+    else
+        echo "" >&2
+        echo "Projekty s volumes:" >&2
+        i=1
+        while IFS= read -r line; do
+            echo "  $i) $line" >&2
+            i=$((i + 1))
+        done <<< "$options"
+        echo "" >&2
+        printf "Vyberte projekt k odstranění: " >&2
+        read -r choice
+        selected=$(sed -n "${choice}p" <<< "$options")
+    fi
+
+    if [ -z "$selected" ]; then
+        echo "Neplatná volba." >&2
+        exit 1
+    fi
+
+    if [ "$selected" = "* Odstranit všechny" ]; then
+        while IFS= read -r proj; do
+            if is_project_running "$proj"; then
+                echo "Kontejner devbox-${proj} běží — přeskakuji." >&2
+                continue
+            fi
+            echo "Odstraňuji data projektu: $proj"
+            remove_project_data "$proj" || true
+        done <<< "$projects"
+    else
+        if is_project_running "$selected"; then
+            echo "Kontejner devbox-${selected} běží — nejdřív ho zastav." >&2
+            exit 1
+        fi
+        echo "Odstraňuji data projektu: $selected"
+        remove_project_data "$selected"
     fi
     exit 0
 fi

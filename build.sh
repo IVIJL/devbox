@@ -9,30 +9,31 @@ set -euo pipefail
 #   ./build.sh --no-cache         # full rebuild without cache
 #   ./build.sh --progress=plain   # show full build log
 #   ./build.sh --clean            # full reset: remove volumes + cache + images, then build
+#   ./build.sh --uninstall        # full reset without rebuild (remove volumes + cache + images)
 #
-# All arguments are passed through to docker build (except --clean).
+# All arguments are passed through to docker build (except --clean/--uninstall).
 # =============================================================================
 
 CLEAN=false
+UNINSTALL=false
 DOCKER_ARGS=()
 for arg in "$@"; do
-    if [ "$arg" = "--clean" ]; then
-        CLEAN=true
-    else
-        DOCKER_ARGS+=("$arg")
-    fi
+    case "$arg" in
+        --clean)     CLEAN=true ;;
+        --uninstall) UNINSTALL=true ;;
+        *)           DOCKER_ARGS+=("$arg") ;;
+    esac
 done
 
 IMAGE="vlcak/devbox:latest"
 
-# Full reset before build: volumes, cache, dangling images
-if [ "$CLEAN" = true ]; then
-    echo "=== Clean: full reset ==="
-
+# Full reset: volumes, cache, dangling images
+full_reset() {
     VOLUMES=$(docker volume ls -q --filter "name=devbox-" 2>/dev/null || true)
     if [ -n "$VOLUMES" ]; then
         echo "Removing devbox volumes:"
         echo "$VOLUMES"
+        # shellcheck disable=SC2086  # intentional word splitting — each volume name is a separate arg
         docker volume rm $VOLUMES || true
         # Verify deletion
         REMAINING=$(docker volume ls -q --filter "name=devbox-" 2>/dev/null || true)
@@ -53,6 +54,54 @@ if [ "$CLEAN" = true ]; then
     docker image prune -f 2>/dev/null || true
 
     echo ""
+}
+
+# --- Uninstall: full reset without rebuild -----------------------------------
+
+if [ "$UNINSTALL" = true ]; then
+    echo "=== Uninstall: full reset ==="
+    full_reset
+
+    # Remove devbox image
+    if docker images -q "$IMAGE" 2>/dev/null | grep -q .; then
+        echo "Removing devbox image..."
+        docker rmi "$IMAGE" 2>/dev/null || true
+    fi
+
+    echo "=== Uninstall done ==="
+    exit 0
+fi
+
+# --- Sudo password prompt ---------------------------------------------------
+# Password is set at build time so sudo inside the container requires authentication.
+# This prevents AI agents / untrusted code from modifying firewall rules via sudo.
+# Passed via --mount=type=secret to avoid leaking into image layers/metadata.
+SUDO_PASSWORD_FILE=$(mktemp)
+trap 'rm -f "$SUDO_PASSWORD_FILE"' EXIT
+if [ -t 0 ]; then
+    read -s -r -p "Set sudo password for devbox: " SUDO_PASSWORD
+    echo ""
+    read -s -r -p "Confirm password: " SUDO_PASSWORD_CONFIRM
+    echo ""
+    if [ "$SUDO_PASSWORD" != "$SUDO_PASSWORD_CONFIRM" ]; then
+        echo "ERROR: Passwords don't match"
+        exit 1
+    fi
+    if [ -z "$SUDO_PASSWORD" ]; then
+        echo "ERROR: Password cannot be empty"
+        exit 1
+    fi
+else
+    # Non-interactive: use env var or default
+    SUDO_PASSWORD="${DEVBOX_SUDO_PASSWORD:-devbox}"
+fi
+printf '%s' "$SUDO_PASSWORD" > "$SUDO_PASSWORD_FILE"
+unset SUDO_PASSWORD SUDO_PASSWORD_CONFIRM
+DOCKER_ARGS+=(--secret "id=sudo_password,src=$SUDO_PASSWORD_FILE")
+
+if [ "$CLEAN" = true ]; then
+    echo "=== Clean: full reset ==="
+    full_reset
 fi
 
 # Capture old image ID before build (for dangling cleanup)
@@ -76,6 +125,7 @@ fi
 DANGLING=$(docker images -q --filter "dangling=true" 2>/dev/null || true)
 if [ -n "$DANGLING" ]; then
     echo "Removing dangling images..."
+    # shellcheck disable=SC2086  # intentional word splitting — each image ID is a separate arg
     docker rmi $DANGLING 2>/dev/null || true
 fi
 
@@ -88,8 +138,9 @@ echo "Build cache usage:"
 docker system df --format '{{.Type}}\t{{.Size}} total, {{.Reclaimable}} reclaimable' 2>/dev/null | grep -i "build" || true
 echo ""
 echo "Tip: run './build.sh --clean' for full reset (volumes + cache + images)"
+echo "      run './build.sh --uninstall' for full reset without rebuild"
 echo "Manual cleanup:"
 echo "  docker volume ls --filter \"name=devbox-\"                              # list devbox volumes"
 echo "  docker volume rm \$(docker volume ls -q --filter \"name=devbox-\")       # remove all"
-echo "  docker builder prune -f                                               # clear build cache"
+echo "  docker builder prune --all -f                                         # clear build cache"
 echo "  docker system prune -a                                                # remove everything unused"

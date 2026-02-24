@@ -194,6 +194,7 @@ install_docker_ce() {
     # shellcheck disable=SC1091
     local docker_id=""
     if [ "$PM" = "apt-get" ]; then
+        # shellcheck disable=SC1091  # /etc/os-release is a system file, not available to shellcheck
         docker_id=$(. /etc/os-release && echo "$ID")
         [[ "$docker_id" =~ ^[a-z]+$ ]] || error "Invalid OS ID for Docker repo: $docker_id"
     fi
@@ -218,6 +219,7 @@ install_docker_ce() {
                     warn "gpg not available, skipping Docker GPG key fingerprint verification."
                 fi
             fi
+            # shellcheck disable=SC1091
             echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${docker_id} $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
                 sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
             sudo apt-get update
@@ -375,8 +377,10 @@ configure_ssh_agent() {
             msg "Adding keychain eval to $rc_file..."
             local keychain_cmd
             if [ "$OS" = "macos" ]; then
+                # shellcheck disable=SC2016  # intentionally writing literal $() into shell rc file
                 keychain_cmd='eval $(keychain --eval --quiet --agents ssh --inherit any)'
             else
+                # shellcheck disable=SC2016
                 keychain_cmd='eval $(keychain --eval --quiet --agents ssh)'
             fi
             printf '\n%s\n%s\n' "$marker" "$keychain_cmd" >> "$rc_file"

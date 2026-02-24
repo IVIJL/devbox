@@ -165,6 +165,8 @@ Shared across all containers:
 - Neovim data volume (`devbox-nvim-data`)
 - Cursor server volume (`devbox-cursor-server`)
 - Firewall allowlist (`~/.config/devbox/allowed-domains.conf`)
+- Host `~/.claude/` directory (read-only, for user-level `CLAUDE.md`)
+- Host `~/.config/git/ignore` (global gitignore)
 - Traefik proxy (`devbox-traefik`)
 
 ```bash
@@ -338,4 +340,10 @@ devbox/
 ├── ssh_config                      # Devbox-specific SSH config (mounted as ~/.ssh/config)
 └── traefik/
     └── dynamic/                    # Traefik route configs (auto-generated)
+
+~/.config/git/
+└── ignore                          # Global gitignore (mounted live into containers)
+
+~/.claude/
+└── CLAUDE.md                       # User-level Claude instructions (mounted live into containers)
 ```

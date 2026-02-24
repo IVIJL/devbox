@@ -22,6 +22,12 @@ else
     "$CHEZMOI_BIN" update --apply=false || true
 fi
 
+# Ignore files that are bind-mounted read-only from host
+CHEZMOI_IGNORE="$HOME/.local/share/chezmoi/.chezmoiignore"
+if ! grep -qxF ".config/git/ignore" "$CHEZMOI_IGNORE" 2>/dev/null; then
+    echo ".config/git/ignore" >> "$CHEZMOI_IGNORE"
+fi
+
 # Always apply (idempotent)
 echo "Applying chezmoi dotfiles..."
 "$CHEZMOI_BIN" apply --force

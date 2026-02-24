@@ -45,7 +45,9 @@
     "source=devbox-claude-config-${devcontainerId},target=/home/node/.claude,type=volume",
     "source=devbox-docker-${devcontainerId},target=/home/node/.local/share/docker,type=volume",
     "source=devbox-nvim-data-${devcontainerId},target=/home/node/.local/share/nvim,type=volume",
-    "source=devbox-cursor-server-${devcontainerId},target=/home/node/.cursor-server,type=volume"
+    "source=devbox-cursor-server-${devcontainerId},target=/home/node/.cursor-server,type=volume",
+    "source=${localEnv:HOME}/.config/git/ignore,target=/home/node/.config/git/ignore,type=bind,readonly",
+    "source=${localEnv:HOME}/.claude,target=/home/node/.host-config/claude,type=bind,readonly"
   ],
   "containerEnv": {
     "NODE_OPTIONS": "--max-old-space-size=4096",

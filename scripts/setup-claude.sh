@@ -10,9 +10,9 @@ TARGET="/home/node/.claude"
 
 # Ensure .claude.json exists (prevents "config not found" warnings on fresh volume)
 if [ ! -f "$TARGET/.claude.json" ]; then
-    if ls "$TARGET/backups/.claude.json.backup."* &>/dev/null; then
+    if compgen -G "$TARGET/backups/.claude.json.backup.*" >/dev/null; then
         # Restore from most recent backup
-        latest=$(ls -t "$TARGET/backups/.claude.json.backup."* | head -1)
+        latest=$(find "$TARGET/backups" -name '.claude.json.backup.*' -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
         cp "$latest" "$TARGET/.claude.json"
         echo "Restored .claude.json from backup"
     else
@@ -28,5 +28,10 @@ cp "$DEFAULTS/statusline-info.sh" "$TARGET/statusline-info.sh"
 # Always overwrite hooks directory
 mkdir -p "$TARGET/hooks"
 cp "$DEFAULTS/hooks/"*.sh "$TARGET/hooks/"
+
+# Symlink user-level CLAUDE.md from host bind mount (live, directory mount)
+if [ -f /home/node/.host-config/claude/CLAUDE.md ]; then
+    ln -sf /home/node/.host-config/claude/CLAUDE.md "$TARGET/CLAUDE.md"
+fi
 
 echo "Claude Code config seeded from image defaults"

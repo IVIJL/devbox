@@ -281,11 +281,13 @@ COPY extra-domains.conf /usr/local/etc/devbox-extra-domains.conf
 COPY scripts/setup-chezmoi.sh /usr/local/bin/
 COPY scripts/n scripts/nx /usr/local/bin/
 COPY scripts/start-rootless-docker.sh /usr/local/bin/
+COPY scripts/devbox-entrypoint.sh /usr/local/bin/
 COPY scripts/setup-claude.sh /usr/local/bin/
 COPY scripts/setup-nvim-data.sh /usr/local/bin/
 
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/n /usr/local/bin/nx /usr/local/bin/start-rootless-docker.sh \
+    /usr/local/bin/devbox-entrypoint.sh \
     /usr/local/bin/setup-claude.sh /usr/local/bin/setup-nvim-data.sh
 
 # Sudo with password — prevents AI agents from modifying firewall rules

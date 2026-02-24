@@ -191,6 +191,24 @@ YAML
     done < "$ports_file"
 }
 
+# Gracefully stop a devbox container — stop inner DinD containers first
+graceful_stop_container() {
+    local name="$1"
+    docker exec "$name" bash -c '
+        if [ -S "$XDG_RUNTIME_DIR/docker.sock" ] && docker info >/dev/null 2>&1; then
+            inner=$(docker ps --format "{{.ID}} {{.Names}}" 2>/dev/null)
+            if [ -n "$inner" ]; then
+                echo "Stopping inner containers..."
+                while read -r cid cname; do
+                    echo "  Stopping: $cname ($cid)"
+                    docker stop -t 30 "$cid" >/dev/null 2>&1 || true
+                done <<< "$inner"
+            fi
+        fi
+    ' 2>/dev/null || true
+    docker stop -t 15 "$name" > /dev/null 2>&1 || true
+}
+
 stop_traefik_if_idle() {
     local remaining
     remaining=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
@@ -447,7 +465,7 @@ if [ "$MODE" = "stop" ]; then
     if [ -n "$PROJECT_FILTER" ]; then
         name="devbox-${PROJECT_FILTER}"
         if docker ps -a --filter "name=^${name}$" --format '{{.ID}}' | grep -q .; then
-            docker stop "$name" > /dev/null 2>&1 || true
+            graceful_stop_container "$name"
             docker rm "$name" > /dev/null
             if [ "$CLEAN_VOLUMES" = true ]; then
                 remove_project_volumes "$PROJECT_FILTER"
@@ -466,7 +484,7 @@ if [ "$MODE" = "stop" ]; then
     if [ "$selected" = "* Zastavit všechny" ]; then
         docker ps -a --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' | while IFS= read -r c; do
             proj="${c#devbox-}"
-            docker stop "$c" > /dev/null 2>&1 || true
+            graceful_stop_container "$c"
             docker rm "$c" > /dev/null
             if [ "$CLEAN_VOLUMES" = true ]; then
                 remove_project_volumes "$proj"
@@ -479,7 +497,7 @@ if [ "$MODE" = "stop" ]; then
         stop_traefik_if_idle
     else
         proj="${selected#devbox-}"
-        docker stop "$selected" > /dev/null 2>&1 || true
+        graceful_stop_container "$selected"
         docker rm "$selected" > /dev/null
         if [ "$CLEAN_VOLUMES" = true ]; then
             remove_project_volumes "$proj"
@@ -949,7 +967,7 @@ echo "Mounting project: $PROJECT_PATH -> /workspace ($CONTAINER_NAME)"
 echo "Starting devbox..."
 
 # Start container in background
-docker run -d --name "$CONTAINER_NAME" "${DOCKER_ARGS[@]}" "$IMAGE" tail -f /dev/null
+docker run -d --name "$CONTAINER_NAME" --stop-timeout 45 "${DOCKER_ARGS[@]}" "$IMAGE" devbox-entrypoint.sh
 
 # Apply default port routes
 apply_port_routes "$CONTAINER_NAME"

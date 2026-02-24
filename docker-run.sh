@@ -245,7 +245,7 @@ restart_exited_container() {
 
 list_running_containers() {
     local containers
-    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}\t{{.Status}}\t{{.RunningFor}}' | grep -v '^devbox-traefik\b')
+    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}\t{{.Status}}\t{{.RunningFor}}' | grep -v '^devbox-traefik\b' || true)
     if [ -z "$containers" ]; then
         echo "Žádné běžící devbox kontejnery."
     else
@@ -259,7 +259,7 @@ list_running_containers() {
 
     local exited
     exited=$(docker ps -a --filter "name=^devbox-" --filter "status=exited" \
-        --format '{{.Names}}\t{{.Status}}' | grep -v '^devbox-traefik\b')
+        --format '{{.Names}}\t{{.Status}}' | grep -v '^devbox-traefik\b' || true)
     if [ -n "$exited" ]; then
         echo ""
         echo "Exited (use 'devbox <name>' to restart):"
@@ -276,7 +276,7 @@ reload_dnsmasq_in_containers() {
     local resolve_domain="${1:-}"
     local deny_domains="${2:-}"
     local containers
-    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$')
+    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
     [ -z "$containers" ] && return 0
     while IFS= read -r container; do
         docker exec -u root "$container" bash -c '
@@ -327,7 +327,7 @@ pick_container() {
     local prompt="$1"
     local with_all="${2:-}"
     local running
-    running=$(docker ps -a --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$')
+    running=$(docker ps -a --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
 
     if [ -z "$running" ]; then
         echo "Žádné devbox kontejnery." >&2
@@ -408,7 +408,7 @@ if [ "$MODE" = "port" ]; then
     grep -qxF "$PORT_NUM" "$ports_file" 2>/dev/null || echo "$PORT_NUM" >> "$ports_file"
 
     # Apply to all running containers
-    running=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$')
+    running=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
     if [ -z "$running" ]; then
         echo "Port uložen do default-ports.conf. Žádné běžící kontejnery."
         exit 0
@@ -482,7 +482,7 @@ if [ "$MODE" = "stop" ]; then
     # No argument or container not found → interactive selection
     selected=$(pick_container "Zastavit kontejner: " "with_all") || exit 1
     if [ "$selected" = "* Zastavit všechny" ]; then
-        docker ps -a --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' | while IFS= read -r c; do
+        docker ps -a --filter "name=^devbox-" --format '{{.Names}}' | { grep -v '^devbox-traefik$' || true; } | while IFS= read -r c; do
             proj="${c#devbox-}"
             graceful_stop_container "$c"
             docker rm "$c" > /dev/null
@@ -605,7 +605,7 @@ fi
 # --- devbox blocked -----------------------------------------------------------
 
 if [ "$MODE" = "blocked" ]; then
-    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$')
+    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
     if [ -z "$containers" ]; then
         echo "Žádné běžící devbox kontejnery."
         exit 0

@@ -25,6 +25,7 @@ Usage:
   devbox allow [domain]            List or add allowed firewall domain
   devbox deny [domain]             Remove allowed domain (interactive)
   devbox blocked                   Show blocked DNS queries, allow interactively
+  devbox cursor [name]             Open Cursor attached to running devbox
   devbox ssh-config [add|edit]     Manage devbox SSH config
 
 Build flags:
@@ -38,6 +39,8 @@ Examples:
   devbox ~/projects/app            Mount specific project
   devbox --ssh-config ~/app        Mount with full host SSH config
   devbox ssh-config add            Add SSH host to devbox config
+  devbox cursor                     Open Cursor for CWD project
+  devbox cursor my-app              Open Cursor for specific devbox
   devbox stop my-app               Stop specific container
   devbox stop --clean              Stop + remove Docker/history volumes
   devbox remove                    Interactive project data cleanup
@@ -398,6 +401,7 @@ case "${1:-}" in
     allow)   MODE="allow";   shift; DOMAIN="${1:-}" ;;
     deny)    MODE="deny";    shift; DOMAIN="${1:-}" ;;
     blocked)   MODE="blocked";   shift ;;
+    cursor)    MODE="cursor";     shift; CURSOR_TARGET="${1:-}" ;;
     ssh-config) MODE="ssh-config"; shift; SSH_CONFIG_ACTION="${1:-}" ;;
     build)     MODE="build";     shift ;;
     uninstall) MODE="uninstall"; shift ;;
@@ -421,6 +425,46 @@ fi
 
 if [ "$MODE" = "uninstall" ]; then
     exec "$DEVBOX_DIR/build.sh" --uninstall
+fi
+
+# --- devbox cursor [name] ---------------------------------------------------
+
+if [ "$MODE" = "cursor" ]; then
+    if ! command -v cursor &>/dev/null; then
+        echo "Error: 'cursor' CLI not found in PATH." >&2
+        echo "Install it: Cursor → Cmd+Shift+P → 'Install cursor command in PATH'" >&2
+        exit 1
+    fi
+
+    # Determine target container
+    if [ -n "${CURSOR_TARGET:-}" ]; then
+        CONTAINER_NAME="devbox-$(sanitize "$CURSOR_TARGET")"
+    else
+        PROJECT_NAME="$(sanitize "$(basename "$(pwd)")")"
+        CONTAINER_NAME="devbox-${PROJECT_NAME}"
+    fi
+
+    # Verify container is running
+    if ! docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.Names}}' | grep -q .; then
+        echo "Container $CONTAINER_NAME is not running." >&2
+        # Try to pick from running containers
+        selected=$(pick_container "Select container: ") || exit 1
+        CONTAINER_NAME="$selected"
+    fi
+
+    # Build attached-container URI for Cursor
+    # Format: vscode-remote://attached-container+<hex-encoded-json>/workspace
+    ATTACH_JSON="{\"containerName\":\"/${CONTAINER_NAME}\"}"
+    if command -v xxd &>/dev/null; then
+        HEX=$(printf '%s' "$ATTACH_JSON" | xxd -p | tr -d '\n')
+    else
+        HEX=$(printf '%s' "$ATTACH_JSON" | od -A n -t x1 | tr -d ' \n')
+    fi
+    FOLDER_URI="vscode-remote://attached-container+${HEX}/workspace"
+
+    echo "Opening Cursor attached to $CONTAINER_NAME..."
+    cursor --folder-uri "$FOLDER_URI"
+    exit 0
 fi
 
 # --- devbox port <port> ------------------------------------------------------

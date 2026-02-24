@@ -35,6 +35,12 @@
 - [ ] Aktuálně `/workspace` je bind mount → compose soubory jsou automaticky dostupné
 - [ ] Ověřit že `docker compose up` uvnitř devboxu funguje s DinD a volumes přežijí restart
 
-### Cursor problemy
-- [ ] Kdyz jsem dal aby cursor nabehnul jako dev conainer pri buildovani tree sitteru a dalsich veci to uplne zamrzne. Prozkoumat proc pripadne jestli je potreba instalovat nvim a podobne veci kdyz tam pracuju v cursoru, nvim je dobre mit v devboxu ale pro cursor pripojeni uplne neni potreba buildovat.
+### Cursor integrace
+- [x] Prozkoumat proč Cursor zamrzne při "Reopen in Container" (tree-sitter build z Dockerfile)
+      → Řešení: používat `devbox cursor` (attach to running) místo rebuild
+- [x] `devbox cursor [name]` — nový subcommand, otevře Cursor připojený k běžícímu devboxu
+- [x] `.devcontainer/cursor/devcontainer.json` — lightweight varianta (image místo build)
+- [x] `.vscode/launch.json` — debug konfigurace (Node.js, Python)
+- [x] `.vscode/settings.json` — attach defaults (extensions, terminal)
+- [ ] Ověřit `devbox cursor` end-to-end (spustit devbox, pak `devbox cursor`, debug breakpoint)
 

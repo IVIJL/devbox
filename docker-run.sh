@@ -21,9 +21,16 @@ Usage:
   devbox port <port>               Expose port via Traefik
   devbox ports                     List active port routes
   devbox build [flags]             Build/rebuild the devbox image
+  devbox uninstall                 Remove everything (containers, volumes, image)
   devbox allow [domain]            List or add allowed firewall domain
   devbox deny [domain]             Remove allowed domain (interactive)
   devbox blocked                   Show blocked DNS queries, allow interactively
+
+Build flags:
+  devbox build                     Build image (uses cache)
+  devbox build --no-cache          Full rebuild without cache
+  devbox build --clean             Full reset (volumes + cache) + rebuild
+  devbox build --progress=plain    Show full build log
 
 Examples:
   devbox                           Mount CWD as /workspace
@@ -386,9 +393,10 @@ case "${1:-}" in
     ports)   MODE="ports";   shift ;;
     allow)   MODE="allow";   shift; DOMAIN="${1:-}" ;;
     deny)    MODE="deny";    shift; DOMAIN="${1:-}" ;;
-    blocked) MODE="blocked"; shift ;;
-    build)   MODE="build";   shift ;;
-    *)       MODE="auto" ;;
+    blocked)   MODE="blocked";   shift ;;
+    build)     MODE="build";     shift ;;
+    uninstall) MODE="uninstall"; shift ;;
+    *)         MODE="auto" ;;
 esac
 
 # --- devbox ls ---------------------------------------------------------------
@@ -402,6 +410,12 @@ fi
 
 if [ "$MODE" = "build" ]; then
     exec "$DEVBOX_DIR/build.sh" "$@"
+fi
+
+# --- devbox uninstall --------------------------------------------------------
+
+if [ "$MODE" = "uninstall" ]; then
+    exec "$DEVBOX_DIR/build.sh" --uninstall
 fi
 
 # --- devbox port <port> ------------------------------------------------------

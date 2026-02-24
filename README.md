@@ -68,8 +68,6 @@ cat > /path/to/project/.devcontainer/devcontainer.json << 'EOF'
   "remoteUser": "node",
   "mounts": [
     "source=${localEnv:HOME}/.gitconfig,target=/etc/gitconfig,type=bind,readonly",
-    "source=${localEnv:HOME}/.ssh/config,target=/home/node/.ssh/config,type=bind,readonly",
-    "source=${localEnv:HOME}/.ssh/known_hosts,target=/home/node/.ssh/known_hosts,type=bind,readonly",
     "source=devbox-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
     "source=devbox-claude-config-${devcontainerId},target=/home/node/.claude,type=volume",
     "source=devbox-docker-${devcontainerId},target=/home/node/.local/share/docker,type=volume"
@@ -95,7 +93,7 @@ Run `devbox --help` for the full list. Summary:
 
 | Command | Description |
 |---|---|
-| `devbox [path]` | Start/attach container for project (default: CWD) |
+| `devbox [--ssh-config] [path]` | Start/attach container for project (default: CWD) |
 | `devbox <name>` | Attach to running `devbox-<name>` container |
 | `devbox ls` | List running and exited containers |
 | `devbox stop [name] [--clean]` | Stop container; `--clean` removes Docker/history volumes |
@@ -105,6 +103,7 @@ Run `devbox --help` for the full list. Summary:
 | `devbox allow [domain]` | List allowed domains, or add one |
 | `devbox deny [domain]` | Remove allowed domain (interactive if no arg) |
 | `devbox blocked` | Show blocked DNS queries, allow interactively via fzf |
+| `devbox ssh-config [add\|edit]` | Manage devbox-specific SSH config |
 
 ## Build
 
@@ -237,7 +236,30 @@ Private SSH keys are **never** mounted into the container. Instead, the containe
 
 Inside the container, verify with `ssh-add -l` (should list your keys).
 
-Only `~/.ssh/config` and `~/.ssh/known_hosts` are bind-mounted (read-only) for host/proxy configuration.
+Host `~/.ssh/config` and `~/.ssh/known_hosts` are **not mounted by default** to prevent leaking server addresses and usernames. GitHub SSH host keys are pre-populated in the image, so `git push/pull` works out of the box.
+
+### Devbox SSH config
+
+To configure SSH hosts for use inside devbox without exposing your full host config:
+
+```bash
+devbox ssh-config                # Show current config
+devbox ssh-config add            # Add host interactively
+devbox ssh-config edit           # Open in $EDITOR
+```
+
+The config is stored in `~/.config/devbox/ssh_config` and automatically mounted into every container. Remember to also allow the domain in the firewall (`devbox allow example.com`).
+
+### Full host SSH config
+
+To temporarily mount your full host `~/.ssh/config` and `~/.ssh/known_hosts`:
+
+```bash
+devbox --ssh-config              # Mount with host SSH config
+devbox --ssh-config ~/project    # Specific project with host SSH config
+```
+
+This flag only takes effect on container creation. For a running container: `devbox stop && devbox --ssh-config`.
 
 **Cursor/VS Code** handles SSH agent forwarding automatically via the devcontainers extension.
 
@@ -313,6 +335,7 @@ devbox/
 ~/.config/devbox/
 ├── allowed-domains.conf            # Firewall allowlist (shared to all containers)
 ├── default-ports.conf              # Default ports for Traefik routing
+├── ssh_config                      # Devbox-specific SSH config (mounted as ~/.ssh/config)
 └── traefik/
     └── dynamic/                    # Traefik route configs (auto-generated)
 ```

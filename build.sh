@@ -43,6 +43,17 @@ IMAGE="vlcak/devbox:latest"
 
 # Full reset: volumes, cache, dangling images
 full_reset() {
+    # Stop and remove all devbox containers (including traefik) so volumes can be deleted
+    CONTAINERS=$(docker ps -a --filter "name=^devbox-" --format '{{.Names}}' 2>/dev/null || true)
+    if [ -n "$CONTAINERS" ]; then
+        echo "Stopping devbox containers..."
+        while IFS= read -r c; do
+            docker stop -t 15 "$c" > /dev/null 2>&1 || true
+            docker rm "$c" > /dev/null 2>&1 || true
+            echo "  Removed: $c"
+        done <<< "$CONTAINERS"
+    fi
+
     VOLUMES=$(docker volume ls -q --filter "name=devbox-" 2>/dev/null || true)
     if [ -n "$VOLUMES" ]; then
         echo "Removing devbox volumes:"
@@ -82,6 +93,54 @@ if [ "$UNINSTALL" = true ]; then
         docker rmi "$IMAGE" 2>/dev/null || true
     fi
 
+    # Remove traefik image
+    if docker images -q "traefik" 2>/dev/null | grep -q .; then
+        echo "Removing traefik image..."
+        docker rmi traefik:v3 2>/dev/null || true
+    fi
+
+    # Remove devproxy network
+    if docker network inspect devproxy >/dev/null 2>&1; then
+        echo "Removing devproxy network..."
+        docker network rm devproxy 2>/dev/null || true
+    fi
+
+    # Remove symlink
+    if [ -L "/usr/local/bin/devbox" ]; then
+        echo "Removing /usr/local/bin/devbox symlink..."
+        sudo rm -f /usr/local/bin/devbox
+    fi
+
+    # Remove install directory (if installed via install.sh)
+    INSTALL_DIR="$HOME/.local/share/devbox"
+    if [ -d "$INSTALL_DIR" ]; then
+        echo "Removing install directory: $INSTALL_DIR"
+        rm -rf "$INSTALL_DIR"
+    fi
+
+    # Ask about config directory
+    CONFIG_DIR="$HOME/.config/devbox"
+    # Also check old location
+    [ -d "$HOME/.devbox" ] && [ ! -d "$CONFIG_DIR" ] && CONFIG_DIR="$HOME/.devbox"
+    if [ -d "$CONFIG_DIR" ]; then
+        echo ""
+        echo "Config directory found: $CONFIG_DIR"
+        echo "  Contains: allowed-domains.conf, default-ports.conf, traefik configs"
+        if [ -t 0 ]; then
+            printf "Remove config directory? [y/N] "
+            read -r answer
+            if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
+                rm -rf "$CONFIG_DIR"
+                echo "Removed: $CONFIG_DIR"
+            else
+                echo "Kept: $CONFIG_DIR"
+            fi
+        else
+            echo "  Skipped (non-interactive). Remove manually: rm -rf $CONFIG_DIR"
+        fi
+    fi
+
+    echo ""
     echo "=== Uninstall done ==="
     exit 0
 fi

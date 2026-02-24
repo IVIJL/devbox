@@ -120,7 +120,7 @@ All other flags pass through to `docker build`. Set `DEVBOX_SUDO_PASSWORD` env v
 
 ## Firewall
 
-The container starts with a default-deny firewall (iptables + ipset + dnsmasq). Only domains listed in `~/.devbox/allowed-domains.conf` can be reached. GitHub is allowed by IP range.
+The container starts with a default-deny firewall (iptables + ipset + dnsmasq). Only domains listed in `~/.config/devbox/allowed-domains.conf` can be reached. GitHub is allowed by IP range.
 
 Default allowed domains include Anthropic API, npm, PyPI, crates.io, VS Code marketplace, Cursor, and Docker Hub. The file is seeded on first run and can be edited manually or via CLI commands.
 
@@ -150,7 +150,7 @@ URL format: `http://<port>.<project>.127.0.0.1.traefik.me`
 For example, running `devbox port 3000` in a project called `my-app` creates:
 `http://3000.my-app.127.0.0.1.traefik.me` → `devbox-my-app:3000`
 
-Default ports (3000, 5173, 8080, etc.) are applied automatically on container start. The list is stored in `~/.devbox/default-ports.conf` and can be edited.
+Default ports (3000, 5173, 8080, etc.) are applied automatically on container start. The list is stored in `~/.config/devbox/default-ports.conf` and can be edited.
 
 ## Multi-session
 
@@ -165,7 +165,7 @@ Shared across all containers:
 - Claude config volume (`devbox-claude-config`)
 - Neovim data volume (`devbox-nvim-data`)
 - Cursor server volume (`devbox-cursor-server`)
-- Firewall allowlist (`~/.devbox/allowed-domains.conf`)
+- Firewall allowlist (`~/.config/devbox/allowed-domains.conf`)
 - Traefik proxy (`devbox-traefik`)
 
 ```bash
@@ -310,7 +310,7 @@ devbox/
 ### Host-side files
 
 ```
-~/.devbox/
+~/.config/devbox/
 ├── allowed-domains.conf            # Firewall allowlist (shared to all containers)
 ├── default-ports.conf              # Default ports for Traefik routing
 └── traefik/

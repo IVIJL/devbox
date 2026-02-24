@@ -5,7 +5,7 @@
 - [x] `devbox ls` — nezobrazuje `devbox-traefik`
 - [x] `devbox port 8080` se dvěma běžícími devboxy → route na oba, vypíše URL obou
 - [x] Spustit třetí devbox → automaticky dostane routy pro všechny default porty
-- [x] `devbox port 4000` → přidá port do `~/.devbox/default-ports.conf` a nastaví route na všechny běžící kontejnery
+- [x] `devbox port 4000` → přidá port do `~/.config/devbox/default-ports.conf` a nastaví route na všechny běžící kontejnery
 - [x] `devbox ports` → zobrazí kompletní přehled, URL ve formátu `<port>.<projekt>.127.0.0.1.traefik.me` (bez `devbox-` prefixu)
 - [x] `devbox stop projekt-a` → smaže YAML configy pro projekt-a
 - [x] `devbox stop` posledního kontejneru → zastaví i traefik automaticky

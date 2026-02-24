@@ -40,7 +40,14 @@ EOF
 
 IMAGE="vlcak/devbox:latest"
 SSH_WARNING=""
-TRAEFIK_CONFIG_DIR="$HOME/.devbox/traefik/dynamic"
+TRAEFIK_CONFIG_DIR="$HOME/.config/devbox/traefik/dynamic"
+
+# Migrate from old ~/.devbox to ~/.config/devbox
+if [ -d "$HOME/.devbox" ] && [ ! -d "$HOME/.config/devbox" ]; then
+    echo "Migrating config: ~/.devbox → ~/.config/devbox"
+    mkdir -p "$HOME/.config"
+    mv "$HOME/.devbox" "$HOME/.config/devbox"
+fi
 
 # --- Helper functions --------------------------------------------------------
 
@@ -80,8 +87,8 @@ bootstrap_traefik() {
 }
 
 seed_allowed_domains() {
-    local domains_file="$HOME/.devbox/allowed-domains.conf"
-    mkdir -p "$HOME/.devbox"
+    local domains_file="$HOME/.config/devbox/allowed-domains.conf"
+    mkdir -p "$HOME/.config/devbox"
 
     local defaults
     defaults=$(cat <<'DOMAINS'
@@ -136,8 +143,8 @@ DOMAINS
 }
 
 seed_default_ports() {
-    local ports_file="$HOME/.devbox/default-ports.conf"
-    mkdir -p "$HOME/.devbox"
+    local ports_file="$HOME/.config/devbox/default-ports.conf"
+    mkdir -p "$HOME/.config/devbox"
     if [ ! -f "$ports_file" ]; then
         cat > "$ports_file" <<'PORTS'
 3000
@@ -163,7 +170,7 @@ PORTS
 apply_port_routes() {
     local container="$1"
     local project="${container#devbox-}"
-    local ports_file="$HOME/.devbox/default-ports.conf"
+    local ports_file="$HOME/.config/devbox/default-ports.conf"
     [ -f "$ports_file" ] || return 0
 
     while read -r port _rest; do
@@ -402,8 +409,8 @@ if [ "$MODE" = "port" ]; then
     fi
 
     # Persist to default-ports.conf (deduplicated)
-    ports_file="$HOME/.devbox/default-ports.conf"
-    mkdir -p "$HOME/.devbox"
+    ports_file="$HOME/.config/devbox/default-ports.conf"
+    mkdir -p "$HOME/.config/devbox"
     touch "$ports_file"
     grep -qxF "$PORT_NUM" "$ports_file" 2>/dev/null || echo "$PORT_NUM" >> "$ports_file"
 
@@ -711,13 +718,13 @@ fi
 # --- devbox allow <domain> ----------------------------------------------------
 
 if [ "$MODE" = "allow" ]; then
-    CONF="$HOME/.devbox/allowed-domains.conf"
-    mkdir -p "$HOME/.devbox"
+    CONF="$HOME/.config/devbox/allowed-domains.conf"
+    mkdir -p "$HOME/.config/devbox"
     touch "$CONF"
 
     # No domain specified → list allowed domains
     if [ -z "${DOMAIN:-}" ]; then
-        echo "Povolené domény (~/.devbox/allowed-domains.conf):"
+        echo "Povolené domény (~/.config/devbox/allowed-domains.conf):"
         allowed_list=$(grep -v '^\s*#' "$CONF" 2>/dev/null | grep -v '^\s*$' | sort || true)
         if [ -n "$allowed_list" ]; then
             echo "$allowed_list" | while read -r d; do echo "  $d"; done
@@ -744,7 +751,7 @@ fi
 # --- devbox deny [domain] ----------------------------------------------------
 
 if [ "$MODE" = "deny" ]; then
-    CONF="$HOME/.devbox/allowed-domains.conf"
+    CONF="$HOME/.config/devbox/allowed-domains.conf"
 
     if [ ! -f "$CONF" ] || ! grep -v '^\s*#' "$CONF" 2>/dev/null | grep -qv '^\s*$'; then
         echo "Žádné domény k odebrání."
@@ -948,7 +955,7 @@ if [ -n "${NTFY_TOKEN:-}" ]; then
 fi
 
 # Shared firewall allowlist (host → all containers, read-only)
-DEVBOX_CONFIG_DIR="$HOME/.devbox"
+DEVBOX_CONFIG_DIR="$HOME/.config/devbox"
 mkdir -p "$DEVBOX_CONFIG_DIR"
 touch "$DEVBOX_CONFIG_DIR/allowed-domains.conf"
 DOCKER_ARGS+=(-v "$DEVBOX_CONFIG_DIR/allowed-domains.conf:/etc/devbox-shared/allowed-domains.conf:ro")
@@ -973,7 +980,7 @@ docker run -d --name "$CONTAINER_NAME" --stop-timeout 45 "${DOCKER_ARGS[@]}" "$I
 apply_port_routes "$CONTAINER_NAME"
 
 # Show URL info
-ports_file="$HOME/.devbox/default-ports.conf"
+ports_file="$HOME/.config/devbox/default-ports.conf"
 if [ -f "$ports_file" ] && [ -s "$ports_file" ]; then
     echo "Port routes:"
     while read -r port _rest; do

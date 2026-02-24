@@ -965,6 +965,12 @@ DOCKER_ARGS+=(-v "$PROJECT_PATH:/workspace")
 
 # --- Start detached container ------------------------------------------------
 
+# Check that image exists locally
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "Image $IMAGE not found. Run ./build.sh first." >&2
+    exit 1
+fi
+
 # Print warnings just before starting container (so they're visible)
 if [ -n "$SSH_WARNING" ]; then
     echo "$SSH_WARNING"

@@ -20,6 +20,7 @@ Usage:
   devbox remove [name]             Remove project data (volumes)
   devbox port <port>               Expose port via Traefik
   devbox ports                     List active port routes
+  devbox build [flags]             Build/rebuild the devbox image
   devbox allow [domain]            List or add allowed firewall domain
   devbox deny [domain]             Remove allowed domain (interactive)
   devbox blocked                   Show blocked DNS queries, allow interactively
@@ -40,6 +41,7 @@ EOF
 
 IMAGE="vlcak/devbox:latest"
 SSH_WARNING=""
+DEVBOX_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 TRAEFIK_CONFIG_DIR="$HOME/.config/devbox/traefik/dynamic"
 
 # Migrate from old ~/.devbox to ~/.config/devbox
@@ -385,6 +387,7 @@ case "${1:-}" in
     allow)   MODE="allow";   shift; DOMAIN="${1:-}" ;;
     deny)    MODE="deny";    shift; DOMAIN="${1:-}" ;;
     blocked) MODE="blocked"; shift ;;
+    build)   MODE="build";   shift ;;
     *)       MODE="auto" ;;
 esac
 
@@ -393,6 +396,12 @@ esac
 if [ "$MODE" = "ls" ]; then
     list_running_containers
     exit 0
+fi
+
+# --- devbox build [flags] ----------------------------------------------------
+
+if [ "$MODE" = "build" ]; then
+    exec "$DEVBOX_DIR/build.sh" "$@"
 fi
 
 # --- devbox port <port> ------------------------------------------------------
@@ -967,7 +976,7 @@ DOCKER_ARGS+=(-v "$PROJECT_PATH:/workspace")
 
 # Check that image exists locally
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    echo "Image $IMAGE not found. Run ./build.sh first." >&2
+    echo "Image $IMAGE not found. Build it with: devbox build" >&2
     exit 1
 fi
 

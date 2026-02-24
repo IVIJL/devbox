@@ -88,6 +88,12 @@ ARG USERNAME=node
 RUN mkdir -p /workspace /home/node/.claude && \
     chown -R node:node /workspace /home/node/.claude
 
+# Pre-populate GitHub SSH host keys (so git works without host known_hosts)
+RUN mkdir -p /home/node/.ssh && chmod 700 /home/node/.ssh && \
+    ssh-keyscan -t ed25519,rsa github.com >> /home/node/.ssh/known_hosts 2>/dev/null && \
+    chmod 600 /home/node/.ssh/known_hosts && \
+    chown -R node:node /home/node/.ssh
+
 # Claude Code config defaults (template — seeded into volume at startup)
 COPY --chown=node:node config/claude/ /etc/claude-defaults/
 RUN chmod +x /etc/claude-defaults/hooks/*.sh /etc/claude-defaults/statusline-info.sh

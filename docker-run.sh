@@ -13,7 +13,7 @@ show_help() {
 Devbox — portable dev container with default-deny firewall
 
 Usage:
-  devbox [path]                    Start/attach container for project
+  devbox [--ssh-config] [path]     Start/attach container for project
   devbox <name>                    Attach to running devbox-<name>
   devbox ls                        List running containers
   devbox stop [name] [--clean]     Stop container (--clean removes volumes)
@@ -25,6 +25,7 @@ Usage:
   devbox allow [domain]            List or add allowed firewall domain
   devbox deny [domain]             Remove allowed domain (interactive)
   devbox blocked                   Show blocked DNS queries, allow interactively
+  devbox ssh-config [add|edit]     Manage devbox SSH config
 
 Build flags:
   devbox build                     Build image (uses cache)
@@ -35,6 +36,8 @@ Build flags:
 Examples:
   devbox                           Mount CWD as /workspace
   devbox ~/projects/app            Mount specific project
+  devbox --ssh-config ~/app        Mount with full host SSH config
+  devbox ssh-config add            Add SSH host to devbox config
   devbox stop my-app               Stop specific container
   devbox stop --clean              Stop + remove Docker/history volumes
   devbox remove                    Interactive project data cleanup
@@ -375,6 +378,7 @@ pick_container() {
 # --- Subcommand parsing ------------------------------------------------------
 
 CLEAN_VOLUMES=false
+SSH_CONFIG_MOUNT=false
 
 case "${1:-}" in
     -h|--help|help) show_help ;;
@@ -394,6 +398,7 @@ case "${1:-}" in
     allow)   MODE="allow";   shift; DOMAIN="${1:-}" ;;
     deny)    MODE="deny";    shift; DOMAIN="${1:-}" ;;
     blocked)   MODE="blocked";   shift ;;
+    ssh-config) MODE="ssh-config"; shift; SSH_CONFIG_ACTION="${1:-}" ;;
     build)     MODE="build";     shift ;;
     uninstall) MODE="uninstall"; shift ;;
     *)         MODE="auto" ;;
@@ -834,7 +839,74 @@ if [ "$MODE" = "deny" ]; then
     exit 0
 fi
 
+# --- devbox ssh-config [add|edit] ---------------------------------------------
+
+if [ "$MODE" = "ssh-config" ]; then
+    SSH_CONFIG_FILE="$HOME/.config/devbox/ssh_config"
+    mkdir -p "$HOME/.config/devbox"
+
+    case "${SSH_CONFIG_ACTION:-}" in
+        add)
+            printf "Host alias (např. rep): "
+            read -r host_alias
+            [ -z "$host_alias" ] && { echo "Host alias je povinný." >&2; exit 1; }
+
+            printf "HostName (adresa serveru): "
+            read -r hostname
+            [ -z "$hostname" ] && { echo "HostName je povinný." >&2; exit 1; }
+
+            printf "Port (výchozí 22): "
+            read -r port
+            port="${port:-22}"
+
+            printf "User (volitelné): "
+            read -r ssh_user
+
+            {
+                echo ""
+                echo "Host $host_alias"
+                echo "    HostName $hostname"
+                [ "$port" != "22" ] && echo "    Port $port"
+                [ -n "$ssh_user" ] && echo "    User $ssh_user"
+            } >> "$SSH_CONFIG_FILE"
+
+            echo "Přidáno do $SSH_CONFIG_FILE:"
+            echo "  Host $host_alias → $hostname${port:+ :$port}"
+            ;;
+        edit)
+            if [ ! -f "$SSH_CONFIG_FILE" ]; then
+                touch "$SSH_CONFIG_FILE"
+            fi
+            "${EDITOR:-vi}" "$SSH_CONFIG_FILE"
+            ;;
+        *)
+            # No action → show current config
+            if [ -f "$SSH_CONFIG_FILE" ] && [ -s "$SSH_CONFIG_FILE" ]; then
+                echo "Devbox SSH config (~/.config/devbox/ssh_config):"
+                echo ""
+                cat "$SSH_CONFIG_FILE"
+            else
+                echo "Devbox SSH config je prázdný."
+            fi
+            echo ""
+            echo "Použití:"
+            echo "  devbox ssh-config          Zobrazit config"
+            echo "  devbox ssh-config add      Přidat host interaktivně"
+            echo "  devbox ssh-config edit     Otevřít v \$EDITOR"
+            ;;
+    esac
+    exit 0
+fi
+
 # --- Auto mode: create or attach ---------------------------------------------
+
+# Parse optional flags before path
+while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+        --ssh-config) SSH_CONFIG_MOUNT=true; shift ;;
+        *) echo "Unknown flag: $1" >&2; exit 1 ;;
+    esac
+done
 
 if [ -d "${1:-.}" ]; then
     # Argument is a directory (or none → CWD) → create/attach mode
@@ -843,6 +915,10 @@ if [ -d "${1:-.}" ]; then
     CONTAINER_NAME="devbox-$(sanitize "$PROJECT_NAME")"
 
     if docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.ID}}' | grep -q .; then
+        if [ "$SSH_CONFIG_MOUNT" = true ]; then
+            echo "WARNING: --ssh-config ignorován — kontejner již běží."
+            echo "  Pro změnu mountů: devbox stop && devbox --ssh-config"
+        fi
         attach_to_container "$CONTAINER_NAME"
         # exec → script ends here
     fi
@@ -942,10 +1018,16 @@ DOCKER_ARGS=(
     -e CLAUDE_CONFIG_DIR=/home/node/.claude
     # Git config from host (system-level so Cursor/VS Code can write to ~/.gitconfig)
     -v "$HOME/.gitconfig:/etc/gitconfig:ro"
-    # SSH config only (no private keys)
-    -v "$HOME/.ssh/config:/home/node/.ssh/config:ro"
-    -v "$HOME/.ssh/known_hosts:/home/node/.ssh/known_hosts:ro"
 )
+
+# SSH config: --ssh-config uses full host config, otherwise devbox-specific config
+DEVBOX_SSH_CONFIG="$HOME/.config/devbox/ssh_config"
+if [ "$SSH_CONFIG_MOUNT" = true ]; then
+    [ -f "$HOME/.ssh/config" ] && DOCKER_ARGS+=(-v "$HOME/.ssh/config:/home/node/.ssh/config:ro")
+    [ -f "$HOME/.ssh/known_hosts" ] && DOCKER_ARGS+=(-v "$HOME/.ssh/known_hosts:/home/node/.ssh/known_hosts:ro")
+elif [ -f "$DEVBOX_SSH_CONFIG" ]; then
+    DOCKER_ARGS+=(-v "$DEVBOX_SSH_CONFIG:/home/node/.ssh/config:ro")
+fi
 
 # SSH agent forwarding (private keys never enter the container)
 if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then

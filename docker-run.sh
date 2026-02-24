@@ -55,6 +55,13 @@ bootstrap_traefik() {
     seed_allowed_domains
     seed_default_ports
 
+    # If traefik exists but is exited, restart it
+    if docker ps -a --filter "name=^devbox-traefik$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
+        echo "Restarting Traefik proxy..."
+        docker start devbox-traefik
+        return
+    fi
+
     if ! docker ps --format '{{.Names}}' | grep -qx devbox-traefik; then
         echo "Starting Traefik proxy..."
         docker run -d --name devbox-traefik --restart unless-stopped \
@@ -200,19 +207,48 @@ attach_to_container() {
     exec docker exec -it -w /workspace "$name" zsh
 }
 
+# Restart an exited devbox container and re-run init scripts
+# Returns 1 if restart fails (stale mounts after reboot) — caller should recreate
+restart_exited_container() {
+    local name="$1"
+    echo "Restarting exited container: $name"
+    if ! docker start "$name" 2>/dev/null; then
+        echo "Restart failed (stale mounts?), removing dead container..."
+        docker rm "$name" > /dev/null
+        return 1
+    fi
+    # Re-run init scripts (firewall, rootless docker, chezmoi, claude)
+    docker exec -u root "$name" bash -c '/usr/local/bin/init-firewall.sh'
+    docker exec "$name" bash -c \
+        '/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh'
+    # Re-apply port routes
+    apply_port_routes "$name"
+}
+
 list_running_containers() {
     local containers
     containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}\t{{.Status}}\t{{.RunningFor}}' | grep -v '^devbox-traefik\b')
     if [ -z "$containers" ]; then
         echo "Žádné běžící devbox kontejnery."
-        return
+    else
+        printf '%-25s %-50s %s\n' "NAME" "URL" "STATUS"
+        while IFS=$'\t' read -r name status running; do
+            local project="${name#devbox-}"
+            local url="http://<port>.${project}.127.0.0.1.traefik.me"
+            printf '%-25s %-50s %s\n' "$name" "$url" "$status"
+        done <<< "$containers"
     fi
-    printf '%-25s %-50s %s\n' "NAME" "URL" "STATUS"
-    while IFS=$'\t' read -r name status running; do
-        local project="${name#devbox-}"
-        local url="http://<port>.${project}.127.0.0.1.traefik.me"
-        printf '%-25s %-50s %s\n' "$name" "$url" "$status"
-    done <<< "$containers"
+
+    local exited
+    exited=$(docker ps -a --filter "name=^devbox-" --filter "status=exited" \
+        --format '{{.Names}}\t{{.Status}}' | grep -v '^devbox-traefik\b')
+    if [ -n "$exited" ]; then
+        echo ""
+        echo "Exited (use 'devbox <name>' to restart):"
+        while IFS=$'\t' read -r name status; do
+            printf '  %-25s %s\n' "$name" "$status"
+        done <<< "$exited"
+    fi
 }
 
 # Regenerate dnsmasq runtime config and restart in all running containers
@@ -273,10 +309,10 @@ pick_container() {
     local prompt="$1"
     local with_all="${2:-}"
     local running
-    running=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$')
+    running=$(docker ps -a --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$')
 
     if [ -z "$running" ]; then
-        echo "Žádné běžící devbox kontejnery." >&2
+        echo "Žádné devbox kontejnery." >&2
         return 1
     fi
 
@@ -410,8 +446,8 @@ if [ "$MODE" = "stop" ]; then
 
     if [ -n "$PROJECT_FILTER" ]; then
         name="devbox-${PROJECT_FILTER}"
-        if docker ps --filter "name=^${name}$" --format '{{.ID}}' | grep -q .; then
-            docker stop "$name" > /dev/null
+        if docker ps -a --filter "name=^${name}$" --format '{{.ID}}' | grep -q .; then
+            docker stop "$name" > /dev/null 2>&1 || true
             docker rm "$name" > /dev/null
             if [ "$CLEAN_VOLUMES" = true ]; then
                 remove_project_volumes "$PROJECT_FILTER"
@@ -428,9 +464,9 @@ if [ "$MODE" = "stop" ]; then
     # No argument or container not found → interactive selection
     selected=$(pick_container "Zastavit kontejner: " "with_all") || exit 1
     if [ "$selected" = "* Zastavit všechny" ]; then
-        docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' | while IFS= read -r c; do
+        docker ps -a --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' | while IFS= read -r c; do
             proj="${c#devbox-}"
-            docker stop "$c" > /dev/null
+            docker stop "$c" > /dev/null 2>&1 || true
             docker rm "$c" > /dev/null
             if [ "$CLEAN_VOLUMES" = true ]; then
                 remove_project_volumes "$proj"
@@ -443,7 +479,7 @@ if [ "$MODE" = "stop" ]; then
         stop_traefik_if_idle
     else
         proj="${selected#devbox-}"
-        docker stop "$selected" > /dev/null
+        docker stop "$selected" > /dev/null 2>&1 || true
         docker rm "$selected" > /dev/null
         if [ "$CLEAN_VOLUMES" = true ]; then
             remove_project_volumes "$proj"
@@ -763,12 +799,30 @@ if [ -d "${1:-.}" ]; then
         # exec → script ends here
     fi
 
+    # If container exists but is exited, restart it
+    if docker ps -a --filter "name=^${CONTAINER_NAME}$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
+        bootstrap_traefik
+        if restart_exited_container "$CONTAINER_NAME"; then
+            attach_to_container "$CONTAINER_NAME"
+            # exec → script ends here
+        fi
+        # restart failed → container removed, fall through to creation
+    fi
+
     # Container not running → create new one (detached) below
 else
     # Argument is not a directory → attach by name
     CONTAINER_NAME="devbox-${1}"
     if docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.ID}}' | grep -q .; then
         attach_to_container "$CONTAINER_NAME"
+    elif docker ps -a --filter "name=^${CONTAINER_NAME}$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
+        bootstrap_traefik
+        if restart_exited_container "$CONTAINER_NAME"; then
+            attach_to_container "$CONTAINER_NAME"
+        else
+            echo "Kontejner $CONTAINER_NAME odstraněn. Spusťte znovu pro vytvoření nového." >&2
+            exit 1
+        fi
     else
         echo "Kontejner $CONTAINER_NAME neběží." >&2
         selected=$(pick_container "Vyber kontejner: ") || exit 1

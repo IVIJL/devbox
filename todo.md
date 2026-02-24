@@ -22,11 +22,13 @@
 - [x] Rozhodnout jestli mountovat compose soubory z host projektu nebo nechat uvnitř workspace
 
 ### Bezpečné ukončení DinD při stop/reboot
-- [ ] Zjistit co se stane při `devbox stop` — dostane DinD proces SIGTERM? Ukončí se vnitřní kontejnery čistě?
-- [ ] Zjistit co se stane při reboot systému bez `devbox stop` — poškodí se DB v DinD?
-- [ ] Zvážit pre-stop hook: před zastavením devboxu zavolat `docker stop` na vnitřní kontejnery (graceful shutdown)
-- [ ] Ověřit jestli rootless dockerd uvnitř devboxu reaguje na SIGTERM správně
-- [ ] Pokud ne, přidat wrapper/trap do entrypointu který při SIGTERM nejdřív zastaví vnitřní kontejnery
+- [x] Zjistit co se stane při `devbox stop` — dostane DinD proces SIGTERM? Ukončí se vnitřní kontejnery čistě?
+- [x] Zjistit co se stane při reboot systému bez `devbox stop` — poškodí se DB v DinD?
+- [x] Zvážit pre-stop hook: před zastavením devboxu zavolat `docker stop` na vnitřní kontejnery (graceful shutdown)
+- [x] Ověřit jestli rootless dockerd uvnitř devboxu reaguje na SIGTERM správně
+- [x] Přidat wrapper/trap do entrypointu který při SIGTERM nejdřív zastaví vnitřní kontejnery
+      → Implementováno: `devbox-entrypoint.sh` jako PID 1 s SIGTERM trap + `graceful_stop_container()` pre-stop hook
+      → Otestováno: nginx dostane clean SIGTERM (exit 0), postgres clean shutdown (žádný WAL recovery)
 
 ### Compose soubory — mount strategie
 - [ ] Rozhodnout: mount compose soubory z host projektu (bind mount `/workspace/docker-compose.yml`) vs. kopírovat dovnitř

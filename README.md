@@ -97,7 +97,7 @@ Run `devbox --help` for the full list. Summary:
 |---|---|
 | `devbox [path]` | Start/attach container for project (default: CWD) |
 | `devbox <name>` | Attach to running `devbox-<name>` container |
-| `devbox ls` | List running containers |
+| `devbox ls` | List running and exited containers |
 | `devbox stop [name] [--clean]` | Stop container; `--clean` removes Docker/history volumes |
 | `devbox remove [name]` | Remove project data (volumes) interactively |
 | `devbox port <port>` | Expose port via Traefik for all running containers |
@@ -204,6 +204,14 @@ Docker runs as the `node` user via `dockerd-rootless.sh` — no `--privileged` f
 
 Docker images and containers are stored in a per-project named volume (`devbox-<project>-docker`), so they survive container restarts without re-pulling images. Volumes persist across `devbox stop` but can be cleaned with `devbox stop --clean` or `devbox remove`.
 
+### Graceful shutdown
+
+The container uses `devbox-entrypoint.sh` as PID 1, which traps SIGTERM and gracefully stops all inner DinD containers before exiting. This prevents database corruption on `devbox stop` or host reboot.
+
+The shutdown chain: host Docker → SIGTERM → entrypoint trap → `docker stop` inner containers → inner processes flush/shutdown → entrypoint exits. Additionally, `devbox stop` runs a pre-stop hook that explicitly stops inner containers before sending SIGTERM to the entrypoint (belt-and-suspenders).
+
+The container uses `--stop-timeout 45` to allow sufficient time for inner containers with databases to shut down cleanly.
+
 ## Included Tools
 
 | Tool | Description |
@@ -292,6 +300,7 @@ devbox/
 │   ├── nvim/                       # Neovim config
 │   └── tmux/                       # Tmux config
 └── scripts/
+    ├── devbox-entrypoint.sh        # Container PID 1 with graceful shutdown
     ├── setup-chezmoi.sh            # postStart: chezmoi init + apply
     ├── setup-claude.sh             # postStart: Claude Code setup
     ├── setup-nvim-data.sh          # Neovim data initialization

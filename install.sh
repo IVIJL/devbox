@@ -567,7 +567,7 @@ print_summary() {
             ;;
     esac
 
-    msg "  ${step}. Build the image:  cd $DEVBOX_DIR && ./build.sh"
+    msg "  ${step}. Build the image:  devbox build"
     step=$((step + 1))
 
     msg "  ${step}. Set your API key: export ANTHROPIC_API_KEY=sk-ant-..."

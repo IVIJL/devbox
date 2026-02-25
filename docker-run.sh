@@ -26,6 +26,7 @@ Usage:
   devbox deny [domain]             Remove allowed domain (interactive)
   devbox blocked                   Show blocked DNS queries, allow interactively
   devbox cursor [name]             Open Cursor attached to running devbox
+  devbox code [name]               Open VS Code attached to running devbox
   devbox ssh-config [add|edit]     Manage devbox SSH config
 
 Build flags:
@@ -41,6 +42,8 @@ Examples:
   devbox ssh-config add            Add SSH host to devbox config
   devbox cursor                     Open Cursor for CWD project
   devbox cursor my-app              Open Cursor for specific devbox
+  devbox code                       Open VS Code for CWD project
+  devbox code my-app                Open VS Code for specific devbox
   devbox stop my-app               Stop specific container
   devbox stop --clean              Stop + remove Docker/history volumes
   devbox remove                    Interactive project data cleanup
@@ -127,6 +130,8 @@ static.crates.io
 marketplace.visualstudio.com
 vscode.blob.core.windows.net
 update.code.visualstudio.com
+*.vscode-cdn.net
+*.vsassets.io
 cursor.com
 cursor.sh
 # Docker Hub (rootless DinD)
@@ -154,6 +159,13 @@ DOMAINS
                 grep -qxF "$entry" "$domains_file" 2>/dev/null || echo "$entry" >> "$domains_file"
             done <<< "$user_entries"
         fi
+    fi
+
+    # Migration: add VS Code CDN domains if missing from existing config
+    if [ -f "$domains_file" ]; then
+        for d in "*.vscode-cdn.net" "*.vsassets.io"; do
+            grep -qF "$d" "$domains_file" 2>/dev/null || echo "$d" >> "$domains_file"
+        done
     fi
 }
 
@@ -402,6 +414,7 @@ case "${1:-}" in
     deny)    MODE="deny";    shift; DOMAIN="${1:-}" ;;
     blocked)   MODE="blocked";   shift ;;
     cursor)    MODE="cursor";     shift; CURSOR_TARGET="${1:-}" ;;
+    code)      MODE="code";       shift; CODE_TARGET="${1:-}" ;;
     ssh-config) MODE="ssh-config"; shift; SSH_CONFIG_ACTION="${1:-}" ;;
     build)     MODE="build";     shift ;;
     uninstall) MODE="uninstall"; shift ;;
@@ -464,6 +477,45 @@ if [ "$MODE" = "cursor" ]; then
 
     echo "Opening Cursor attached to $CONTAINER_NAME..."
     cursor --folder-uri "$FOLDER_URI"
+    exit 0
+fi
+
+# --- devbox code [name] ----------------------------------------------------
+
+if [ "$MODE" = "code" ]; then
+    if ! command -v code &>/dev/null; then
+        echo "Error: 'code' CLI not found in PATH." >&2
+        echo "Install it: VS Code → Cmd+Shift+P → 'Install code command in PATH'" >&2
+        exit 1
+    fi
+
+    # Determine target container
+    if [ -n "${CODE_TARGET:-}" ]; then
+        CONTAINER_NAME="devbox-$(sanitize "$CODE_TARGET")"
+    else
+        PROJECT_NAME="$(sanitize "$(basename "$(pwd)")")"
+        CONTAINER_NAME="devbox-${PROJECT_NAME}"
+    fi
+
+    # Verify container is running
+    if ! docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.Names}}' | grep -q .; then
+        echo "Container $CONTAINER_NAME is not running." >&2
+        # Try to pick from running containers
+        selected=$(pick_container "Select container: ") || exit 1
+        CONTAINER_NAME="$selected"
+    fi
+
+    # Build attached-container URI for VS Code
+    ATTACH_JSON="{\"containerName\":\"/${CONTAINER_NAME}\"}"
+    if command -v xxd &>/dev/null; then
+        HEX=$(printf '%s' "$ATTACH_JSON" | xxd -p | tr -d '\n')
+    else
+        HEX=$(printf '%s' "$ATTACH_JSON" | od -A n -t x1 | tr -d ' \n')
+    fi
+    FOLDER_URI="vscode-remote://attached-container+${HEX}/workspace"
+
+    echo "Opening VS Code attached to $CONTAINER_NAME..."
+    code --folder-uri "$FOLDER_URI"
     exit 0
 fi
 
@@ -1059,9 +1111,11 @@ DOCKER_ARGS=(
     -v devbox-claude-config:/home/node/.claude
     -v devbox-nvim-data:/home/node/.local/share/nvim
     -v devbox-cursor-server:/home/node/.cursor-server
+    -v devbox-vscode-server:/home/node/.vscode-server
     -e CLAUDE_CONFIG_DIR=/home/node/.claude
-    # Git config from host (system-level so Cursor/VS Code can write to ~/.gitconfig)
-    -v "$HOME/.gitconfig:/etc/gitconfig:ro"
+    # Git config from host (staging path — copied to /etc/gitconfig by entrypoint
+    # so VS Code/Cursor can write credential helpers without "Device busy" error)
+    -v "$HOME/.gitconfig:/home/node/.gitconfig-host:ro"
 )
 
 # Global gitignore from host
@@ -1155,8 +1209,9 @@ else
 fi
 
 # Init scripts: firewall runs as root (no sudo needed), rest as node
+# Fix IDE server directory permissions (volumes may be created as root)
 docker exec -u root "$CONTAINER_NAME" bash -c \
-    '/usr/local/bin/init-firewall.sh'
+    'chown node:node /home/node/.cursor-server /home/node/.vscode-server 2>/dev/null; /usr/local/bin/init-firewall.sh'
 docker exec "$CONTAINER_NAME" bash -c \
     '/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh'
 

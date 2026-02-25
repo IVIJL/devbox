@@ -1,6 +1,6 @@
 # Devbox - Personal Dev Container
 
-Portable development environment built on Claude Code devcontainer (node:20/Debian) with a default-deny firewall. Claude Code can run with `--dangerously-skip-permissions` without risk to the host system.
+Portable development environment built on Claude Code devcontainer (node:22/Debian) with a default-deny firewall. Claude Code can run with `--dangerously-skip-permissions` without risk to the host system.
 
 ## Quick Start
 
@@ -67,10 +67,11 @@ cat > /path/to/project/.devcontainer/devcontainer.json << 'EOF'
   ],
   "remoteUser": "node",
   "mounts": [
-    "source=${localEnv:HOME}/.gitconfig,target=/etc/gitconfig,type=bind,readonly",
-    "source=devbox-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
+    "source=${localEnv:HOME}/.gitconfig,target=/home/node/.gitconfig-host,type=bind,readonly",
     "source=devbox-claude-config-${devcontainerId},target=/home/node/.claude,type=volume",
-    "source=devbox-docker-${devcontainerId},target=/home/node/.local/share/docker,type=volume"
+    "source=devbox-docker-${devcontainerId},target=/home/node/.local/share/docker,type=volume",
+    "source=devbox-cursor-server-${devcontainerId},target=/home/node/.cursor-server,type=volume",
+    "source=devbox-vscode-server-${devcontainerId},target=/home/node/.vscode-server,type=volume"
   ],
   "containerEnv": {
     "NODE_OPTIONS": "--max-old-space-size=4096",
@@ -79,7 +80,7 @@ cat > /path/to/project/.devcontainer/devcontainer.json << 'EOF'
   },
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
   "workspaceFolder": "/workspace",
-  "postStartCommand": "sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh",
+  "postStartCommand": "sudo cp /home/node/.gitconfig-host /etc/gitconfig 2>/dev/null || true; sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh",
   "waitFor": "postStartCommand"
 }
 EOF
@@ -103,6 +104,8 @@ Run `devbox --help` for the full list. Summary:
 | `devbox allow [domain]` | List allowed domains, or add one |
 | `devbox deny [domain]` | Remove allowed domain (interactive if no arg) |
 | `devbox blocked` | Show blocked DNS queries, allow interactively via fzf |
+| `devbox cursor [name]` | Open Cursor attached to running devbox |
+| `devbox code [name]` | Open VS Code attached to running devbox |
 | `devbox ssh-config [add\|edit]` | Manage devbox-specific SSH config |
 
 ## Build
@@ -164,6 +167,7 @@ Shared across all containers:
 - Claude config volume (`devbox-claude-config`)
 - Neovim data volume (`devbox-nvim-data`)
 - Cursor server volume (`devbox-cursor-server`)
+- VS Code server volume (`devbox-vscode-server`)
 - Firewall allowlist (`~/.config/devbox/allowed-domains.conf`)
 - Host `~/.claude/` directory (read-only, for user-level `CLAUDE.md`)
 - Host `~/.config/git/ignore` (global gitignore)
@@ -312,7 +316,9 @@ To update dotfiles without rebuilding: just restart the container.
 devbox/
 ├── Dockerfile                      # Main image
 ├── .devcontainer/
-│   └── devcontainer.json           # For Cursor/VS Code (this repo)
+│   ├── devcontainer.json           # For Cursor/VS Code (this repo)
+│   └── cursor/
+│       └── devcontainer.json       # Cursor-specific config (pre-built image)
 ├── devcontainer-standalone.json    # For standalone devcontainer CLI usage
 ├── docker-run.sh                   # CLI entrypoint (devbox command)
 ├── build.sh                        # Build script with cleanup

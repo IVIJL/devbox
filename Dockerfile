@@ -85,8 +85,10 @@ ARG USERNAME=node
 
 
 # Create workspace and config directories
-RUN mkdir -p /workspace /home/node/.claude && \
-    chown -R node:node /workspace /home/node/.claude
+RUN mkdir -p /workspace /home/node/.claude \
+    /home/node/.cursor-server /home/node/.vscode-server && \
+    chown -R node:node /workspace /home/node/.claude \
+    /home/node/.cursor-server /home/node/.vscode-server
 
 # Pre-populate GitHub SSH host keys (so git works without host known_hosts)
 RUN mkdir -p /home/node/.ssh && chmod 700 /home/node/.ssh && \

@@ -67,5 +67,6 @@ fi
 # Clean up images older than 24 hours
 find "$CLIP_DIR" -name 'clip-*.png' -mmin +1440 -delete 2>/dev/null || true
 
-# Output path (works on both host and inside container via bind mount)
-echo "${HOME}/.clipboard-images/${FILENAME}"
+# Output path with ~ (works on both host and inside container via bind mount)
+# shellcheck disable=SC2088
+echo "~/.clipboard-images/${FILENAME}"

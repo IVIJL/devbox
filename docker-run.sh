@@ -1089,11 +1089,11 @@ if [ -z "${SSH_AUTH_SOCK:-}" ]; then
     echo "  Add your keys with: ssh-add"
 fi
 
-# Ensure agent has keys loaded
+# Try to load default keys (non-fatal — devbox works without SSH keys)
 if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
     if ! ssh-add -l &>/dev/null; then
-        echo "SSH agent has no keys, adding default keys..."
-        ssh-add
+        echo "SSH agent has no keys, trying to add default keys..."
+        ssh-add 2>/dev/null || echo "  No SSH keys found — SSH forwarding will have no keys. Add keys with: ssh-add"
     fi
 fi
 

@@ -1,6 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
+# =============================================================================
+# Grab clipboard image and save to ~/.clipboard-images/
+# Works on WSL2, Linux X11, and Linux Wayland.
+# =============================================================================
+
 CLIP_DIR="${HOME}/.clipboard-images"
 mkdir -p "$CLIP_DIR"
 
@@ -8,12 +13,12 @@ TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 FILENAME="clip-${TIMESTAMP}.png"
 HOST_PATH="${CLIP_DIR}/${FILENAME}"
 
-# Convert WSL path to Windows path for PowerShell
-WIN_PATH=$(wslpath -w "$HOST_PATH")
+# --- Detect environment and grab clipboard image ----------------------------
 
-# Grab image from Windows clipboard via PowerShell
-# Uses Windows PowerShell 5.1 (not pwsh) which has System.Drawing available
-if ! powershell.exe -NoProfile -Command "
+if [ -e /proc/sys/fs/binfmt_misc/WSLInterop ]; then
+    # WSL2: use Windows clipboard via PowerShell
+    WIN_PATH=$(wslpath -w "$HOST_PATH")
+    if ! powershell.exe -NoProfile -Command "
 Add-Type -AssemblyName System.Windows.Forms
 \$img = [System.Windows.Forms.Clipboard]::GetImage()
 if (\$img -eq \$null) {
@@ -22,11 +27,39 @@ if (\$img -eq \$null) {
 }
 \$img.Save('${WIN_PATH}')
 " 2>/dev/null; then
-    echo "ERROR: No image found in clipboard" >&2
-    exit 1
+        echo "ERROR: No image found in clipboard" >&2
+        exit 1
+    fi
+
+elif [ "${XDG_SESSION_TYPE:-}" = "wayland" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    # Wayland: use wl-paste
+    if ! command -v wl-paste >/dev/null 2>&1; then
+        echo "ERROR: wl-paste not found (install wl-clipboard)" >&2
+        exit 1
+    fi
+    if ! wl-paste --type image/png > "$HOST_PATH" 2>/dev/null; then
+        rm -f "$HOST_PATH"
+        echo "ERROR: No image found in clipboard" >&2
+        exit 1
+    fi
+
+else
+    # X11: use xclip
+    if ! command -v xclip >/dev/null 2>&1; then
+        echo "ERROR: xclip not found (install xclip)" >&2
+        exit 1
+    fi
+    if ! xclip -selection clipboard -target image/png -o > "$HOST_PATH" 2>/dev/null; then
+        rm -f "$HOST_PATH"
+        echo "ERROR: No image found in clipboard" >&2
+        exit 1
+    fi
 fi
 
-if [ ! -f "$HOST_PATH" ]; then
+# --- Validate output ---------------------------------------------------------
+
+if [ ! -s "$HOST_PATH" ]; then
+    rm -f "$HOST_PATH"
     echo "ERROR: Failed to save clipboard image" >&2
     exit 1
 fi
@@ -34,5 +67,5 @@ fi
 # Clean up images older than 24 hours
 find "$CLIP_DIR" -name 'clip-*.png' -mmin +1440 -delete 2>/dev/null || true
 
-# Use ~/.clipboard-images/ path (works on both host and inside container)
+# Output path (works on both host and inside container via bind mount)
 echo "${HOME}/.clipboard-images/${FILENAME}"

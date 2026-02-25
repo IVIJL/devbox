@@ -106,6 +106,7 @@ Run `devbox --help` for the full list. Summary:
 | `devbox blocked` | Show blocked DNS queries, allow interactively via fzf |
 | `devbox cursor [name]` | Open Cursor attached to running devbox |
 | `devbox code [name]` | Open VS Code attached to running devbox |
+| `devbox clip` | Grab clipboard image for container use |
 | `devbox ssh-config [add\|edit]` | Manage devbox-specific SSH config |
 
 ## Build
@@ -185,6 +186,7 @@ devbox ls                        # List all running containers
 |---|---|
 | `ANTHROPIC_API_KEY` | API key for Claude Code |
 | `DEVBOX_SUDO_PASSWORD` | Sudo password for non-interactive builds (default: `devbox`) |
+| `CHEZMOI_REPO` | Chezmoi dotfiles repo (default in docker-run.sh: `github.com/IVIJL/vlci-dotfiles`; empty = skip) |
 | `NTFY_TOKEN` | ntfy.sh notification token (auto-detected from Claude hooks) |
 | `TZ` | Timezone (default: `Europe/Prague`) |
 
@@ -304,11 +306,53 @@ This starts one `ssh-agent` per boot, shared across all terminals. Keys are adde
 
 </details>
 
+## Clipboard Image Paste
+
+Paste images from your host clipboard into Claude Code conversations inside the container. The `devbox clip` command grabs the current clipboard image, saves it to `~/.clipboard-images/`, and prints the path. Claude Code can then read the image from that path.
+
+Works on WSL2 (PowerShell clipboard), Linux X11 (`xclip`), and Linux Wayland (`wl-paste`).
+
+```bash
+devbox clip                      # Grab clipboard image, print path
+```
+
+### WezTerm keybinding
+
+Add a keybinding to your `~/.wezterm.lua` so `Ctrl+Shift+S` grabs the clipboard image and pastes its path into the terminal. This snippet auto-detects WSL vs native Linux:
+
+```lua
+{
+  key = "s",
+  mods = "CTRL|SHIFT",
+  action = wezterm.action_callback(function(window, pane)
+    local cmd
+    local f = io.open("/proc/sys/fs/binfmt_misc/WSLInterop", "r")
+    if f then
+      f:close()
+      cmd = { "wsl.exe", "-d", "Ubuntu-24.04", "--",
+              "/home/vlcak/Projekty/devbox/scripts/clip-image.sh" }
+    else
+      cmd = { os.getenv("HOME") .. "/Projekty/devbox/scripts/clip-image.sh" }
+    end
+    local success, stdout, _ = wezterm.run_child_process(cmd)
+    if success then
+      pane:send_text(stdout:gsub("%s+$", ""))
+    else
+      window:toast_notification("devbox clip", "No image in clipboard", nil, 3000)
+    end
+  end),
+},
+```
+
+Adjust paths and WSL distro name to match your setup.
+
+Images older than 24 hours are cleaned up automatically on each invocation.
+
 ## Dotfiles
 
-Chezmoi initializes from `github.com/IVIJL/vlci-dotfiles` on every container start (postStart). Dotfiles are applied with `--force`, overriding any default config.
+Chezmoi dotfiles are configured via the `CHEZMOI_REPO` environment variable. In `docker-run.sh` it defaults to `github.com/IVIJL/vlci-dotfiles`. Set your own repo or leave it empty to skip chezmoi initialization.
 
-To update dotfiles without rebuilding: just restart the container.
+Chezmoi runs on every container start (postStart). Dotfiles are applied with `--force`, overriding any default config. To update dotfiles without rebuilding: just restart the container.
 
 ## File Structure
 
@@ -331,6 +375,7 @@ devbox/
 │   └── tmux/                       # Tmux config
 └── scripts/
     ├── devbox-entrypoint.sh        # Container PID 1 with graceful shutdown
+    ├── clip-image.sh               # Clipboard image grab (WSL/X11/Wayland)
     ├── setup-chezmoi.sh            # postStart: chezmoi init + apply
     ├── setup-claude.sh             # postStart: Claude Code setup
     ├── setup-nvim-data.sh          # Neovim data initialization
@@ -352,4 +397,6 @@ devbox/
 
 ~/.claude/
 └── CLAUDE.md                       # User-level Claude instructions (mounted live into containers)
+
+~/.clipboard-images/                # Shared clipboard images (host ↔ container)
 ```

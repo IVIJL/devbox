@@ -326,15 +326,16 @@ Add a keybinding to your `~/.wezterm.lua` so `Ctrl+Shift+S` grabs the clipboard 
   mods = "CTRL|SHIFT",
   action = wezterm.action_callback(function(window, pane)
     local cmd
-    -- Detect WSL: wsl.exe exists only on Windows/WSL hosts
     local handle = io.popen("command -v wsl.exe 2>/dev/null")
-    local wsl_path = handle and handle:read("*a"):gsub("%s+$", "") or ""
+    local has_wsl = handle and handle:read("*a"):gsub("%s+$", "") ~= ""
     if handle then handle:close() end
-    if wsl_path ~= "" then
-      cmd = { "wsl.exe", "-d", "Ubuntu-24.04", "--",
-              "/home/vlcak/Projekty/devbox/scripts/clip-image.sh" }
+    if has_wsl then
+      -- WSL: use default distro, bash -lc expands $HOME automatically
+      cmd = { "wsl.exe", "--", "bash", "-lc",
+              "$HOME/.local/share/devbox/scripts/clip-image.sh" }
     else
-      cmd = { os.getenv("HOME") .. "/Projekty/devbox/scripts/clip-image.sh" }
+      -- Native Linux: call script directly
+      cmd = { os.getenv("HOME") .. "/.local/share/devbox/scripts/clip-image.sh" }
     end
     local success, stdout, _ = wezterm.run_child_process(cmd)
     if success then
@@ -345,8 +346,6 @@ Add a keybinding to your `~/.wezterm.lua` so `Ctrl+Shift+S` grabs the clipboard 
   end),
 },
 ```
-
-Adjust paths and WSL distro name to match your setup.
 
 Images older than 24 hours are cleaned up automatically on each invocation.
 

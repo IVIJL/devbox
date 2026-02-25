@@ -326,9 +326,11 @@ Add a keybinding to your `~/.wezterm.lua` so `Ctrl+Shift+S` grabs the clipboard 
   mods = "CTRL|SHIFT",
   action = wezterm.action_callback(function(window, pane)
     local cmd
-    local f = io.open("/proc/sys/fs/binfmt_misc/WSLInterop", "r")
-    if f then
-      f:close()
+    -- Detect WSL: wsl.exe exists only on Windows/WSL hosts
+    local handle = io.popen("command -v wsl.exe 2>/dev/null")
+    local wsl_path = handle and handle:read("*a"):gsub("%s+$", "") or ""
+    if handle then handle:close() end
+    if wsl_path ~= "" then
       cmd = { "wsl.exe", "-d", "Ubuntu-24.04", "--",
               "/home/vlcak/Projekty/devbox/scripts/clip-image.sh" }
     else

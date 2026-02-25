@@ -15,7 +15,7 @@ HOST_PATH="${CLIP_DIR}/${FILENAME}"
 
 # --- Detect environment and grab clipboard image ----------------------------
 
-if [ -e /proc/sys/fs/binfmt_misc/WSLInterop ]; then
+if grep -qi microsoft /proc/version 2>/dev/null; then
     # WSL2: use Windows clipboard via PowerShell
     WIN_PATH=$(wslpath -w "$HOST_PATH")
     if ! powershell.exe -NoProfile -Command "

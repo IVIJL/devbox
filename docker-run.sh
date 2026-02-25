@@ -27,6 +27,7 @@ Usage:
   devbox blocked                   Show blocked DNS queries, allow interactively
   devbox cursor [name]             Open Cursor attached to running devbox
   devbox code [name]               Open VS Code attached to running devbox
+  devbox clip                      Grab clipboard image for container use
   devbox ssh-config [add|edit]     Manage devbox SSH config
 
 Build flags:
@@ -118,6 +119,7 @@ claude.ai
 sentry.io
 statsig.anthropic.com
 statsig.com
+mcp-proxy.anthropic.com
 # npm
 registry.npmjs.org
 # PyPI
@@ -134,6 +136,7 @@ update.code.visualstudio.com
 *.vsassets.io
 cursor.com
 cursor.sh
+raw.githubusercontent.com
 # Docker Hub (rootless DinD)
 registry-1.docker.io
 auth.docker.io
@@ -416,6 +419,7 @@ case "${1:-}" in
     cursor)    MODE="cursor";     shift; CURSOR_TARGET="${1:-}" ;;
     code)      MODE="code";       shift; CODE_TARGET="${1:-}" ;;
     ssh-config) MODE="ssh-config"; shift; SSH_CONFIG_ACTION="${1:-}" ;;
+    clip)      MODE="clip";      shift ;;
     build)     MODE="build";     shift ;;
     uninstall) MODE="uninstall"; shift ;;
     *)         MODE="auto" ;;
@@ -429,6 +433,12 @@ if [ "$MODE" = "ls" ]; then
 fi
 
 # --- devbox build [flags] ----------------------------------------------------
+
+# --- devbox clip -- grab clipboard image for container use -------------------
+
+if [ "$MODE" = "clip" ]; then
+    exec "$DEVBOX_DIR/scripts/clip-image.sh"
+fi
 
 if [ "$MODE" = "build" ]; then
     exec "$DEVBOX_DIR/build.sh" "$@"
@@ -1113,10 +1123,11 @@ DOCKER_ARGS=(
     -v devbox-cursor-server:/home/node/.cursor-server
     -v devbox-vscode-server:/home/node/.vscode-server
     -e CLAUDE_CONFIG_DIR=/home/node/.claude
-    # Git config from host (staging path — copied to /etc/gitconfig by entrypoint
-    # so VS Code/Cursor can write credential helpers without "Device busy" error)
-    -v "$HOME/.gitconfig:/home/node/.gitconfig-host:ro"
 )
+
+# Git config from host (staging path — copied to /etc/gitconfig by entrypoint
+# so VS Code/Cursor can write credential helpers without "Device busy" error)
+[ -f "$HOME/.gitconfig" ] && DOCKER_ARGS+=(-v "$HOME/.gitconfig:/home/node/.gitconfig-host:ro")
 
 # Global gitignore from host
 GIT_GLOBAL_IGNORE="$HOME/.config/git/ignore"
@@ -1164,11 +1175,22 @@ if [ -n "${NTFY_TOKEN:-}" ]; then
     DOCKER_ARGS+=(-e "NTFY_TOKEN=$NTFY_TOKEN")
 fi
 
+# Chezmoi dotfiles repo (set your own or leave empty to skip)
+CHEZMOI_REPO="${CHEZMOI_REPO:-github.com/IVIJL/vlci-dotfiles}"
+if [ -n "$CHEZMOI_REPO" ]; then
+    DOCKER_ARGS+=(-e "CHEZMOI_REPO=$CHEZMOI_REPO")
+fi
+
 # Shared firewall allowlist (host → all containers, read-only)
 DEVBOX_CONFIG_DIR="$HOME/.config/devbox"
 mkdir -p "$DEVBOX_CONFIG_DIR"
 touch "$DEVBOX_CONFIG_DIR/allowed-domains.conf"
 DOCKER_ARGS+=(-v "$DEVBOX_CONFIG_DIR/allowed-domains.conf:/etc/devbox-shared/allowed-domains.conf:ro")
+
+# Clipboard images shared directory (host → container, same ~/.clipboard-images path)
+CLIPBOARD_DIR="$HOME/.clipboard-images"
+mkdir -p "$CLIPBOARD_DIR"
+DOCKER_ARGS+=(-v "$CLIPBOARD_DIR:/home/node/.clipboard-images")
 
 # Mount workspace
 DOCKER_ARGS+=(-v "$PROJECT_PATH:/workspace")

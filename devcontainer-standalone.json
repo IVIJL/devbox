@@ -38,6 +38,7 @@
       }
     }
   },
+  "initializeCommand": "mkdir -p \"${localEnv:HOME}/.clipboard-images\" \"${localEnv:HOME}/.claude\" \"${localEnv:HOME}/.config/git\" \"${localEnv:HOME}/.ssh\" && touch \"${localEnv:HOME}/.gitconfig\" \"${localEnv:HOME}/.config/git/ignore\" \"${localEnv:HOME}/.ssh/config\" \"${localEnv:HOME}/.ssh/known_hosts\"",
   "remoteUser": "node",
   "mounts": [
     "source=${localEnv:HOME}/.gitconfig,target=/home/node/.gitconfig-host,type=bind,readonly",
@@ -49,13 +50,15 @@
     "source=devbox-docker,target=/home/node/.local/share/docker,type=volume",
     "source=devbox-nvim-data,target=/home/node/.local/share/nvim,type=volume",
     "source=devbox-cursor-server,target=/home/node/.cursor-server,type=volume",
-    "source=devbox-vscode-server,target=/home/node/.vscode-server,type=volume"
+    "source=devbox-vscode-server,target=/home/node/.vscode-server,type=volume",
+    "source=${localEnv:HOME}/.clipboard-images,target=/home/node/.clipboard-images,type=bind"
   ],
   "containerEnv": {
     "NODE_OPTIONS": "--max-old-space-size=4096",
     "CLAUDE_CONFIG_DIR": "/home/node/.claude",
     "TZ": "${localEnv:TZ:Europe/Prague}",
-    "NTFY_TOKEN": "${localEnv:NTFY_TOKEN}"
+    "NTFY_TOKEN": "${localEnv:NTFY_TOKEN}",
+    "CHEZMOI_REPO": "${localEnv:CHEZMOI_REPO}"
   },
   "workspaceFolder": "/workspace",
   "postStartCommand": "sudo cp /home/node/.gitconfig-host /etc/gitconfig 2>/dev/null || true; sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh",

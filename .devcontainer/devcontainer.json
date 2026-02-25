@@ -38,6 +38,7 @@
       }
     }
   },
+  "initializeCommand": "mkdir -p \"${localEnv:HOME}/.clipboard-images\" \"${localEnv:HOME}/.claude\" \"${localEnv:HOME}/.config/git\" && touch \"${localEnv:HOME}/.gitconfig\" \"${localEnv:HOME}/.config/git/ignore\"",
   "remoteUser": "node",
   "mounts": [
     "source=${localEnv:HOME}/.gitconfig,target=/home/node/.gitconfig-host,type=bind,readonly",
@@ -48,13 +49,15 @@
     "source=devbox-cursor-server-${devcontainerId},target=/home/node/.cursor-server,type=volume",
     "source=devbox-vscode-server-${devcontainerId},target=/home/node/.vscode-server,type=volume",
     "source=${localEnv:HOME}/.config/git/ignore,target=/home/node/.config/git/ignore,type=bind,readonly",
-    "source=${localEnv:HOME}/.claude,target=/home/node/.host-config/claude,type=bind,readonly"
+    "source=${localEnv:HOME}/.claude,target=/home/node/.host-config/claude,type=bind,readonly",
+    "source=${localEnv:HOME}/.clipboard-images,target=/home/node/.clipboard-images,type=bind"
   ],
   "containerEnv": {
     "NODE_OPTIONS": "--max-old-space-size=4096",
     "CLAUDE_CONFIG_DIR": "/home/node/.claude",
     "TZ": "${localEnv:TZ:Europe/Prague}",
-    "NTFY_TOKEN": "${localEnv:NTFY_TOKEN}"
+    "NTFY_TOKEN": "${localEnv:NTFY_TOKEN}",
+    "CHEZMOI_REPO": "${localEnv:CHEZMOI_REPO}"
   },
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
   "workspaceFolder": "/workspace",

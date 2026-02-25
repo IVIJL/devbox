@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # User packages
     ncdu mc nala libfuse2 xauth xclip ripgrep fd-find \
     build-essential libclang-dev \
-    grc curl wget ca-certificates \
+    grc curl wget ca-certificates shellcheck \
     && echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/backports.list \
     && apt-get update && apt-get install -y --no-install-recommends -t bookworm-backports tmux \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \

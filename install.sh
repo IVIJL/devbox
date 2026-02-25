@@ -361,10 +361,19 @@ configure_ssh_agent() {
     info "Configuring SSH agent..."
 
     # Determine login shell profile (runs once per session, not managed by dotfiles)
+    # IMPORTANT: For bash, prefer existing ~/.profile over creating ~/.bash_profile.
+    # Bash reads ~/.bash_profile first and STOPS — creating it shadows ~/.profile,
+    # breaking any existing user/system configuration there.
     local rc_file
     case "$(basename "${SHELL:-/bin/bash}")" in
         zsh)  rc_file="$HOME/.zprofile" ;;
-        bash) rc_file="$HOME/.bash_profile" ;;
+        bash)
+            if [ -f "$HOME/.bash_profile" ]; then
+                rc_file="$HOME/.bash_profile"
+            else
+                rc_file="$HOME/.profile"
+            fi
+            ;;
         *)    rc_file="$HOME/.profile" ;;
     esac
 

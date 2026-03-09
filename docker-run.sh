@@ -456,9 +456,15 @@ fi
 
 if [ "$MODE" = "update" ]; then
     echo "Updating devbox..."
-    git -C "$DEVBOX_DIR" pull --ff-only
-    echo "Rebuilding image..."
-    exec "$DEVBOX_DIR/build.sh" "$@"
+    pull_output=$(git -C "$DEVBOX_DIR" pull --ff-only origin main 2>&1)
+    echo "$pull_output"
+    if echo "$pull_output" | grep -q "Already up to date"; then
+        echo "No changes, skipping rebuild."
+    else
+        echo "Rebuilding image..."
+        exec "$DEVBOX_DIR/build.sh" "$@"
+    fi
+    exit 0
 fi
 
 # --- devbox uninstall --------------------------------------------------------

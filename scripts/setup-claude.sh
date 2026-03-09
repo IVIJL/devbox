@@ -39,4 +39,10 @@ if [ -f /home/node/.host-config/claude/.credentials.json ]; then
     cp /home/node/.host-config/claude/.credentials.json "$TARGET/.credentials.json"
 fi
 
+# Copy ~/.claude.json from host (onboarding state, account info)
+# Writable copy so Claude Code can update it during the session.
+if [ -f /home/node/.host-config/claude.json ]; then
+    cp /home/node/.host-config/claude.json /home/node/.claude.json
+fi
+
 echo "Claude Code config seeded from image defaults"

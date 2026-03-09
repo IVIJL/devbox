@@ -1159,6 +1159,9 @@ GIT_GLOBAL_IGNORE="$HOME/.config/git/ignore"
 # Host ~/.claude directory (read-only staging; setup-claude.sh symlinks CLAUDE.md into the volume)
 [ -d "$HOME/.claude" ] && DOCKER_ARGS+=(-v "$HOME/.claude:/home/node/.host-config/claude:ro")
 
+# Host ~/.claude.json (read-only staging; setup-claude.sh copies into container)
+[ -f "$HOME/.claude.json" ] && DOCKER_ARGS+=(-v "$HOME/.claude.json:/home/node/.host-config/claude.json:ro")
+
 # SSH config: --ssh-config uses full host config, otherwise devbox-specific config
 DEVBOX_SSH_CONFIG="$HOME/.config/devbox/ssh_config"
 if [ "$SSH_CONFIG_MOUNT" = true ]; then

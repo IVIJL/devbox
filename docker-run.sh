@@ -21,6 +21,7 @@ Usage:
   devbox port <port>               Expose port via Traefik
   devbox ports                     List active port routes
   devbox build [flags]             Build/rebuild the devbox image
+  devbox update                    Update devbox (pull repo + rebuild image)
   devbox uninstall                 Remove everything (containers, volumes, image)
   devbox allow [domain]            List or add allowed firewall domain
   devbox deny [domain]             Remove allowed domain (interactive)
@@ -427,6 +428,7 @@ case "${1:-}" in
     ssh-config) MODE="ssh-config"; shift; SSH_CONFIG_ACTION="${1:-}" ;;
     clip)      MODE="clip";      shift ;;
     build)     MODE="build";     shift ;;
+    update)    MODE="update";    shift ;;
     uninstall) MODE="uninstall"; shift ;;
     *)         MODE="auto" ;;
 esac
@@ -447,6 +449,15 @@ if [ "$MODE" = "clip" ]; then
 fi
 
 if [ "$MODE" = "build" ]; then
+    exec "$DEVBOX_DIR/build.sh" "$@"
+fi
+
+# --- devbox update -----------------------------------------------------------
+
+if [ "$MODE" = "update" ]; then
+    echo "Updating devbox..."
+    git -C "$DEVBOX_DIR" pull --ff-only
+    echo "Rebuilding image..."
     exec "$DEVBOX_DIR/build.sh" "$@"
 fi
 

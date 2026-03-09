@@ -39,10 +39,11 @@ if [ -f /home/node/.host-config/claude/.credentials.json ]; then
     cp /home/node/.host-config/claude/.credentials.json "$TARGET/.credentials.json"
 fi
 
-# Copy ~/.claude.json from host (onboarding state, account info)
-# Writable copy so Claude Code can update it during the session.
+# Copy host ~/.claude.json into CLAUDE_CONFIG_DIR (onboarding state, account info, prefs).
+# Claude Code reads hasCompletedOnboarding from this path; without it every new
+# per-project container shows the login screen.
 if [ -f /home/node/.host-config/claude.json ]; then
-    cp /home/node/.host-config/claude.json /home/node/.claude.json
+    cp /home/node/.host-config/claude.json "$TARGET/.claude.json"
 fi
 
 echo "Claude Code config seeded from image defaults"

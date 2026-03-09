@@ -1207,6 +1207,9 @@ if [ -n "$CHEZMOI_REPO" ]; then
     DOCKER_ARGS+=(-e "CHEZMOI_REPO=$CHEZMOI_REPO")
 fi
 
+# Host home directory for WezTerm OSC 7 safe fallback CWD
+DOCKER_ARGS+=(-e "HOST_HOME=$HOME")
+
 # Shared firewall allowlist (host → all containers, read-only)
 DEVBOX_CONFIG_DIR="$HOME/.config/devbox"
 mkdir -p "$DEVBOX_CONFIG_DIR"

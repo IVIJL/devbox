@@ -46,4 +46,10 @@ if [ -f /home/node/.host-config/claude.json ]; then
     cp /home/node/.host-config/claude.json "$TARGET/.claude.json"
 fi
 
+# Pre-trust /workspace so the safety prompt doesn't appear on every startup
+if [ -f "$TARGET/.claude.json" ]; then
+    jq '.projects["/workspace"].hasTrustDialogAccepted = true' "$TARGET/.claude.json" > "$TARGET/.claude.json.tmp" \
+        && mv "$TARGET/.claude.json.tmp" "$TARGET/.claude.json"
+fi
+
 echo "Claude Code config seeded from image defaults"

@@ -74,6 +74,11 @@ sanitize() {
     echo "$1" | tr -cs 'a-zA-Z0-9_.-' '-' | sed 's/^-//;s/-$//'
 }
 
+set_tab_title() {
+    # shellcheck disable=SC1003 # literal backslash for OSC escape terminator
+    printf '\033]0;%s\033\\' "$1"
+}
+
 bootstrap_traefik() {
     docker network inspect devproxy >/dev/null 2>&1 || docker network create devproxy
 
@@ -259,6 +264,7 @@ stop_traefik_if_idle() {
 attach_to_container() {
     local name="$1"
     echo "Attaching to running container: $name"
+    set_tab_title "${name#devbox-}"
     exec docker exec -it -w /workspace "$name" zsh
 }
 
@@ -1117,8 +1123,8 @@ DOCKER_ARGS=(
     # Per-project volumes
     -v "devbox-${PROJECT_NAME}-history:/home/node/.local/share/atuin"
     -v "devbox-${PROJECT_NAME}-docker:/home/node/.local/share/docker"
+    -v "devbox-${PROJECT_NAME}-claude:/home/node/.claude"
     # Shared volumes
-    -v devbox-claude-config:/home/node/.claude
     -v devbox-nvim-data:/home/node/.local/share/nvim
     -v devbox-cursor-server:/home/node/.cursor-server
     -v devbox-vscode-server:/home/node/.vscode-server
@@ -1238,4 +1244,5 @@ docker exec "$CONTAINER_NAME" bash -c \
     '/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh'
 
 # Attach first interactive session
+set_tab_title "$PROJECT_NAME"
 exec docker exec -it -w /workspace "$CONTAINER_NAME" zsh

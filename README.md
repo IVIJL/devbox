@@ -162,10 +162,10 @@ Multiple devbox containers can run simultaneously for different projects. Each g
 - Container (`devbox-<project>`)
 - Docker volume (`devbox-<project>-docker`)
 - Shell history volume (`devbox-<project>-history`)
+- Claude config volume (`devbox-<project>-claude`)
 - Traefik port routes (namespaced by project name)
 
 Shared across all containers:
-- Claude config volume (`devbox-claude-config`)
 - Neovim data volume (`devbox-nvim-data`)
 - Cursor server volume (`devbox-cursor-server`)
 - VS Code server volume (`devbox-vscode-server`)
@@ -218,6 +218,25 @@ The container uses `devbox-entrypoint.sh` as PID 1, which traps SIGTERM and grac
 The shutdown chain: host Docker → SIGTERM → entrypoint trap → `docker stop` inner containers → inner processes flush/shutdown → entrypoint exits. Additionally, `devbox stop` runs a pre-stop hook that explicitly stops inner containers before sending SIGTERM to the entrypoint (belt-and-suspenders).
 
 The container uses `--stop-timeout 45` to allow sufficient time for inner containers with databases to shut down cleanly.
+
+#### Windows shutdown hook
+
+When Windows shuts down or restarts, WSL2 is terminated abruptly without sending SIGTERM to processes inside. This causes containers to exit with code 255 instead of a clean shutdown.
+
+To fix this, install the Windows shutdown hook that stops all Docker containers **before** WSL2 terminates:
+
+```powershell
+# Run as Administrator in PowerShell
+powershell -ExecutionPolicy Bypass -File scripts\windows\install-shutdown-hook.ps1
+```
+
+This registers a shutdown script via the Windows registry (works on Home edition without `gpedit.msc`). The script runs automatically during shutdown, stops all running containers in parallel with a 15s timeout, and logs to `C:\Scripts\devbox\shutdown.log`.
+
+To uninstall:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\uninstall-shutdown-hook.ps1
+```
 
 ## Included Tools
 
@@ -316,6 +335,8 @@ Works on WSL2 (PowerShell clipboard), Linux X11 (`xclip`), and Linux Wayland (`w
 devbox clip                      # Grab clipboard image, print path
 ```
 
+Images older than 24 hours are cleaned up automatically on each invocation.
+
 ### WezTerm keybinding
 
 Add a keybinding to your `~/.wezterm.lua` so `Ctrl+Shift+S` grabs the clipboard image and pastes its path into the terminal. This snippet auto-detects WSL vs native Linux:
@@ -344,7 +365,61 @@ Add a keybinding to your `~/.wezterm.lua` so `Ctrl+Shift+S` grabs the clipboard 
 },
 ```
 
-Images older than 24 hours are cleaned up automatically on each invocation.
+
+### WezTerm tab duplication and tab title
+
+By default, `Ctrl+Shift+T` opens a new tab but WSL tabs may land in `/` instead of the current directory. The fix requires OSC 7 reporting — but only on the host. Inside devbox containers the same hook would send paths like `/workspace` that don't exist on the host, causing `chdir(/workspace) failed` on every new tab. Instead, containers export only their project name via a WezTerm user variable.
+
+Since dotfiles are shared via chezmoi, use a single conditional block in `~/.zshrc`:
+
+```bash
+if [ -n "$DEVCONTAINER" ]; then
+    # Export project name for WezTerm tab title (no OSC 7 — container paths don't exist on host)
+    printf '\033]1337;SetUserVar=devbox_project=%s\007' "$(printf '%s' "${HOSTNAME}" | base64)"
+else
+    # Host: OSC 7 for CWD tracking (tab duplication with correct directory)
+    __wezterm_osc7() {
+        printf '\033]7;file://%s%s\033\\' "${HOSTNAME}" "${PWD}"
+    }
+    precmd_functions+=(__wezterm_osc7)
+fi
+```
+
+In `~/.wezterm.lua`, use `CurrentPaneDomain` for both the keybinding and the `+` button:
+
+```lua
+{ key = 'T', mods = 'CTRL|SHIFT', action = act.SpawnTab('CurrentPaneDomain') },
+```
+
+```lua
+wezterm.on('new-tab-button-click', function(window, pane)
+  window:perform_action(act.SpawnTab('CurrentPaneDomain'), pane)
+  return false
+end)
+```
+
+Claude Code continuously overwrites the terminal tab title (spinner animation during work, "Claude Code" as static title). There is no official config to disable this ([#7229](https://github.com/anthropics/claude-code/issues/7229)). The `format-tab-title` event controls what WezTerm **displays** in the tab bar. Add to `~/.wezterm.lua`:
+
+```lua
+wezterm.on('format-tab-title', function(tab)
+  local pane = tab.active_pane
+  local project = pane:get_user_vars().devbox_project
+  if project and project ~= '' then
+    return ' ' .. project .. ': ' .. pane.title .. ' '
+  end
+  local cwd = pane.current_working_dir
+  if cwd then
+    local dir = cwd.file_path:match('([^/]+)/?$') or cwd.file_path
+    return ' ' .. dir .. ' '
+  end
+  return pane.title
+end)
+```
+
+Result:
+- Devbox tab: `myapp: Claude Code` or `myapp: ⠋ Thinking...` — project prefix from user variable, Claude Code controls the rest.
+- Non-devbox tab: basename of the current directory (e.g. `projects`) instead of `wslhost.exe`.
+- Before the first prompt (OSC 7 not yet received): falls back to `pane.title`.
 
 ## Dotfiles
 

@@ -380,13 +380,17 @@ The solution is a hybrid approach in `~/.zshrc` (managed by chezmoi):
 if [ -n "$DEVCONTAINER" ]; then
     # Devbox: OSC 7 with hostname for tab title prefix (cwd.host in WezTerm).
     # HOST_HOME as safe CWD so new tabs open in host's ~ instead of /workspace.
+    # OSC 1 sets pane.title to CWD basename (updates on cd, restores after Claude Code exit).
     __wezterm_osc7() {
         printf '\033]7;file://%s%s\033\\' "${HOSTNAME}" "${HOST_HOME:-/}"
+        printf '\033]1;%s\033\\' "${PWD##*/}"
     }
     precmd_functions+=(__wezterm_osc7)
 else
-    # Host WSL: OSC 7 doesn't work (cwd always nil), use OSC 1 to set tab title
+    # Host WSL: OSC 7 doesn't set cwd, but empty OSC 7 clears stale cwd.host
+    # left over from a previous container session. OSC 1 sets the tab title.
     __wezterm_title() {
+        printf '\033]7;\033\\'
         printf '\033]1;%s\033\\' "${PWD##*/}"
     }
     precmd_functions+=(__wezterm_title)
@@ -438,7 +442,7 @@ Result:
 - Devbox tab (shell): `myapp` — project name from container hostname.
 - Devbox tab (Claude Code): `myapp: Claude Code` — project prefix + Claude Code title.
 - After exiting Claude Code: `myapp` (back to project name only).
-- After exiting devbox: CWD basename (host precmd fires on next prompt).
+- After exiting devbox: CWD basename (host precmd clears stale `cwd.host` via empty OSC 7).
 - New tab from devbox pane: opens in host's home directory (`HOST_HOME`).
 
 ## Dotfiles

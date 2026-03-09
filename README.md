@@ -368,27 +368,29 @@ Add a keybinding to your `~/.wezterm.lua` so `Ctrl+Shift+S` grabs the clipboard 
 
 ### WezTerm tab duplication and tab title
 
-OSC 7 reporting is needed for two things: CWD-aware new tabs and project name in tab title. The challenge is that dotfiles are shared (chezmoi) between host and containers. Container paths like `/workspace` don't exist on the host, causing `chdir(/workspace) failed` when WezTerm spawns a new tab.
+OSC 7 (`\033]7;file://host/path`) is the standard way to report CWD to terminals, but **it doesn't work on WezTerm's WSL domain** — `pane.current_working_dir` stays nil. OSC 0 doesn't work either. Only **OSC 1** (`\033]1;TITLE`) works for setting the tab title on WSL.
 
-The solution: both host and container send OSC 7 via `precmd`, but the container sends the host's home directory (`HOST_HOME`) as a safe CWD instead of `/workspace`. WezTerm uses `cwd.host` for the tab title prefix — it's non-empty only for "foreign" hostnames (containers), because WezTerm clears it when it matches the local machine. The container hostname is set to the project name via `docker run --hostname "$PROJECT_NAME"`. The `HOST_HOME` env var is passed to the container via `devcontainer.json` / `docker-run.sh`.
+Inside devbox containers, OSC 7 *does* work (escape sequences pass through docker to WezTerm). The container hostname (`docker run --hostname "$PROJECT_NAME"`) appears as `cwd.host` in WezTerm, which is used for the project name prefix.
 
-In `~/.zshrc` (managed by chezmoi):
+The solution is a hybrid approach in `~/.zshrc` (managed by chezmoi):
+- **Container**: OSC 7 with hostname for `cwd.host` tab prefix + `HOST_HOME` as safe CWD
+- **Host WSL**: OSC 1 to set tab title directly to CWD basename
 
 ```bash
 if [ -n "$DEVCONTAINER" ]; then
-    # Devbox: send hostname via OSC 7 for tab title prefix (cwd.host in WezTerm).
-    # Use HOST_HOME as CWD so new tabs open in host's ~ instead of failing
-    # with "chdir(/workspace) failed". Falls back to / if HOST_HOME is not set.
+    # Devbox: OSC 7 with hostname for tab title prefix (cwd.host in WezTerm).
+    # HOST_HOME as safe CWD so new tabs open in host's ~ instead of /workspace.
     __wezterm_osc7() {
         printf '\033]7;file://%s%s\033\\' "${HOSTNAME}" "${HOST_HOME:-/}"
     }
+    precmd_functions+=(__wezterm_osc7)
 else
-    # Host: full OSC 7 for CWD tracking (tab duplication with correct directory)
-    __wezterm_osc7() {
-        printf '\033]7;file://%s%s\033\\' "${HOSTNAME}" "${PWD}"
+    # Host WSL: OSC 7 doesn't work (cwd always nil), use OSC 1 to set tab title
+    __wezterm_title() {
+        printf '\033]1;%s\033\\' "${PWD##*/}"
     }
+    precmd_functions+=(__wezterm_title)
 fi
-precmd_functions+=(__wezterm_osc7)
 ```
 
 In `~/.wezterm.lua`, use `CurrentPaneDomain` for both the keybinding and the `+` button:
@@ -404,46 +406,40 @@ wezterm.on('new-tab-button-click', function(window, pane)
 end)
 ```
 
-Claude Code continuously overwrites the terminal tab title via OSC escape sequences (spinner animation during work, "Claude Code" as static title). There is no official config to disable this ([#7229](https://github.com/anthropics/claude-code/issues/7229)). The `format-tab-title` event controls what WezTerm **displays** in the tab bar. It uses `pane.title` (set by programs via OSC), `pane.foreground_process_name` (current process), and `pane.current_working_dir` (from OSC 7). Add to `~/.wezterm.lua`:
+Claude Code continuously overwrites the terminal tab title via OSC escape sequences (spinner animation during work, "Claude Code" as static title). There is no official config to disable this ([#7229](https://github.com/anthropics/claude-code/issues/7229)). The `format-tab-title` event controls what WezTerm **displays** in the tab bar. On WSL host tabs, `pane.title` is set to CWD basename by the OSC 1 precmd hook above. On devbox tabs, `cwd.host` carries the project name from OSC 7. Add to `~/.wezterm.lua`:
 
 ```lua
 wezterm.on('format-tab-title', function(tab)
   local pane = tab.active_pane
   local cwd = pane.current_working_dir
 
-  -- Process name basename (e.g. "zsh", "claude", "node")
-  local proc = pane.foreground_process_name or ''
-  local proc_name = proc:match('([^/\\]+)$') or ''
-
-  -- Use pane.title when a program (like Claude Code) sets it via OSC;
-  -- fall back to process basename, then "shell"
+  -- pane.title defaults to "wslhost.exe" on WSL — treat as unset
   local title = pane.title or ''
-  if title == '' then
-    title = proc_name ~= '' and proc_name or 'shell'
+  if title:find('wslhost') then
+    title = ''
   end
 
-  -- Devbox container: cwd.host is the project name (--hostname flag).
-  -- WezTerm clears cwd.host when it matches the local machine hostname,
-  -- so this is non-empty only for "foreign" hosts (containers).
+  -- Devbox container: cwd.host = project name (--hostname flag)
   if cwd and cwd.host ~= '' then
-    return ' ' .. cwd.host .. ': ' .. title .. ' '
+    if title ~= '' then
+      return ' ' .. cwd.host .. ': ' .. title .. ' '
+    end
+    return ' ' .. cwd.host .. ' '
   end
 
-  -- Host: show CWD basename (avoids "wslhost.exe" default)
-  if cwd then
-    local dir = cwd.file_path:match('([^/]+)/?$') or cwd.file_path
-    return ' ' .. dir .. ' '
-  end
-
-  return ' ' .. title .. ' '
+  -- Host WSL: pane.title is set to CWD basename via OSC 1 precmd hook
+  -- (OSC 7 doesn't work on WezTerm WSL domain, so cwd is always nil here)
+  return title ~= '' and (' ' .. title .. ' ') or ' shell '
 end)
 ```
 
 Result:
-- Devbox tab: `myapp: Claude Code` or `myapp: ⠋ Thinking...` — project prefix from container hostname, Claude Code controls the title part.
-- Host tab: CWD basename (e.g. `Projekty`) instead of `wslhost.exe`.
-- After exiting Claude Code: falls back to process name (e.g. `zsh`) instead of empty title.
-- New tab from devbox pane: opens in host's home directory (`HOST_HOME`) instead of crashing with `chdir(/workspace) failed`.
+- Host tab: CWD basename (e.g. `Projekty`) via OSC 1, updates on every `cd`.
+- Devbox tab (shell): `myapp` — project name from container hostname.
+- Devbox tab (Claude Code): `myapp: Claude Code` — project prefix + Claude Code title.
+- After exiting Claude Code: `myapp` (back to project name only).
+- After exiting devbox: CWD basename (host precmd fires on next prompt).
+- New tab from devbox pane: opens in host's home directory (`HOST_HOME`).
 
 ## Dotfiles
 

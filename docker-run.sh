@@ -279,7 +279,7 @@ restart_exited_container() {
         return 1
     fi
     # Re-run init scripts (firewall, rootless docker, chezmoi, claude)
-    docker exec -u root "$name" bash -c '/usr/local/bin/init-firewall.sh'
+    docker exec -u root "$name" bash -c 'cp /home/node/.gitconfig-host /etc/gitconfig 2>/dev/null; /usr/local/bin/init-firewall.sh'
     docker exec "$name" bash -c \
         '/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh'
     # Re-apply port routes
@@ -1239,7 +1239,7 @@ fi
 # Init scripts: firewall runs as root (no sudo needed), rest as node
 # Fix IDE server directory permissions (volumes may be created as root)
 docker exec -u root "$CONTAINER_NAME" bash -c \
-    'chown node:node /home/node/.cursor-server /home/node/.vscode-server 2>/dev/null; /usr/local/bin/init-firewall.sh'
+    'cp /home/node/.gitconfig-host /etc/gitconfig 2>/dev/null; chown node:node /home/node/.cursor-server /home/node/.vscode-server 2>/dev/null; /usr/local/bin/init-firewall.sh'
 docker exec "$CONTAINER_NAME" bash -c \
     '/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh'
 

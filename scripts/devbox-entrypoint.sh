@@ -24,11 +24,6 @@ shutdown_handler() {
 
 trap shutdown_handler SIGTERM SIGINT
 
-# Copy host gitconfig so IDE can write to /etc/gitconfig (avoids read-only mount errors)
-if [ -f /home/node/.gitconfig-host ]; then
-    sudo cp /home/node/.gitconfig-host /etc/gitconfig 2>/dev/null || true
-fi
-
 # Keep container alive — sleep in background + wait allows signal handling
 # (bash ignores signals during foreground sleep)
 while true; do

@@ -114,11 +114,15 @@ detect_os() {
     case "$(uname -s)" in
         Darwin)
             OS="macos"
-            PM="brew"
-            if ! has brew; then
-                error "Homebrew is required on macOS. Install from https://brew.sh"
+            if has port; then
+                PM="macports"
+                msg "macOS detected (MacPorts)"
+            elif has brew; then
+                PM="brew"
+                msg "macOS detected (Homebrew)"
+            else
+                error "On macOS, Homebrew or MacPorts is required. Install from https://brew.sh or https://www.macports.org/install.php"
             fi
-            msg "macOS detected (Homebrew)"
             return
             ;;
         Linux) ;;
@@ -154,8 +158,9 @@ detect_os() {
 pkg_install() {
     local pkg="$1"
     case "$PM" in
-        brew)    brew install "$pkg" ;;
-        apt-get) sudo apt-get install -y "$pkg" ;;
+        brew)      brew install "$pkg" ;;
+        macports)  sudo port install "$pkg" ;;
+        apt-get)   sudo apt-get install -y "$pkg" ;;
         dnf)     sudo dnf install -y "$pkg" ;;
         pacman)  sudo pacman -S --noconfirm "$pkg" ;;
         zypper)  sudo zypper install -y "$pkg" ;;
@@ -165,12 +170,13 @@ pkg_install() {
 
 pkg_update() {
     case "$PM" in
-        apt-get) sudo apt-get update ;;
-        dnf)     ;; # dnf auto-refreshes
-        pacman)  ;; # pacman -Sy without -u is unsafe; pacman -S handles it
-        zypper)  sudo zypper refresh ;;
-        apk)     sudo apk update ;;
-        brew)    brew update ;;
+        apt-get)   sudo apt-get update ;;
+        dnf)       ;; # dnf auto-refreshes
+        pacman)    ;; # pacman -Sy without -u is unsafe; pacman -S handles it
+        zypper)    sudo zypper refresh ;;
+        apk)       sudo apk update ;;
+        brew)      brew update ;;
+        macports)  sudo port selfupdate ;;
     esac
 }
 
@@ -300,7 +306,11 @@ check_docker() {
         msg "Install Docker via one of:"
         msg "  - Docker Desktop: https://www.docker.com/products/docker-desktop/"
         msg "  - OrbStack:       https://orbstack.dev"
-        msg "  - Colima:         brew install colima docker docker-compose"
+        if [ "$PM" = "macports" ]; then
+            msg "  - MacPorts:        sudo port install docker docker-compose"
+        else
+            msg "  - Colima:          brew install colima docker docker-compose"
+        fi
         SKIPPED+=("Docker (not installed)")
         return
     fi
@@ -636,3 +646,4 @@ main() {
 }
 
 main
+

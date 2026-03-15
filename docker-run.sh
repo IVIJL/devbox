@@ -474,7 +474,7 @@ if [ "$MODE" = "claude-token" ]; then
     mkdir -p "$HOME/.config/devbox"
     echo "Running 'claude setup-token'..."
     echo "Follow the prompts to authenticate."
-    if token=$(claude setup-token 2>/dev/null); then
+    if token=$(claude setup-token); then
         printf '%s\n' "$token" > "$claude_token_file"
         chmod 600 "$claude_token_file"
         echo "Claude token saved to $claude_token_file"
@@ -504,7 +504,7 @@ if [ "$MODE" = "update" ]; then
             mkdir -p "$HOME/.config/devbox"
             echo "Running 'claude setup-token'..."
             echo "Follow the prompts to authenticate."
-            if token=$(claude setup-token 2>/dev/null); then
+            if token=$(claude setup-token); then
                 printf '%s\n' "$token" > "$claude_token_file"
                 chmod 600 "$claude_token_file"
                 echo "Claude token saved to $claude_token_file"

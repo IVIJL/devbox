@@ -460,7 +460,7 @@ setup_claude_token() {
     msg "Follow the prompts to authenticate."
 
     local token
-    if token=$(claude setup-token 2>/dev/null); then
+    if token=$(claude setup-token); then
         printf '%s\n' "$token" > "$token_file"
         chmod 600 "$token_file"
         CONFIGURED+=("Claude token -> $token_file")

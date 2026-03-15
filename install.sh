@@ -450,21 +450,9 @@ setup_claude_token() {
         return
     fi
 
-    if ! confirm "Generate Claude Code token for containers? (avoids daily re-login)"; then
-        SKIPPED+=("Claude token (skipped)")
-        return
-    fi
-
-    mkdir -p "$HOME/.config/devbox"
-    echo ""
-    if claude setup-token > "$token_file"; then
-        chmod 600 "$token_file"
-        CONFIGURED+=("Claude token -> $token_file")
-    else
-        rm -f "$token_file"
-        warn "claude setup-token failed. You can run it later: devbox claude-token"
-        SKIPPED+=("Claude token (setup failed)")
-    fi
+    msg "Run 'devbox claude-token' after install to set up a long-lived token."
+    msg "This avoids daily re-login when using Claude Code in containers."
+    SKIPPED+=("Claude token (run 'devbox claude-token' to set up)")
 }
 
 # --- Clone / update devbox repo ---------------------------------------------

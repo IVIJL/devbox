@@ -472,16 +472,14 @@ if [ "$MODE" = "claude-token" ]; then
         fi
     fi
     mkdir -p "$HOME/.config/devbox"
-    echo "Running 'claude setup-token'..."
-    echo "Follow the prompts to authenticate."
-    if token=$(claude setup-token); then
-        printf '%s\n' "$token" > "$claude_token_file"
+    echo ""
+    if claude setup-token > "$claude_token_file"; then
         chmod 600 "$claude_token_file"
         echo "Claude token saved to $claude_token_file"
         echo "Restart your devbox containers to use the new token."
     else
-        echo "claude setup-token failed. Try running it manually:"
-        echo "  claude setup-token > $claude_token_file"
+        rm -f "$claude_token_file"
+        echo "claude setup-token failed. Try again with: devbox claude-token"
         exit 1
     fi
     exit 0
@@ -502,15 +500,13 @@ if [ "$MODE" = "update" ]; then
         read -r answer
         if [[ "$answer" =~ ^[Yy]$ ]]; then
             mkdir -p "$HOME/.config/devbox"
-            echo "Running 'claude setup-token'..."
-            echo "Follow the prompts to authenticate."
-            if token=$(claude setup-token); then
-                printf '%s\n' "$token" > "$claude_token_file"
+            echo ""
+            if claude setup-token > "$claude_token_file"; then
                 chmod 600 "$claude_token_file"
                 echo "Claude token saved to $claude_token_file"
             else
-                echo "claude setup-token failed. You can run it manually later:"
-                echo "  claude setup-token > $claude_token_file"
+                rm -f "$claude_token_file"
+                echo "claude setup-token failed. You can run it later: devbox claude-token"
             fi
         fi
     fi

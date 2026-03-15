@@ -456,17 +456,13 @@ setup_claude_token() {
     fi
 
     mkdir -p "$HOME/.config/devbox"
-    msg "Running 'claude setup-token'..."
-    msg "Follow the prompts to authenticate."
-
-    local token
-    if token=$(claude setup-token); then
-        printf '%s\n' "$token" > "$token_file"
+    echo ""
+    if claude setup-token > "$token_file"; then
         chmod 600 "$token_file"
         CONFIGURED+=("Claude token -> $token_file")
     else
-        warn "claude setup-token failed. You can run it manually later:"
-        msg "  claude setup-token > $token_file"
+        rm -f "$token_file"
+        warn "claude setup-token failed. You can run it later: devbox claude-token"
         SKIPPED+=("Claude token (setup failed)")
     fi
 }

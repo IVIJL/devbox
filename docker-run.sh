@@ -498,9 +498,16 @@ fi
 # --- devbox update -----------------------------------------------------------
 
 if [ "$MODE" = "update" ]; then
-    echo "Updating devbox..."
-    pull_output=$(git -C "$DEVBOX_DIR" pull --ff-only origin main 2>&1)
-    echo "$pull_output"
+    # Re-exec with updated script after pull (skip pull on second run)
+    if [ "${DEVBOX_UPDATE_PULLED:-}" != "1" ]; then
+        echo "Updating devbox..."
+        pull_output=$(git -C "$DEVBOX_DIR" pull --ff-only origin main 2>&1)
+        echo "$pull_output"
+        if ! echo "$pull_output" | grep -q "Already up to date"; then
+            echo "Re-running with updated script..."
+            DEVBOX_UPDATE_PULLED=1 exec "$DEVBOX_DIR/docker-run.sh" update "$@"
+        fi
+    fi
 
     # Offer Claude token setup if not configured yet
     claude_token_file="$HOME/.config/devbox/claude-token"
@@ -509,11 +516,11 @@ if [ "$MODE" = "update" ]; then
         printf '\033[1;33m==> Claude Code token not configured. Run "devbox claude-token" to avoid daily re-login. \033[0m\n'
     fi
 
-    if echo "$pull_output" | grep -q "Already up to date"; then
-        echo "No changes, skipping rebuild."
-    else
+    if [ "${DEVBOX_UPDATE_PULLED:-}" = "1" ]; then
         echo "Rebuilding image..."
         exec "$DEVBOX_DIR/build.sh" "$@"
+    else
+        echo "No changes, skipping rebuild."
     fi
     exit 0
 fi

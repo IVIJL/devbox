@@ -21,6 +21,7 @@ _devbox() {
         cmd)
             local -a commands
             commands=(
+                'help:Show help message'
                 'ls:List running containers'
                 'stop:Stop container (--clean removes volumes)'
                 'remove:Remove project data (volumes)'

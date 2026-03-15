@@ -23,6 +23,7 @@ Usage:
   devbox build [flags]             Build/rebuild the devbox image
   devbox update                    Update devbox (pull repo + rebuild image)
   devbox uninstall                 Remove everything (containers, volumes, image)
+  devbox claude-token              Generate/regenerate Claude Code token
   devbox allow [domain]            List or add allowed firewall domain
   devbox deny [domain]             Remove allowed domain (interactive)
   devbox blocked                   Show blocked DNS queries, allow interactively
@@ -427,6 +428,7 @@ case "${1:-}" in
     code)      MODE="code";       shift; CODE_TARGET="${1:-}" ;;
     ssh-config) MODE="ssh-config"; shift; SSH_CONFIG_ACTION="${1:-}" ;;
     clip)      MODE="clip";      shift ;;
+    claude-token) MODE="claude-token"; shift ;;
     build)     MODE="build";     shift ;;
     update)    MODE="update";    shift ;;
     uninstall) MODE="uninstall"; shift ;;
@@ -450,6 +452,39 @@ fi
 
 if [ "$MODE" = "build" ]; then
     exec "$DEVBOX_DIR/build.sh" "$@"
+fi
+
+# --- devbox claude-token -----------------------------------------------------
+
+if [ "$MODE" = "claude-token" ]; then
+    claude_token_file="$HOME/.config/devbox/claude-token"
+    if ! command -v claude &>/dev/null; then
+        echo "Error: 'claude' command not found. Install Claude Code first:"
+        echo "  curl -fsSL https://claude.ai/install.sh | bash"
+        exit 1
+    fi
+    if [ -f "$claude_token_file" ]; then
+        printf '\033[1;33m==> Token already exists at %s. Regenerate? [y/N] \033[0m' "$claude_token_file"
+        read -r answer
+        if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+            echo "Kept existing token."
+            exit 0
+        fi
+    fi
+    mkdir -p "$HOME/.config/devbox"
+    echo "Running 'claude setup-token'..."
+    echo "Follow the prompts to authenticate."
+    if token=$(claude setup-token 2>/dev/null); then
+        printf '%s\n' "$token" > "$claude_token_file"
+        chmod 600 "$claude_token_file"
+        echo "Claude token saved to $claude_token_file"
+        echo "Restart your devbox containers to use the new token."
+    else
+        echo "claude setup-token failed. Try running it manually:"
+        echo "  claude setup-token > $claude_token_file"
+        exit 1
+    fi
+    exit 0
 fi
 
 # --- devbox update -----------------------------------------------------------

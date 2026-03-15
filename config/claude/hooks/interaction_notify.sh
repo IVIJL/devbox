@@ -4,7 +4,7 @@
 # Runs when Claude needs user interaction or approval
 
 SOUND_FILE="/home/node/.claude/sounds/option.wav"
-NTFY_URL="https://n.gaiagroup.cz/VlciClaude"
+NTFY_URL="${NTFY_URL:-}"
 TOKEN="${NTFY_TOKEN:-}"
 
 # Function to log messages
@@ -52,12 +52,9 @@ if [ "$INTERACTION_NEEDED" = true ]; then
     ) &
 
     # Send ntfy notification (separate process with timeout)
+    MESSAGE="⏳ Claude čeká na tvoje potvrzení"
     (
-        MESSAGE="⏳ Claude čeká na tvoje potvrzení"
-
-        if [ -n "$TOKEN" ] && [ "$TOKEN" != "YOUR_TOKEN_HERE" ]; then
-            curl -s -o /dev/null -H "Authorization: Bearer $TOKEN" -d "$MESSAGE" "$NTFY_URL"
-        else
+        if [ -n "$TOKEN" ] && [ -n "$NTFY_URL" ]; then
             curl -s -o /dev/null -H "Authorization: Bearer $TOKEN" -d "$MESSAGE" "$NTFY_URL"
         fi
     ) &

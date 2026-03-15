@@ -4,7 +4,7 @@
 # Runs when Claude successfully completes a task
 
 SOUND_FILE="/home/node/.claude/sounds/success.wav"
-NTFY_URL="https://n.gaiagroup.cz/VlciClaude"
+NTFY_URL="${NTFY_URL:-}"
 TOKEN="${NTFY_TOKEN:-}"
 
 # Function to log messages
@@ -24,11 +24,9 @@ log_message() {
 ) &
 
 # Send ntfy notification (separate process with timeout)
+MESSAGE="✅ Claude dokončil úlohu úspěšně"
 (
-    MESSAGE="✅ Claude dokončil úlohu úspěšně"
-    if [ -n "$TOKEN" ] && [ "$TOKEN" != "YOUR_TOKEN_HERE" ]; then
-        curl -s -o /dev/null -H "Authorization: Bearer $TOKEN" -d "$MESSAGE" "$NTFY_URL"
-    else
+    if [ -n "$TOKEN" ] && [ -n "$NTFY_URL" ]; then
         curl -s -o /dev/null -H "Authorization: Bearer $TOKEN" -d "$MESSAGE" "$NTFY_URL"
     fi
 ) &

@@ -1268,6 +1268,15 @@ if [ -n "${NTFY_TOKEN:-}" ]; then
     DOCKER_ARGS+=(-e "NTFY_TOKEN=$NTFY_TOKEN")
 fi
 
+# Auto-detect NTFY_URL from host's Claude hooks if not set
+if [ -z "${NTFY_URL:-}" ] && [ -d "$HOME/.claude/hooks" ]; then
+    NTFY_URL=$(grep -ohm1 'NTFY_URL="https://[^"]*"' "$HOME/.claude/hooks/"*.sh 2>/dev/null | head -1 | cut -d'"' -f2 || true)
+fi
+
+if [ -n "${NTFY_URL:-}" ]; then
+    DOCKER_ARGS+=(-e "NTFY_URL=$NTFY_URL")
+fi
+
 # Chezmoi dotfiles repo (set your own or leave empty to skip)
 CHEZMOI_REPO="${CHEZMOI_REPO:-github.com/IVIJL/vlci-dotfiles}"
 if [ -n "$CHEZMOI_REPO" ]; then

@@ -4,7 +4,7 @@
 # Runs after tool use to detect errors and failures
 
 SOUND_FILE="/home/node/.claude/sounds/fail.wav"
-NTFY_URL="https://n.gaiagroup.cz/VlciClaude"
+NTFY_URL="${NTFY_URL:-}"
 TOKEN="${NTFY_TOKEN:-}"
 
 # Function to log messages
@@ -90,17 +90,13 @@ if [ "$ERROR_DETECTED" = true ]; then
     ) &
 
     # Send ntfy notification (separate process with timeout)
+    MESSAGE="❌ Claude narazil na chybu při používání nástroje"
+    if [ -n "$TOOL_NAME" ]; then
+        MESSAGE="❌ Claude narazil na chybu při používání: $TOOL_NAME"
+    fi
+    log_message "Sending notification: $MESSAGE"
     (
-        MESSAGE="❌ Claude narazil na chybu při používání nástroje"
-        if [ -n "$TOOL_NAME" ]; then
-            MESSAGE="❌ Claude narazil na chybu při používání: $TOOL_NAME"
-        fi
-
-        log_message "Sending notification: $MESSAGE"
-
-        if [ -n "$TOKEN" ] && [ "$TOKEN" != "YOUR_TOKEN_HERE" ]; then
-            curl -s -o /dev/null -H "Authorization: Bearer $TOKEN" -d "$MESSAGE" "$NTFY_URL"
-        else
+        if [ -n "$TOKEN" ] && [ -n "$NTFY_URL" ]; then
             curl -s -o /dev/null -H "Authorization: Bearer $TOKEN" -d "$MESSAGE" "$NTFY_URL"
         fi
     ) &

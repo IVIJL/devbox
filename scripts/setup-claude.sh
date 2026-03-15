@@ -53,4 +53,7 @@ if [ -f "$TARGET/.claude.json" ]; then
         && mv "$TARGET/.claude.json.tmp" "$TARGET/.claude.json"
 fi
 
+# Ensure npm-global/bin exists so zshrc path filter ($^path(N-/)) keeps it in PATH
+mkdir -p /usr/local/share/npm-global/bin
+
 echo "Claude Code config seeded from image defaults"

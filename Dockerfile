@@ -281,6 +281,9 @@ RUN STAMP=$(date +%s) && \
     echo "$STAMP" > /home/node/.local/share/nvim/.nvim-build-stamp && \
     chown node:node /home/node/.local/share/nvim/.nvim-build-stamp
 
+# Ensure npm-global bin is in PATH for all zsh sessions (survives chezmoi dotfiles)
+RUN echo 'export PATH="$PATH:/usr/local/share/npm-global/bin"' >> /etc/zsh/zshenv
+
 # Shared firewall allowlist mount point (bind-mounted :ro from host)
 RUN mkdir -p /etc/devbox-shared
 

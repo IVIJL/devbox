@@ -455,6 +455,62 @@ setup_claude_token() {
     SKIPPED+=("Claude token (run 'devbox claude-token' to set up)")
 }
 
+# --- Zsh completion ----------------------------------------------------------
+
+setup_completions() {
+    local shell_name
+    shell_name="$(basename "${SHELL:-/bin/bash}")"
+    if [ "$shell_name" != "zsh" ]; then
+        SKIPPED+=("zsh completion (shell is $shell_name, not zsh)")
+        return
+    fi
+
+    local src="$DEVBOX_DIR/completions/_devbox"
+    if [ ! -f "$src" ]; then
+        SKIPPED+=("zsh completion (completion file not found in repo)")
+        return
+    fi
+
+    # Priority 1: use an existing writable fpath directory
+    # Ask zsh for its current fpath and try each entry
+    local dest_dir=""
+    local fpath_dirs
+    fpath_dirs=$(zsh -c 'echo $fpath' 2>/dev/null | tr ' ' '\n')
+    while IFS= read -r dir; do
+        if ! { [ -d "$dir" ] && [ -w "$dir" ]; }; then continue; fi
+        # Skip directories inside DEVBOX_DIR itself to avoid self-referencing
+        case "$dir" in "$DEVBOX_DIR"*) continue ;; esac
+        dest_dir="$dir"
+        break
+    done <<< "$fpath_dirs"
+
+    if [ -n "$dest_dir" ]; then
+        cp "$src" "$dest_dir/_devbox"
+        CONFIGURED+=("zsh completion -> $dest_dir/_devbox")
+        return
+    fi
+
+    # Fallback: ~/.zsh/completions + add fpath to .zshrc before compinit
+    dest_dir="$HOME/.zsh/completions"
+    mkdir -p "$dest_dir"
+    cp "$src" "$dest_dir/_devbox"
+
+    local zshrc="$HOME/.zshrc"
+    local marker="# Devbox: zsh completion fpath"
+    if grep -qF "$marker" "$zshrc" 2>/dev/null; then
+        SKIPPED+=("zsh fpath in $zshrc (already configured)")
+    elif grep -q 'compinit' "$zshrc" 2>/dev/null; then
+        # Insert fpath line before the first compinit occurrence
+        sed -i "/compinit/i $marker\nfpath=(~\/.zsh\/completions \$fpath)" "$zshrc"
+        CONFIGURED+=("zsh fpath in $zshrc (added before compinit)")
+    else
+        # shellcheck disable=SC2016  # $fpath is a zsh variable, intentionally unexpanded
+        printf '\n%s\nfpath=(~/.zsh/completions $fpath)\n' "$marker" >> "$zshrc"
+        CONFIGURED+=("zsh fpath in $zshrc")
+    fi
+    CONFIGURED+=("zsh completion -> $dest_dir/_devbox")
+}
+
 # --- Clone / update devbox repo ---------------------------------------------
 
 setup_devbox_repo() {
@@ -650,6 +706,9 @@ main() {
 
     echo ""
     install_command
+
+    echo ""
+    setup_completions
 
     echo ""
     setup_claude_token

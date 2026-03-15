@@ -1,0 +1,80 @@
+#compdef devbox
+
+# Zsh completion for devbox
+# Install: copy to a directory in $fpath (e.g. /usr/local/share/zsh/site-functions/)
+
+_devbox_containers() {
+    local -a containers
+    containers=(${(f)"$(docker ps --filter 'name=^devbox-' \
+        --format '{{.Names}}' 2>/dev/null \
+        | grep -v '^devbox-traefik$' | sed 's/^devbox-//')"})
+    _describe 'running devbox containers' containers
+}
+
+_devbox() {
+    local state
+    _arguments \
+        '1: :->cmd' \
+        '*: :->args'
+
+    case $state in
+        cmd)
+            local -a commands
+            commands=(
+                'ls:List running containers'
+                'stop:Stop container (--clean removes volumes)'
+                'remove:Remove project data (volumes)'
+                'port:Expose port via Traefik'
+                'ports:List active port routes'
+                'build:Build/rebuild the devbox image'
+                'update:Update devbox (pull repo + rebuild image)'
+                'uninstall:Remove everything (containers, volumes, image)'
+                'prune:Remove Docker build cache and dangling images'
+                'claude-token:Generate/regenerate Claude Code token'
+                'allow:List or add allowed firewall domain'
+                'deny:Remove allowed domain (interactive)'
+                'blocked:Show blocked DNS queries, allow interactively'
+                'cursor:Open Cursor attached to running devbox'
+                'code:Open VS Code attached to running devbox'
+                'clip:Grab clipboard image for container use'
+                'ssh-config:Manage devbox SSH config'
+            )
+            _describe 'devbox commands' commands
+            ;;
+        args)
+            case $words[2] in
+                stop)
+                    if (( CURRENT == 3 )); then
+                        _devbox_containers
+                    elif (( CURRENT == 4 )); then
+                        local -a flags
+                        flags=('--clean:Stop and remove project volumes')
+                        _describe 'flags' flags
+                    fi
+                    ;;
+                cursor|code|remove)
+                    _devbox_containers
+                    ;;
+                build)
+                    local -a flags
+                    flags=(
+                        '--clean:Full reset (volumes + cache) + rebuild'
+                        '--no-cache:Full rebuild without cache'
+                        '--progress=plain:Show full build log'
+                    )
+                    _describe 'build flags' flags
+                    ;;
+                ssh-config)
+                    local -a actions
+                    actions=(
+                        'add:Add SSH host to devbox config'
+                        'edit:Edit devbox SSH config'
+                    )
+                    _describe 'ssh-config actions' actions
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_devbox "$@"

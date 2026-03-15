@@ -15,11 +15,12 @@ Usage:
   ./build.sh                       Build image (uses cache)
   ./build.sh --no-cache            Full rebuild without cache
   ./build.sh --progress=plain      Show full build log
-  ./build.sh --clean               Full reset + rebuild
+  ./build.sh --clean               Full reset (volumes + cache) + rebuild
   ./build.sh --uninstall           Full reset without rebuild
 
 All other flags pass through to docker build.
 Set DEVBOX_SUDO_PASSWORD env var for non-interactive builds.
+To reclaim build cache space without rebuilding, use: devbox prune
 EOF
     exit 0
 }

@@ -23,6 +23,7 @@ Usage:
   devbox build [flags]             Build/rebuild the devbox image
   devbox update                    Update devbox (pull repo + rebuild image)
   devbox uninstall                 Remove everything (containers, volumes, image)
+  devbox prune                     Remove Docker build cache and dangling images
   devbox claude-token              Generate/regenerate Claude Code token
   devbox allow [domain]            List or add allowed firewall domain
   devbox deny [domain]             Remove allowed domain (interactive)
@@ -432,6 +433,7 @@ case "${1:-}" in
     build)     MODE="build";     shift ;;
     update)    MODE="update";    shift ;;
     uninstall) MODE="uninstall"; shift ;;
+    prune)     MODE="prune";     shift ;;
     *)         MODE="auto" ;;
 esac
 
@@ -517,6 +519,17 @@ if [ "$MODE" = "update" ]; then
     fi
 
     if [ "${DEVBOX_UPDATE_PULLED:-}" = "1" ]; then
+        # Refresh completion file in any location it was previously installed
+        _completion_src="$DEVBOX_DIR/completions/_devbox"
+        if [ -f "$_completion_src" ]; then
+            for _dir in "/usr/local/share/zsh/site-functions" "$HOME/.zsh/completions"; do
+                if [ -f "$_dir/_devbox" ] && [ -w "$_dir" ]; then
+                    cp "$_completion_src" "$_dir/_devbox"
+                    echo "Updated zsh completion in $_dir"
+                    break
+                fi
+            done
+        fi
         echo "Rebuilding image..."
         exec "$DEVBOX_DIR/build.sh" "$@"
     else
@@ -529,6 +542,15 @@ fi
 
 if [ "$MODE" = "uninstall" ]; then
     exec "$DEVBOX_DIR/build.sh" --uninstall
+fi
+
+# --- devbox prune ------------------------------------------------------------
+
+if [ "$MODE" = "prune" ]; then
+    echo "=== Pruning Docker build cache ==="
+    docker builder prune --all -f
+    docker image prune -f
+    exit 0
 fi
 
 # --- devbox cursor [name] ---------------------------------------------------
@@ -1201,6 +1223,7 @@ DOCKER_ARGS=(
     -v "devbox-${PROJECT_NAME}-claude:/home/node/.claude"
     # Shared volumes
     -v devbox-nvim-data:/home/node/.local/share/nvim
+    -v devbox-npm-global:/usr/local/share/npm-global
     -v devbox-cursor-server:/home/node/.cursor-server
     -v devbox-vscode-server:/home/node/.vscode-server
     -e CLAUDE_CONFIG_DIR=/home/node/.claude

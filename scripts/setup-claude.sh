@@ -34,8 +34,9 @@ if [ -f /home/node/.host-config/claude/CLAUDE.md ]; then
     ln -sf /home/node/.host-config/claude/CLAUDE.md "$TARGET/CLAUDE.md"
 fi
 
-# Copy credentials from host (writable copy so Claude can refresh tokens)
-if [ -f /home/node/.host-config/claude/.credentials.json ]; then
+# Copy credentials from host only when no setup-token is provided.
+# When CLAUDE_CODE_OAUTH_TOKEN is set, Claude uses it directly — no file needed.
+if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -f /home/node/.host-config/claude/.credentials.json ]; then
     cp /home/node/.host-config/claude/.credentials.json "$TARGET/.credentials.json"
 fi
 

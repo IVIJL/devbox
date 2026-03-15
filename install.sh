@@ -433,6 +433,44 @@ SSH_EOF
     fi
 }
 
+# --- Claude Code setup-token ------------------------------------------------
+
+setup_claude_token() {
+    info "Checking Claude Code token..."
+
+    local token_file="$HOME/.config/devbox/claude-token"
+
+    if [ -f "$token_file" ]; then
+        SKIPPED+=("Claude token (already configured)")
+        return
+    fi
+
+    if ! has claude; then
+        SKIPPED+=("Claude token (claude not installed on host)")
+        return
+    fi
+
+    if ! confirm "Generate Claude Code token for containers? (avoids daily re-login)"; then
+        SKIPPED+=("Claude token (skipped)")
+        return
+    fi
+
+    mkdir -p "$HOME/.config/devbox"
+    msg "Running 'claude setup-token'..."
+    msg "Follow the prompts to authenticate."
+
+    local token
+    if token=$(claude setup-token 2>/dev/null); then
+        printf '%s\n' "$token" > "$token_file"
+        chmod 600 "$token_file"
+        CONFIGURED+=("Claude token -> $token_file")
+    else
+        warn "claude setup-token failed. You can run it manually later:"
+        msg "  claude setup-token > $token_file"
+        SKIPPED+=("Claude token (setup failed)")
+    fi
+}
+
 # --- Clone / update devbox repo ---------------------------------------------
 
 setup_devbox_repo() {
@@ -604,8 +642,9 @@ main() {
         msg "  1. Install git and keychain (if missing)"
         msg "  2. Configure SSH agent via keychain"
         msg "  3. Clone devbox to $DEVBOX_DIR"
-        msg "  4. Check Docker availability"
-        msg "  5. Install 'devbox' command to $SYMLINK_PATH"
+        msg "  4. Optionally generate Claude Code token for containers"
+        msg "  5. Check Docker availability"
+        msg "  6. Install 'devbox' command to $SYMLINK_PATH"
         echo ""
         if ! confirm "Continue?"; then
             msg "Aborted."
@@ -627,6 +666,9 @@ main() {
 
     echo ""
     install_command
+
+    echo ""
+    setup_claude_token
 
     echo ""
     check_docker

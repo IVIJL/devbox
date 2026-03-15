@@ -458,6 +458,28 @@ if [ "$MODE" = "update" ]; then
     echo "Updating devbox..."
     pull_output=$(git -C "$DEVBOX_DIR" pull --ff-only origin main 2>&1)
     echo "$pull_output"
+
+    # Offer Claude token setup if not configured yet
+    claude_token_file="$HOME/.config/devbox/claude-token"
+    if [ ! -f "$claude_token_file" ] && command -v claude &>/dev/null; then
+        echo ""
+        printf '\033[1;33m==> Generate Claude Code token for containers? (avoids daily re-login) [y/N] \033[0m'
+        read -r answer
+        if [[ "$answer" =~ ^[Yy]$ ]]; then
+            mkdir -p "$HOME/.config/devbox"
+            echo "Running 'claude setup-token'..."
+            echo "Follow the prompts to authenticate."
+            if token=$(claude setup-token 2>/dev/null); then
+                printf '%s\n' "$token" > "$claude_token_file"
+                chmod 600 "$claude_token_file"
+                echo "Claude token saved to $claude_token_file"
+            else
+                echo "claude setup-token failed. You can run it manually later:"
+                echo "  claude setup-token > $claude_token_file"
+            fi
+        fi
+    fi
+
     if echo "$pull_output" | grep -q "Already up to date"; then
         echo "No changes, skipping rebuild."
     else
@@ -1185,6 +1207,15 @@ fi
 # Pass through API key
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     DOCKER_ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+fi
+
+# Read Claude setup-token from config file and pass to container
+CLAUDE_TOKEN_FILE="$HOME/.config/devbox/claude-token"
+if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -f "$CLAUDE_TOKEN_FILE" ]; then
+    CLAUDE_CODE_OAUTH_TOKEN="$(cat "$CLAUDE_TOKEN_FILE")"
+fi
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    DOCKER_ARGS+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
 fi
 
 # Pass through extra domains

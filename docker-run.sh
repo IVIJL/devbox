@@ -519,16 +519,21 @@ if [ "$MODE" = "update" ]; then
     fi
 
     if [ "${DEVBOX_UPDATE_PULLED:-}" = "1" ]; then
-        # Refresh completion file in any location it was previously installed
+        # Install or refresh zsh completion file
         _completion_src="$DEVBOX_DIR/completions/_devbox"
-        if [ -f "$_completion_src" ]; then
+        if [ -f "$_completion_src" ] && [ "$(basename "${SHELL:-}")" = "zsh" ]; then
+            _completion_installed=false
             for _dir in "/usr/local/share/zsh/site-functions" "$HOME/.zsh/completions"; do
-                if [ -f "$_dir/_devbox" ] && [ -w "$_dir" ]; then
+                if [ -d "$_dir" ] && [ -w "$_dir" ]; then
                     cp "$_completion_src" "$_dir/_devbox"
-                    echo "Updated zsh completion in $_dir"
+                    echo "Installed zsh completion in $_dir"
+                    _completion_installed=true
                     break
                 fi
             done
+            if [ "$_completion_installed" = false ]; then
+                echo "Note: could not install zsh completion automatically. Run install.sh to set it up."
+            fi
         fi
         echo "Rebuilding image..."
         exec "$DEVBOX_DIR/build.sh" "$@"

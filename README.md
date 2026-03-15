@@ -108,18 +108,43 @@ Run `devbox --help` for the full list. Summary:
 | `devbox code [name]` | Open VS Code attached to running devbox |
 | `devbox clip` | Grab clipboard image for container use |
 | `devbox ssh-config [add\|edit]` | Manage devbox-specific SSH config |
+| `devbox claude-token` | Generate/regenerate Claude Code OAuth token |
+| `devbox update` | Pull latest devbox repo and rebuild image |
+| `devbox prune` | Remove Docker build cache and dangling images (reclaim disk space) |
+| `devbox uninstall` | Remove all containers, volumes, and image |
 
 ## Build
 
 ```bash
-./build.sh                       # Build image (uses cache)
-./build.sh --no-cache            # Full rebuild without cache
-./build.sh --progress=plain      # Show full build log
-./build.sh --clean               # Full reset + rebuild
-./build.sh --uninstall           # Full reset without rebuild
+devbox build                     # Build image (uses cache)
+devbox build --no-cache          # Full rebuild without cache
+devbox build --progress=plain    # Show full build log
+devbox build --clean             # Full reset (volumes + cache) + rebuild
+devbox prune                     # Remove build cache only — no volumes, no rebuild
+devbox update                    # Pull latest repo + rebuild image
 ```
 
+`devbox build --clean` stops all containers, removes all devbox volumes, clears build cache, and rebuilds. Use `devbox prune` to reclaim build cache space (typically 10–20 GB after many builds) without touching volumes or triggering a rebuild.
+
 All other flags pass through to `docker build`. Set `DEVBOX_SUDO_PASSWORD` env var for non-interactive builds. Run `./build.sh --help` for details.
+
+## Zsh Completion
+
+Tab completion is included for all `devbox` commands. It is installed automatically by `install.sh` and updated on `devbox update`.
+
+- `devbox <TAB>` — shows all commands with descriptions
+- `devbox stop <TAB>` — shows running container names
+- `devbox build <TAB>` — shows `--clean`, `--no-cache`, `--progress=plain`
+- `devbox ssh-config <TAB>` — shows `add`, `edit`
+
+**Manual install** (if you skipped `install.sh`):
+
+```bash
+# Copy to a writable directory already in your $fpath, e.g.:
+sudo cp completions/_devbox /usr/local/share/zsh/site-functions/
+# Then reload:
+exec zsh
+```
 
 ## Firewall
 
@@ -167,6 +192,7 @@ Multiple devbox containers can run simultaneously for different projects. Each g
 
 Shared across all containers:
 - Neovim data volume (`devbox-nvim-data`)
+- Global npm packages volume (`devbox-npm-global`) — `npm install -g` persists across restarts
 - Cursor server volume (`devbox-cursor-server`)
 - VS Code server volume (`devbox-vscode-server`)
 - Firewall allowlist (`~/.config/devbox/allowed-domains.conf`)
@@ -187,7 +213,8 @@ devbox ls                        # List all running containers
 | `ANTHROPIC_API_KEY` | API key for Claude Code |
 | `DEVBOX_SUDO_PASSWORD` | Sudo password for non-interactive builds (default: `devbox`) |
 | `CHEZMOI_REPO` | Chezmoi dotfiles repo (default in docker-run.sh: `github.com/IVIJL/vlci-dotfiles`; empty = skip) |
-| `NTFY_TOKEN` | ntfy.sh notification token (auto-detected from Claude hooks) |
+| `NTFY_TOKEN` | ntfy.sh notification token (auto-detected from `~/.claude/hooks/*.sh` on host) |
+| `NTFY_URL` | ntfy.sh topic URL for Claude hook notifications (auto-detected from `~/.claude/hooks/*.sh` on host) |
 | `TZ` | Timezone (default: `Europe/Prague`) |
 
 ## Docker-in-Docker (Rootless)
@@ -466,6 +493,8 @@ devbox/
 ├── install.sh                      # Automated installer
 ├── init-firewall.sh                # Default-deny firewall (iptables/ipset/dnsmasq)
 ├── extra-domains.conf              # Build-time extra allowed domains
+├── completions/
+│   └── _devbox                     # Zsh completion script
 ├── config/
 │   ├── claude/                     # Claude Code config
 │   ├── nvim/                       # Neovim config

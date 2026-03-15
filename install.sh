@@ -471,17 +471,19 @@ setup_completions() {
         return
     fi
 
-    # Priority 1: use an existing writable fpath directory
-    # Ask zsh for its current fpath and try each entry
-    local dest_dir=""
+    # Ask zsh for its current fpath entries
     local fpath_dirs
     fpath_dirs=$(zsh -c 'echo $fpath' 2>/dev/null | tr ' ' '\n')
+
+    # Priority 1: writable fpath dir — no sudo, no .zshrc changes
+    local dest_dir=""
     while IFS= read -r dir; do
-        if ! { [ -d "$dir" ] && [ -w "$dir" ]; }; then continue; fi
-        # Skip directories inside DEVBOX_DIR itself to avoid self-referencing
-        case "$dir" in "$DEVBOX_DIR"*) continue ;; esac
-        dest_dir="$dir"
-        break
+        [ -d "$dir" ] || continue
+        case "$dir" in "$DEVBOX_DIR"*) continue ;; esac  # skip self
+        if [ -w "$dir" ]; then
+            dest_dir="$dir"
+            break
+        fi
     done <<< "$fpath_dirs"
 
     if [ -n "$dest_dir" ]; then
@@ -490,7 +492,17 @@ setup_completions() {
         return
     fi
 
-    # Fallback: ~/.zsh/completions + add fpath to .zshrc before compinit
+    # Priority 2: fpath dir via sudo — no .zshrc changes
+    while IFS= read -r dir; do
+        [ -d "$dir" ] || continue
+        case "$dir" in "$DEVBOX_DIR"*) continue ;; esac
+        if sudo cp "$src" "$dir/_devbox" 2>/dev/null; then
+            CONFIGURED+=("zsh completion -> $dir/_devbox (via sudo)")
+            return
+        fi
+    done <<< "$fpath_dirs"
+
+    # Priority 3: fallback ~/.zsh/completions — only touches .zshrc when no fpath exists
     dest_dir="$HOME/.zsh/completions"
     mkdir -p "$dest_dir"
     cp "$src" "$dest_dir/_devbox"

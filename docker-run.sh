@@ -519,18 +519,37 @@ if [ "$MODE" = "update" ]; then
     fi
 
     if [ "${DEVBOX_UPDATE_PULLED:-}" = "1" ]; then
-        # Install or refresh zsh completion file
+        # Install or refresh zsh completion file (no .zshrc modifications here)
         _completion_src="$DEVBOX_DIR/completions/_devbox"
         if [ -f "$_completion_src" ] && [ "$(basename "${SHELL:-}")" = "zsh" ]; then
-            _completion_dir=""
-            if [ -d "/usr/local/share/zsh/site-functions" ] && [ -w "/usr/local/share/zsh/site-functions" ]; then
-                _completion_dir="/usr/local/share/zsh/site-functions"
-            else
-                mkdir -p "$HOME/.zsh/completions"
-                _completion_dir="$HOME/.zsh/completions"
+            _completion_installed=false
+            _fpath_dirs=$(zsh -c 'echo $fpath' 2>/dev/null | tr ' ' '\n')
+            # Priority 1: writable fpath dir (no sudo)
+            while IFS= read -r _dir; do
+                [ -d "$_dir" ] || continue
+                case "$_dir" in "$DEVBOX_DIR"*) continue ;; esac
+                if [ -w "$_dir" ]; then
+                    cp "$_completion_src" "$_dir/_devbox"
+                    echo "Installed zsh completion in $_dir"
+                    _completion_installed=true
+                    break
+                fi
+            done <<< "$_fpath_dirs"
+            # Priority 2: fpath dir via sudo -n (non-interactive, uses cached credentials)
+            if [ "$_completion_installed" = false ]; then
+                while IFS= read -r _dir; do
+                    [ -d "$_dir" ] || continue
+                    case "$_dir" in "$DEVBOX_DIR"*) continue ;; esac
+                    if sudo -n cp "$_completion_src" "$_dir/_devbox" 2>/dev/null; then
+                        echo "Installed zsh completion in $_dir (via sudo)"
+                        _completion_installed=true
+                        break
+                    fi
+                done <<< "$_fpath_dirs"
             fi
-            cp "$_completion_src" "$_completion_dir/_devbox"
-            echo "Installed zsh completion in $_completion_dir"
+            if [ "$_completion_installed" = false ]; then
+                echo "Note: zsh completion not updated. Run install.sh to (re)install it."
+            fi
         fi
         echo "Rebuilding image..."
         exec "$DEVBOX_DIR/build.sh" "$@"

@@ -96,10 +96,6 @@ RUN mkdir -p /home/node/.ssh && chmod 700 /home/node/.ssh && \
     chmod 600 /home/node/.ssh/known_hosts && \
     chown -R node:node /home/node/.ssh
 
-# Claude Code config defaults (template — seeded into volume at startup)
-COPY --chown=node:node config/claude/ /etc/claude-defaults/
-RUN chmod +x /etc/claude-defaults/hooks/*.sh /etc/claude-defaults/statusline-info.sh
-
 ENV DEVCONTAINER=true
 ENV SHELL=/bin/zsh
 ENV TERM=xterm-256color
@@ -286,6 +282,10 @@ RUN echo 'export PATH="$PATH:/usr/local/share/npm-global/bin"' >> /etc/zsh/zshen
 
 # Shared firewall allowlist mount point (bind-mounted :ro from host)
 RUN mkdir -p /etc/devbox-shared
+
+# Claude Code config defaults (template — seeded into volume at startup)
+COPY --chown=node:node config/claude/ /etc/claude-defaults/
+RUN chmod +x /etc/claude-defaults/hooks/*.sh /etc/claude-defaults/statusline-info.sh
 
 COPY init-firewall.sh /usr/local/bin/
 COPY extra-domains.conf /usr/local/etc/devbox-extra-domains.conf

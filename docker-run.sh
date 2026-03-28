@@ -461,7 +461,7 @@ if [ "$MODE" = "sync-skills" ]; then
         echo "No skills found at ~/.claude/skills/"
         exit 0
     fi
-    skill_count=$(find "$HOME/.claude/skills" -maxdepth 1 -name '*.md' | wc -l)
+    skill_count=$(find "$HOME/.claude/skills" -maxdepth 2 -name 'SKILL.md' | wc -l)
     containers=$(docker ps --filter "name=^devbox-" --filter "status=running" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
     if [ -z "$containers" ]; then
         echo "No running devbox containers found"

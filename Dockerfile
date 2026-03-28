@@ -6,7 +6,10 @@ ENV TZ="$TZ"
 # =============================================================================
 # Layer 1: APT packages (Claude Code base + user tools)
 # =============================================================================
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    apt-get update && apt-get install -y --no-install-recommends \
     # Claude Code packages
     less git procps sudo zsh man-db unzip gnupg2 gh \
     iptables ipset iproute2 dnsutils aggregate jq nano vim dnsmasq iputils-ping \
@@ -18,7 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     grc curl wget ca-certificates shellcheck rsync \
     && echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/backports.list \
     && apt-get update && apt-get install -y --no-install-recommends -t bookworm-backports tmux \
-    && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && ln -s "$(which fdfind)" /usr/local/bin/fd
 
 # =============================================================================
@@ -53,7 +55,9 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # =============================================================================
 # Layer 3: Docker CE (rootless)
 # =============================================================================
-RUN install -m 0755 -d /etc/apt/keyrings && \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    install -m 0755 -d /etc/apt/keyrings && \
     curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && \
     chmod a+r /etc/apt/keyrings/docker.asc && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
@@ -61,8 +65,7 @@ RUN install -m 0755 -d /etc/apt/keyrings && \
     apt-get update && apt-get install -y --no-install-recommends \
     docker-ce docker-ce-cli containerd.io \
     docker-buildx-plugin docker-compose-plugin \
-    docker-ce-rootless-extras && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    docker-ce-rootless-extras
 
 # Rootless Docker: subordinate UID/GID mapping
 RUN echo "node:100000:65536" >> /etc/subuid && \
@@ -128,9 +131,10 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 # tree-sitter-cli from source (pre-built binary AND Mason's binary both need GLIBC 2.39, Bookworm has 2.36)
-# Clean cargo build cache afterwards to reduce image size
-RUN . "$HOME/.cargo/env" && cargo install tree-sitter-cli && \
-    rm -rf "$HOME/.cargo/registry" "$HOME/.cargo/git"
+RUN --mount=type=cache,target=/home/node/.cargo/registry,uid=1000 \
+    --mount=type=cache,target=/home/node/.cargo/git,uid=1000 \
+    --mount=type=cache,target=/tmp/cargo-target,uid=1000 \
+    . "$HOME/.cargo/env" && CARGO_TARGET_DIR=/tmp/cargo-target cargo install tree-sitter-cli
 
 # Starship prompt
 RUN mkdir -p /home/node/.local/bin && \

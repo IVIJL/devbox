@@ -31,6 +31,7 @@ Usage:
   devbox cursor [name]             Open Cursor attached to running devbox
   devbox code [name]               Open VS Code attached to running devbox
   devbox clip                      Grab clipboard image for container use
+  devbox sync-skills               Sync host skills to all running containers
   devbox ssh-config [add|edit]     Manage devbox SSH config
 
 Build flags:
@@ -434,6 +435,7 @@ case "${1:-}" in
     update)    MODE="update";    shift ;;
     uninstall) MODE="uninstall"; shift ;;
     prune)     MODE="prune";     shift ;;
+    sync-skills) MODE="sync-skills"; shift ;;
     *)         MODE="auto" ;;
 esac
 
@@ -450,6 +452,27 @@ fi
 
 if [ "$MODE" = "clip" ]; then
     exec "$DEVBOX_DIR/scripts/clip-image.sh"
+fi
+
+# --- devbox sync-skills -- sync host skills to all running containers --------
+
+if [ "$MODE" = "sync-skills" ]; then
+    if [ ! -d "$HOME/.claude/skills" ]; then
+        echo "No skills found at ~/.claude/skills/"
+        exit 0
+    fi
+    skill_count=$(find "$HOME/.claude/skills" -maxdepth 1 -name '*.md' | wc -l)
+    containers=$(docker ps --filter "name=^devbox-" --filter "status=running" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
+    if [ -z "$containers" ]; then
+        echo "No running devbox containers found"
+        exit 0
+    fi
+    for c in $containers; do
+        docker exec "$c" bash -c 'mkdir -p /home/node/.claude/skills && rsync -a /home/node/.host-config/claude/skills/ /home/node/.claude/skills/'
+        echo "  synced $c"
+    done
+    echo "Synced $skill_count skill(s) to $(echo "$containers" | wc -l) container(s)"
+    exit 0
 fi
 
 if [ "$MODE" = "build" ]; then

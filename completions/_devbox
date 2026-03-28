@@ -39,6 +39,7 @@ _devbox() {
                 'code:Open VS Code attached to running devbox'
                 'clip:Grab clipboard image for container use'
                 'ssh-config:Manage devbox SSH config'
+                'sync-skills:Sync host skills to all running containers'
             )
             _describe 'devbox commands' commands
             ;;

@@ -29,6 +29,13 @@ cp "$DEFAULTS/statusline-info.sh" "$TARGET/statusline-info.sh"
 mkdir -p "$TARGET/hooks"
 cp "$DEFAULTS/hooks/"*.sh "$TARGET/hooks/"
 
+# Sync skills from host bind mount (additive — never removes container-only skills)
+if [ -d /home/node/.host-config/claude/skills ]; then
+    mkdir -p "$TARGET/skills"
+    rsync -a /home/node/.host-config/claude/skills/ "$TARGET/skills/"
+    echo "Skills synced from host"
+fi
+
 # Symlink user-level CLAUDE.md from host bind mount (live, directory mount)
 if [ -f /home/node/.host-config/claude/CLAUDE.md ]; then
     ln -sf /home/node/.host-config/claude/CLAUDE.md "$TARGET/CLAUDE.md"

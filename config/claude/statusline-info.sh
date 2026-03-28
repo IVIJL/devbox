@@ -4,7 +4,6 @@
 input=$(cat)
 
 # Extract data from JSON
-session_id=$(echo "$input" | jq -r '.session_id // ""')
 model_name=$(echo "$input" | jq -r '.model.display_name // "Claude"')
 current_dir=$(echo "$input" | jq -r '.workspace.current_dir // "~"')
 project_dir=$(echo "$input" | jq -r '.workspace.project_dir // ""')
@@ -16,41 +15,65 @@ else
     folder_name=$(basename "$current_dir")
 fi
 
-# Calculate session duration
-session_start_file="/tmp/claude_session_${session_id}_start"
-current_time=$(date +%s)
-
-if [ ! -f "$session_start_file" ]; then
-    echo "$current_time" > "$session_start_file"
-    session_duration="0m"
-else
-    start_time=$(cat "$session_start_file")
-    duration_seconds=$((current_time - start_time))
-
-    if [ $duration_seconds -lt 60 ]; then
-        session_duration="${duration_seconds}s"
-    elif [ $duration_seconds -lt 3600 ]; then
-        minutes=$((duration_seconds / 60))
-        session_duration="${minutes}m"
-    else
-        hours=$((duration_seconds / 3600))
-        minutes=$(((duration_seconds % 3600) / 60))
-        session_duration="${hours}h${minutes}m"
-    fi
-fi
-
-# Get git branch (suppress error messages)
+# Git branch (suppress error messages)
 git_branch=""
-if [ -d "$current_dir/.git" ] || git -C "$current_dir" rev-parse --git-dir >/dev/null 2>&1; then
+if git -C "$current_dir" rev-parse --git-dir >/dev/null 2>&1; then
     git_branch=$(git -C "$current_dir" branch --show-current 2>/dev/null || echo "")
     if [ -n "$git_branch" ]; then
-        git_branch=" [git:$git_branch]"
+        git_branch=" [${git_branch}]"
     fi
 fi
 
-# Format the status line with colors
-printf "\033[36m%s\033[0m \033[33m%s\033[0m\033[32m%s\033[0m \033[35m⏱ %s\033[0m" \
-    "$model_name" \
-    "$folder_name" \
-    "$git_branch" \
-    "$session_duration"
+# Context window usage
+pct=$(echo "$input" | jq -r '.context_window.used_percentage // 0' | cut -d. -f1)
+ctx_size=$(echo "$input" | jq -r '.context_window.context_window_size // 200000')
+
+# Context size label
+if [ "$ctx_size" -ge 900000 ] 2>/dev/null; then
+    ctx_label="1M"
+elif [ "$ctx_size" -ge 180000 ] 2>/dev/null; then
+    ctx_label="200K"
+else
+    ctx_label="$((ctx_size / 1000))K"
+fi
+
+# Color based on usage: green <50%, yellow 50-80%, red >80%
+if [ "$pct" -ge 80 ] 2>/dev/null; then
+    bar_color='\033[31m'
+elif [ "$pct" -ge 50 ] 2>/dev/null; then
+    bar_color='\033[33m'
+else
+    bar_color='\033[32m'
+fi
+
+# Progress bar (10 chars)
+filled=$((pct / 10))
+empty=$((10 - filled))
+bar=""
+if [ "$filled" -gt 0 ]; then
+    printf -v fill_str "%${filled}s"
+    bar="${fill_str// /█}"
+fi
+if [ "$empty" -gt 0 ]; then
+    printf -v empty_str "%${empty}s"
+    bar="${bar}${empty_str// /░}"
+fi
+
+# Session duration from cost.total_duration_ms
+duration_ms=$(echo "$input" | jq -r '.cost.total_duration_ms // 0')
+duration_sec=$((duration_ms / 1000))
+if [ "$duration_sec" -lt 60 ]; then
+    duration="${duration_sec}s"
+elif [ "$duration_sec" -lt 3600 ]; then
+    duration="$((duration_sec / 60))m"
+else
+    duration="$((duration_sec / 3600))h$(((duration_sec % 3600) / 60))m"
+fi
+
+# Line 1: model, project, git branch
+printf "\033[36m%s\033[0m \033[33m%s\033[0m\033[32m%s\033[0m\n" \
+    "$model_name" "$folder_name" "$git_branch"
+
+# Line 2: context bar, percentage, ctx size, duration
+printf "%b%s\033[0m %d%% [%s] \033[35m⏱ %s\033[0m" \
+    "$bar_color" "$bar" "$pct" "$ctx_label" "$duration"

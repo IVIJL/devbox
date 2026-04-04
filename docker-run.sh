@@ -610,8 +610,21 @@ if [ "$MODE" = "prune" ]; then
         echo "=== Pruning ALL Docker build cache ==="
         docker builder prune --all -f
     else
-        echo "=== Pruning old Docker build cache (keeping latest) ==="
-        docker buildx prune --reserved-space 8gb -f
+        # Calculate reserve from image size + 2GB margin
+        IMAGE="vlcak/devbox:latest"
+        RESERVE="10gb"
+        if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+            SIZE_STR=$(docker images "$IMAGE" --format '{{.Size}}')
+            SIZE_NUM=$(echo "$SIZE_STR" | grep -oP '^[\d.]+')
+            SIZE_UNIT=$(echo "$SIZE_STR" | grep -oP '[A-Z]+$')
+            if [ "$SIZE_UNIT" = "GB" ]; then
+                RESERVE="$(echo "$SIZE_NUM + 2" | bc | awk '{printf "%d\n", $1 + ($1 != int($1))}')gb"
+            elif [ "$SIZE_UNIT" = "MB" ]; then
+                RESERVE="$(echo "$SIZE_NUM / 1024 + 2" | bc | awk '{printf "%d\n", $1 + ($1 != int($1))}')gb"
+            fi
+        fi
+        echo "=== Pruning old Docker build cache (reserving $RESERVE) ==="
+        docker buildx prune --reserved-space "$RESERVE" -f
     fi
     docker image prune -f
     exit 0

@@ -74,6 +74,37 @@ fi
 printf "\033[36m%s\033[0m \033[33m%s\033[0m\033[32m%s\033[0m\n" \
     "$model_name" "$folder_name" "$git_branch"
 
-# Line 2: context bar, percentage, ctx size, duration
-printf "%b%s\033[0m %d%% [%s] \033[35m⏱ %s\033[0m" \
-    "$bar_color" "$bar" "$pct" "$ctx_label" "$duration"
+# 5-hour rate limit window
+five_h_pct=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty' | cut -d. -f1)
+five_h_info=""
+if [ -n "$five_h_pct" ]; then
+    remaining=$((100 - five_h_pct))
+    if [ "$five_h_pct" -ge 80 ] 2>/dev/null; then
+        five_h_color='\033[31m'
+    elif [ "$five_h_pct" -ge 50 ] 2>/dev/null; then
+        five_h_color='\033[33m'
+    else
+        five_h_color='\033[32m'
+    fi
+    # Time until 5h window resets
+    resets_at=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
+    reset_label=""
+    if [ -n "$resets_at" ]; then
+        now=$(date +%s)
+        left=$((resets_at - now))
+        if [ "$left" -gt 0 ]; then
+            left_h=$((left / 3600))
+            left_m=$(((left % 3600) / 60))
+            if [ "$left_h" -gt 0 ]; then
+                reset_label=" ${left_h}h${left_m}m"
+            else
+                reset_label=" ${left_m}m"
+            fi
+        fi
+    fi
+    five_h_info=$(printf " %b5h:%d%%free%s\033[0m" "$five_h_color" "$remaining" "$reset_label")
+fi
+
+# Line 2: context bar, percentage, ctx size, duration, 5h window
+printf "%b%s\033[0m %d%% [%s] \033[35m⏱ %s\033[0m%s" \
+    "$bar_color" "$bar" "$pct" "$ctx_label" "$duration" "$five_h_info"

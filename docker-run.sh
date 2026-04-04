@@ -23,7 +23,7 @@ Usage:
   devbox build [flags]             Build/rebuild the devbox image
   devbox update                    Update devbox (pull repo + rebuild image)
   devbox uninstall                 Remove everything (containers, volumes, image)
-  devbox prune [--all]             Remove unused build cache (--all = everything)
+  devbox prune [--all]             Remove old build cache (--all = everything)
   devbox claude-token              Generate/regenerate Claude Code token
   devbox allow [domain]            List or add allowed firewall domain
   devbox deny [domain]             Remove allowed domain (interactive)
@@ -610,8 +610,8 @@ if [ "$MODE" = "prune" ]; then
         echo "=== Pruning ALL Docker build cache ==="
         docker builder prune --all -f
     else
-        echo "=== Pruning unused Docker build cache ==="
-        docker builder prune -f
+        echo "=== Pruning old Docker build cache (keeping latest) ==="
+        docker buildx prune --reserved-space 8gb -f
     fi
     docker image prune -f
     exit 0

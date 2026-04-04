@@ -127,6 +127,9 @@ RUN git clone --depth 1 https://github.com/junegunn/fzf.git /home/node/.fzf && \
 # Claude Code (native binary installer)
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
+# Codex CLI (OpenAI)
+RUN npm install -g @openai/codex
+
 # Rust + Cargo
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 

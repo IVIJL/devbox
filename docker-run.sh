@@ -154,6 +154,7 @@ docker.io
 docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com
 # OpenAI / Codex
 *.openai.com
+*.chatgpt.com
 # Custom
 gaiagroup.cz
 DOMAINS
@@ -182,9 +183,10 @@ DOMAINS
         done
     fi
 
-    # Migration: add OpenAI domains for Codex if missing
+    # Migration: add OpenAI/ChatGPT domains for Codex if missing
     if [ -f "$domains_file" ]; then
         grep -qF "*.openai.com" "$domains_file" 2>/dev/null || echo "*.openai.com" >> "$domains_file"
+        grep -qF "*.chatgpt.com" "$domains_file" 2>/dev/null || echo "*.chatgpt.com" >> "$domains_file"
     fi
 }
 

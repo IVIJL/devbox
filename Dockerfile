@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     # User packages
     ncdu mc nala libfuse2 xauth xclip ripgrep fd-find \
     build-essential libclang-dev \
-    grc curl wget ca-certificates shellcheck rsync bubblewrap \
+    grc curl wget ca-certificates shellcheck rsync \
     && echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/backports.list \
     && apt-get update && apt-get install -y --no-install-recommends -t bookworm-backports tmux \
     && ln -s "$(which fdfind)" /usr/local/bin/fd
@@ -123,13 +123,6 @@ ENV PATH=$PATH:/usr/local/share/npm-global/bin
 # fzf keybindings + completion (CTRL-R, CTRL-T, **(TAB))
 RUN git clone --depth 1 https://github.com/junegunn/fzf.git /home/node/.fzf && \
     /home/node/.fzf/install --all
-
-# Claude Code (native binary installer)
-RUN curl -fsSL https://claude.ai/install.sh | bash
-
-# Codex CLI (OpenAI) — separate prefix to avoid npm-global volume overlay
-RUN npm install -g --prefix /home/node/.codex-cli @openai/codex
-ENV PATH=/home/node/.codex-cli/bin:$PATH
 
 # Rust + Cargo
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -272,6 +265,22 @@ RUN /home/node/.local/bin/uv tool install python-lsp-server \
 
 # Ruff linter/formatter
 RUN /home/node/.local/bin/uv tool install ruff
+
+# --- Below this line: frequently changed, fast rebuilds ---
+
+# Extra APT packages (add new packages here to avoid invalidating heavy builds above)
+USER root
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends bubblewrap
+USER node
+
+# Claude Code (native binary installer)
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Codex CLI (OpenAI) — separate prefix to avoid npm-global volume overlay
+RUN npm install -g --prefix /home/node/.codex-cli @openai/codex
+ENV PATH=/home/node/.codex-cli/bin:$PATH
 
 # =============================================================================
 # Layer 6: Firewall + scripts (root)

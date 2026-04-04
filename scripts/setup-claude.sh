@@ -50,6 +50,16 @@ if [ -d "$HOST" ]; then
         rsync -a "$HOST/skills/" "$TARGET/skills/"
         echo "Skills synced from host"
     fi
+
+    # Sync plugins from host (marketplace repos, cache, config)
+    if [ -d "$HOST/plugins" ]; then
+        rsync -a "$HOST/plugins/" "$TARGET/plugins/"
+        # Fix host-specific absolute paths in plugin registry
+        if [ -f "$TARGET/plugins/installed_plugins.json" ] && [ -n "${HOST_HOME:-}" ]; then
+            sed -i "s|${HOST_HOME}/.claude|/home/node/.claude|g" "$TARGET/plugins/installed_plugins.json"
+        fi
+        echo "Plugins synced from host"
+    fi
 fi
 
 # Pre-trust /workspace/<project> so the safety prompt doesn't appear on every startup
@@ -62,5 +72,11 @@ fi
 
 # Ensure npm-global/bin exists so zshrc path filter ($^path(N-/)) keeps it in PATH
 mkdir -p /usr/local/share/npm-global/bin
+
+# Install Codex CLI if not present (persists in npm-global volume)
+if ! command -v codex &>/dev/null; then
+    echo "Installing Codex CLI..."
+    npm install -g @openai/codex
+fi
 
 echo "Claude Code config seeded from image defaults"

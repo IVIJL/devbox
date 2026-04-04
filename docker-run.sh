@@ -152,6 +152,8 @@ auth.docker.io
 production.cloudflare.docker.com
 docker.io
 docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com
+# OpenAI / Codex
+*.openai.com
 # Custom
 gaiagroup.cz
 DOMAINS
@@ -178,6 +180,11 @@ DOMAINS
         for d in "*.vscode-cdn.net" "*.vsassets.io"; do
             grep -qF "$d" "$domains_file" 2>/dev/null || echo "$d" >> "$domains_file"
         done
+    fi
+
+    # Migration: add OpenAI domains for Codex if missing
+    if [ -f "$domains_file" ]; then
+        grep -qF "*.openai.com" "$domains_file" 2>/dev/null || echo "*.openai.com" >> "$domains_file"
     fi
 }
 
@@ -1289,6 +1296,10 @@ GIT_GLOBAL_IGNORE="$HOME/.config/git/ignore"
 # Host ~/.claude directory (RW bind mount; credentials symlinked from shared volume)
 mkdir -p "$HOME/.claude"
 DOCKER_ARGS+=(-v "$HOME/.claude:/home/node/.claude-host")
+
+# Host ~/.codex directory (RW; Codex CLI auth + config shared with host)
+mkdir -p "$HOME/.codex"
+DOCKER_ARGS+=(-v "$HOME/.codex:/home/node/.codex")
 
 # Host ~/.claude.json (onboarding state, account info)
 [ -f "$HOME/.claude.json" ] && DOCKER_ARGS+=(-v "$HOME/.claude.json:/home/node/.claude-host/.claude.json:ro")

@@ -1318,12 +1318,13 @@ if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     DOCKER_ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
 fi
 
-# Read Claude setup-token from config file and pass to container
+# Read Claude setup-token from config file (fallback when host has no OAuth credentials)
 CLAUDE_TOKEN_FILE="$HOME/.config/devbox/claude-token"
 if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -f "$CLAUDE_TOKEN_FILE" ]; then
     CLAUDE_CODE_OAUTH_TOKEN="$(cat "$CLAUDE_TOKEN_FILE")"
 fi
-if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+# Only pass token when host credentials are not available — symlinked OAuth takes precedence
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ ! -f "$HOME/.claude/.credentials.json" ]; then
     DOCKER_ARGS+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
 fi
 

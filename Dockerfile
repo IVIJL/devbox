@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     # User packages
     ncdu mc nala libfuse2 xauth xclip ripgrep fd-find \
     build-essential libclang-dev \
-    grc curl wget ca-certificates shellcheck rsync \
+    grc curl wget ca-certificates shellcheck rsync bubblewrap \
     && echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/backports.list \
     && apt-get update && apt-get install -y --no-install-recommends -t bookworm-backports tmux \
     && ln -s "$(which fdfind)" /usr/local/bin/fd

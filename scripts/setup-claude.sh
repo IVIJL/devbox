@@ -54,9 +54,13 @@ if [ -d "$HOST" ]; then
     # Sync plugins from host (marketplace repos, cache, config)
     if [ -d "$HOST/plugins" ]; then
         rsync -a "$HOST/plugins/" "$TARGET/plugins/"
-        # Fix host-specific absolute paths in plugin registry
-        if [ -f "$TARGET/plugins/installed_plugins.json" ] && [ -n "${HOST_HOME:-}" ]; then
-            sed -i "s|${HOST_HOME}/.claude|/home/node/.claude|g" "$TARGET/plugins/installed_plugins.json"
+        # Fix host-specific absolute paths in plugin registries
+        if [ -n "${HOST_HOME:-}" ]; then
+            for pfile in installed_plugins.json known_marketplaces.json; do
+                if [ -f "$TARGET/plugins/$pfile" ]; then
+                    sed -i "s|${HOST_HOME}/.claude|/home/node/.claude|g" "$TARGET/plugins/$pfile"
+                fi
+            done
         fi
         echo "Plugins synced from host"
     fi

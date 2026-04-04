@@ -41,7 +41,7 @@ Build flags:
   devbox build --progress=plain    Show full build log
 
 Examples:
-  devbox                           Mount CWD as /workspace
+  devbox                           Mount CWD as /workspace/<project>
   devbox ~/projects/app            Mount specific project
   devbox --ssh-config ~/app        Mount with full host SSH config
   devbox ssh-config add            Add SSH host to devbox config
@@ -269,7 +269,11 @@ attach_to_container() {
     local name="$1"
     echo "Attaching to running container: $name"
     set_tab_title "${name#devbox-}"
-    exec docker exec -it -w /workspace "$name" zsh
+    local ws="/workspace/${name#devbox-}"
+    if ! docker exec "$name" test -d "$ws" 2>/dev/null; then
+        ws="/workspace"
+    fi
+    exec docker exec -it -w "$ws" "$name" zsh
 }
 
 # Restart an exited devbox container and re-run init scripts
@@ -468,7 +472,7 @@ if [ "$MODE" = "sync-skills" ]; then
         exit 0
     fi
     for c in $containers; do
-        docker exec "$c" bash -c 'mkdir -p /home/node/.claude/skills && rsync -a /home/node/.host-config/claude/skills/ /home/node/.claude/skills/'
+        docker exec "$c" bash -c 'mkdir -p /home/node/.claude/skills && rsync -a /home/node/.claude-host/skills/ /home/node/.claude/skills/'
         echo "  synced $c"
     done
     echo "Synced $skill_count skill(s) to $(echo "$containers" | wc -l) container(s)"
@@ -630,7 +634,7 @@ if [ "$MODE" = "cursor" ]; then
     else
         HEX=$(printf '%s' "$ATTACH_JSON" | od -A n -t x1 | tr -d ' \n')
     fi
-    FOLDER_URI="vscode-remote://attached-container+${HEX}/workspace"
+    FOLDER_URI="vscode-remote://attached-container+${HEX}/workspace/${CONTAINER_NAME#devbox-}"
 
     echo "Opening Cursor attached to $CONTAINER_NAME..."
     cursor --folder-uri "$FOLDER_URI"
@@ -669,7 +673,7 @@ if [ "$MODE" = "code" ]; then
     else
         HEX=$(printf '%s' "$ATTACH_JSON" | od -A n -t x1 | tr -d ' \n')
     fi
-    FOLDER_URI="vscode-remote://attached-container+${HEX}/workspace"
+    FOLDER_URI="vscode-remote://attached-container+${HEX}/workspace/${CONTAINER_NAME#devbox-}"
 
     echo "Opening VS Code attached to $CONTAINER_NAME..."
     code --folder-uri "$FOLDER_URI"
@@ -1264,13 +1268,14 @@ DOCKER_ARGS=(
     # Per-project volumes
     -v "devbox-${PROJECT_NAME}-history:/home/node/.local/share/atuin"
     -v "devbox-${PROJECT_NAME}-docker:/home/node/.local/share/docker"
-    -v "devbox-${PROJECT_NAME}-claude:/home/node/.claude"
+    -v "devbox-claude:/home/node/.claude"
     # Shared volumes
     -v devbox-nvim-data:/home/node/.local/share/nvim
     -v devbox-npm-global:/usr/local/share/npm-global
     -v devbox-cursor-server:/home/node/.cursor-server
     -v devbox-vscode-server:/home/node/.vscode-server
     -e CLAUDE_CONFIG_DIR=/home/node/.claude
+    -e "DEVBOX_PROJECT_NAME=$(sanitize "$PROJECT_NAME")"
 )
 
 # Git config from host (staging path — copied to /etc/gitconfig by entrypoint
@@ -1281,11 +1286,12 @@ DOCKER_ARGS=(
 GIT_GLOBAL_IGNORE="$HOME/.config/git/ignore"
 [ -f "$GIT_GLOBAL_IGNORE" ] && DOCKER_ARGS+=(-v "$GIT_GLOBAL_IGNORE:/home/node/.config/git/ignore:ro")
 
-# Host ~/.claude directory (read-only staging; setup-claude.sh symlinks CLAUDE.md into the volume)
-[ -d "$HOME/.claude" ] && DOCKER_ARGS+=(-v "$HOME/.claude:/home/node/.host-config/claude:ro")
+# Host ~/.claude directory (RW bind mount; credentials symlinked from shared volume)
+mkdir -p "$HOME/.claude"
+DOCKER_ARGS+=(-v "$HOME/.claude:/home/node/.claude-host")
 
-# Host ~/.claude.json (read-only staging; setup-claude.sh copies into container)
-[ -f "$HOME/.claude.json" ] && DOCKER_ARGS+=(-v "$HOME/.claude.json:/home/node/.host-config/claude.json:ro")
+# Host ~/.claude.json (onboarding state, account info)
+[ -f "$HOME/.claude.json" ] && DOCKER_ARGS+=(-v "$HOME/.claude.json:/home/node/.claude-host/.claude.json:ro")
 
 # SSH config: --ssh-config uses full host config, otherwise devbox-specific config
 DEVBOX_SSH_CONFIG="$HOME/.config/devbox/ssh_config"
@@ -1365,7 +1371,7 @@ mkdir -p "$CLIPBOARD_DIR"
 DOCKER_ARGS+=(-v "$CLIPBOARD_DIR:/home/node/.clipboard-images")
 
 # Mount workspace
-DOCKER_ARGS+=(-v "$PROJECT_PATH:/workspace")
+DOCKER_ARGS+=(-v "$PROJECT_PATH:/workspace/$(sanitize "$PROJECT_NAME")")
 
 # --- Start detached container ------------------------------------------------
 
@@ -1380,7 +1386,14 @@ if [ -n "$SSH_WARNING" ]; then
     echo "$SSH_WARNING"
 fi
 
-echo "Mounting project: $PROJECT_PATH -> /workspace ($CONTAINER_NAME)"
+# Migration notice for legacy per-project Claude volumes
+if docker volume inspect "devbox-${PROJECT_NAME}-claude" >/dev/null 2>&1; then
+    echo "NOTE: Legacy volume 'devbox-${PROJECT_NAME}-claude' detected."
+    echo "  Credentials now come from host ~/.claude (shared)."
+    echo "  To remove: docker volume rm devbox-${PROJECT_NAME}-claude"
+fi
+
+echo "Mounting project: $PROJECT_PATH -> /workspace/$(sanitize "$PROJECT_NAME") ($CONTAINER_NAME)"
 echo "Starting devbox..."
 
 # Start container in background
@@ -1411,4 +1424,4 @@ docker exec "$CONTAINER_NAME" bash -c \
 
 # Attach first interactive session
 set_tab_title "$PROJECT_NAME"
-exec docker exec -it -w /workspace "$CONTAINER_NAME" zsh
+exec docker exec -it -w "/workspace/$(sanitize "$PROJECT_NAME")" "$CONTAINER_NAME" zsh

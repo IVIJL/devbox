@@ -43,13 +43,13 @@
   "mounts": [
     "source=${localEnv:HOME}/.gitconfig,target=/home/node/.gitconfig-host,type=bind,readonly",
     "source=devbox-history-${devcontainerId},target=/home/node/.local/share/atuin,type=volume",
-    "source=devbox-claude-config-${devcontainerId},target=/home/node/.claude,type=volume",
+    "source=devbox-claude,target=/home/node/.claude,type=volume",
     "source=devbox-docker-${devcontainerId},target=/home/node/.local/share/docker,type=volume",
     "source=devbox-nvim-data-${devcontainerId},target=/home/node/.local/share/nvim,type=volume",
     "source=devbox-cursor-server-${devcontainerId},target=/home/node/.cursor-server,type=volume",
     "source=devbox-vscode-server-${devcontainerId},target=/home/node/.vscode-server,type=volume",
     "source=${localEnv:HOME}/.config/git/ignore,target=/home/node/.config/git/ignore,type=bind,readonly",
-    "source=${localEnv:HOME}/.claude,target=/home/node/.host-config/claude,type=bind,readonly",
+    "source=${localEnv:HOME}/.claude,target=/home/node/.claude-host,type=bind",
     "source=${localEnv:HOME}/.clipboard-images,target=/home/node/.clipboard-images,type=bind"
   ],
   "containerEnv": {
@@ -60,8 +60,8 @@
     "CHEZMOI_REPO": "${localEnv:CHEZMOI_REPO}",
     "HOST_HOME": "${localEnv:HOME}"
   },
-  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
-  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/${localWorkspaceFolderBasename},type=bind,consistency=delegated",
+  "workspaceFolder": "/workspace/${localWorkspaceFolderBasename}",
   "postStartCommand": "sudo cp /home/node/.gitconfig-host /etc/gitconfig 2>/dev/null || true; sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh",
   "waitFor": "postStartCommand"
 }

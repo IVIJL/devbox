@@ -127,8 +127,9 @@ RUN git clone --depth 1 https://github.com/junegunn/fzf.git /home/node/.fzf && \
 # Claude Code (native binary installer)
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
-# Codex CLI (OpenAI) — installed to /usr/local to avoid npm-global volume overlay
-RUN npm install -g --prefix /usr/local @openai/codex
+# Codex CLI (OpenAI) — separate prefix to avoid npm-global volume overlay
+RUN npm install -g --prefix /home/node/.codex-cli @openai/codex
+ENV PATH=/home/node/.codex-cli/bin:$PATH
 
 # Rust + Cargo
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y

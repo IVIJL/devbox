@@ -1431,6 +1431,15 @@ if docker volume inspect "devbox-${PROJECT_NAME}-claude" >/dev/null 2>&1; then
     echo "  To remove: docker volume rm devbox-${PROJECT_NAME}-claude"
 fi
 
+# Auto-cleanup obsolete devbox-codex-bin volume (Codex CLI moved to
+# devbox-npm-global). Safe: docker refuses removal if any container still
+# references it, in which case we leave it for the next run.
+if docker volume inspect "devbox-codex-bin" >/dev/null 2>&1; then
+    if docker volume rm "devbox-codex-bin" >/dev/null 2>&1; then
+        echo "Removed obsolete 'devbox-codex-bin' volume (Codex now lives in devbox-npm-global)"
+    fi
+fi
+
 echo "Mounting project: $PROJECT_PATH -> /workspace/$(sanitize "$PROJECT_NAME") ($CONTAINER_NAME)"
 echo "Starting devbox..."
 

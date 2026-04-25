@@ -278,9 +278,10 @@ USER node
 # Claude Code (native binary installer)
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
-# Codex CLI (OpenAI) — separate prefix to avoid npm-global volume overlay
-RUN npm install -g --prefix /home/node/.codex-cli @openai/codex
-ENV PATH=/home/node/.codex-cli/bin:$PATH
+# Codex CLI (OpenAI) — installs into devbox-npm-global volume (NPM_CONFIG_PREFIX).
+# Existing volumes from before this change won't auto-populate; setup-claude.sh
+# bootstraps Codex at runtime when missing.
+RUN npm install -g @openai/codex
 
 # =============================================================================
 # Layer 6: Firewall + scripts (root)

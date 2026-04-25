@@ -77,6 +77,18 @@ fi
 # Ensure npm-global/bin exists so zshrc path filter ($^path(N-/)) keeps it in PATH
 mkdir -p /usr/local/share/npm-global/bin
 
+# Bootstrap Codex CLI in devbox-npm-global volume if missing. Existing volumes
+# (created before Codex moved here) don't auto-populate from the image, so we
+# install on first start. Idempotent: skips if already present.
+if [ ! -x /usr/local/share/npm-global/bin/codex ]; then
+    echo "Bootstrapping Codex CLI into npm-global volume..."
+    if npm install -g @openai/codex >/dev/null 2>&1; then
+        echo "Codex CLI installed"
+    else
+        echo "Codex CLI install failed - run 'npm install -g @openai/codex' manually"
+    fi
+fi
+
 # Repair claude symlink: ~/.local/bin/claude lives in the image layer (not in
 # the devbox-claude-bin volume), so docker run resets it to the image-baked
 # version. Pick the highest-versioned binary in the persisted volume and re-link.

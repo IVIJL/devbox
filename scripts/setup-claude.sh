@@ -77,4 +77,16 @@ fi
 # Ensure npm-global/bin exists so zshrc path filter ($^path(N-/)) keeps it in PATH
 mkdir -p /usr/local/share/npm-global/bin
 
+# Repair claude symlink: ~/.local/bin/claude lives in the image layer (not in
+# the devbox-claude-bin volume), so docker run resets it to the image-baked
+# version. Pick the highest-versioned binary in the persisted volume and re-link.
+if [ -d /home/node/.local/share/claude/versions ]; then
+    LATEST=$(find /home/node/.local/share/claude/versions/ -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null \
+        | sort -V | tail -1)
+    if [ -n "$LATEST" ]; then
+        ln -sf "/home/node/.local/share/claude/versions/$LATEST" /home/node/.local/bin/claude
+        echo "Claude symlink -> $LATEST"
+    fi
+fi
+
 echo "Claude Code config seeded from image defaults"

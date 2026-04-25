@@ -1303,6 +1303,10 @@ DOCKER_ARGS=(
     -v devbox-npm-global:/usr/local/share/npm-global
     -v devbox-cursor-server:/home/node/.cursor-server
     -v devbox-vscode-server:/home/node/.vscode-server
+    # Persist self-updated Claude Code & Codex CLI across docker run
+    # (image baked versions seed empty volumes via Docker auto-populate)
+    -v devbox-claude-bin:/home/node/.local/share/claude
+    -v devbox-codex-bin:/home/node/.codex-cli
     -e CLAUDE_CONFIG_DIR=/home/node/.claude
     -e "DEVBOX_PROJECT_NAME=$(sanitize "$PROJECT_NAME")"
 )

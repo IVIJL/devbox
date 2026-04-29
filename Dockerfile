@@ -144,8 +144,12 @@ RUN curl --proto '=https' --tlsv1.2 -LsSf https://setup.atuin.sh | sh && \
 # UV Python package manager
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Chezmoi
-RUN sh -c "$(curl -fsLS get.chezmoi.io)" -- -b /home/node/.local/bin
+# Chezmoi (retry on transient upstream 5xx from get.chezmoi.io)
+RUN for i in 1 2 3; do \
+        sh -c "$(curl -fsLS get.chezmoi.io)" -- -b /home/node/.local/bin && break; \
+        echo "chezmoi install attempt $i failed, retrying in 5s..."; \
+        sleep 5; \
+    done && test -x /home/node/.local/bin/chezmoi
 
 # LazyVim starter + cleanup
 RUN git clone --depth 1 https://github.com/LazyVim/starter /home/node/.config/nvim && \

@@ -549,9 +549,11 @@ if [ "$MODE" = "update" ]; then
         fi
     fi
 
-    # Offer Claude token setup if not configured yet
+    # Offer Claude token setup only if neither host OAuth credentials nor a token file exist
     claude_token_file="$HOME/.config/devbox/claude-token"
-    if [ ! -f "$claude_token_file" ] && command -v claude &>/dev/null; then
+    if [ ! -f "$claude_token_file" ] \
+       && [ ! -f "$HOME/.claude/.credentials.json" ] \
+       && command -v claude &>/dev/null; then
         echo ""
         printf '\033[1;33m==> Claude Code token not configured. Run "devbox claude-token" to avoid daily re-login. \033[0m\n'
     fi

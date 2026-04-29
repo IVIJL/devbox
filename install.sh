@@ -445,6 +445,11 @@ setup_claude_token() {
         return
     fi
 
+    if [ -f "$HOME/.claude/.credentials.json" ]; then
+        SKIPPED+=("Claude token (host OAuth credentials present, will be symlinked)")
+        return
+    fi
+
     if ! has claude; then
         SKIPPED+=("Claude token (claude not installed on host)")
         return

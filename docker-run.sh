@@ -1325,6 +1325,9 @@ GIT_GLOBAL_IGNORE="$HOME/.config/git/ignore"
 mkdir -p "$HOME/.claude"
 DOCKER_ARGS+=(-v "$HOME/.claude:/home/node/.claude-host")
 
+# Host ~/.agents directory (RO; targets of ~/.claude/skills symlinks)
+[ -d "$HOME/.agents" ] && DOCKER_ARGS+=(-v "$HOME/.agents:/home/node/.agents:ro")
+
 # Host ~/.codex directory (RW; Codex CLI auth + config shared with host)
 mkdir -p "$HOME/.codex"
 DOCKER_ARGS+=(-v "$HOME/.codex:/home/node/.codex")

@@ -144,13 +144,6 @@ RUN curl --proto '=https' --tlsv1.2 -LsSf https://setup.atuin.sh | sh && \
 # UV Python package manager
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Chezmoi (retry on transient upstream 5xx from get.chezmoi.io)
-RUN for i in 1 2 3; do \
-        sh -c "$(curl -fsLS get.chezmoi.io)" -- -b /home/node/.local/bin && break; \
-        echo "chezmoi install attempt $i failed, retrying in 5s..."; \
-        sleep 5; \
-    done && test -x /home/node/.local/bin/chezmoi
-
 # LazyVim starter + cleanup
 RUN git clone --depth 1 https://github.com/LazyVim/starter /home/node/.config/nvim && \
     rm -rf /home/node/.config/nvim/.git && \
@@ -269,6 +262,15 @@ RUN /home/node/.local/bin/uv tool install python-lsp-server \
 
 # Ruff linter/formatter
 RUN /home/node/.local/bin/uv tool install ruff
+
+# Chezmoi (retry on transient upstream 5xx from get.chezmoi.io)
+# Placed AFTER heavy nvim/Mason/treesitter/uv builds so chezmoi tweaks (e.g. retry
+# logic) don't bust their cache. chezmoi is only used at runtime by setup-chezmoi.sh.
+RUN for i in 1 2 3; do \
+        sh -c "$(curl -fsLS get.chezmoi.io)" -- -b /home/node/.local/bin && break; \
+        echo "chezmoi install attempt $i failed, retrying in 5s..."; \
+        sleep 5; \
+    done && test -x /home/node/.local/bin/chezmoi
 
 # --- Below this line: frequently changed, fast rebuilds ---
 

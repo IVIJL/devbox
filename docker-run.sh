@@ -1305,10 +1305,6 @@ DOCKER_ARGS=(
     -v devbox-npm-global:/usr/local/share/npm-global
     -v devbox-cursor-server:/home/node/.cursor-server
     -v devbox-vscode-server:/home/node/.vscode-server
-    # Persist self-updated Claude Code across docker run (image baked version
-    # seeds empty volume via Docker auto-populate). Codex CLI lives in the
-    # existing devbox-npm-global volume.
-    -v devbox-claude-bin:/home/node/.local/share/claude
     -e CLAUDE_CONFIG_DIR=/home/node/.claude
     -e "DEVBOX_PROJECT_NAME=$(sanitize "$PROJECT_NAME")"
 )
@@ -1327,6 +1323,10 @@ DOCKER_ARGS+=(-v "$HOME/.claude:/home/node/.claude-host")
 
 # Host ~/.agents directory (RO; targets of ~/.claude/skills symlinks)
 [ -d "$HOME/.agents" ] && DOCKER_ARGS+=(-v "$HOME/.agents:/home/node/.agents:ro")
+
+# Host claude binaries (RO; share host-installed Claude Code with all containers).
+# Falls back to image-baked version if host has no Claude installed.
+[ -d "$HOME/.local/share/claude" ] && DOCKER_ARGS+=(-v "$HOME/.local/share/claude:/home/node/.local/share/claude:ro")
 
 # Host ~/.codex directory (RW; Codex CLI auth + config shared with host)
 mkdir -p "$HOME/.codex"
@@ -1434,6 +1434,15 @@ if docker volume inspect "devbox-${PROJECT_NAME}-claude" >/dev/null 2>&1; then
     echo "NOTE: Legacy volume 'devbox-${PROJECT_NAME}-claude' detected."
     echo "  Credentials now come from host ~/.claude (shared)."
     echo "  To remove: docker volume rm devbox-${PROJECT_NAME}-claude"
+fi
+
+# Auto-cleanup obsolete devbox-claude-bin volume (claude binaries now bind-mounted
+# from host ~/.local/share/claude). Safe: docker refuses removal if any container
+# still references it, in which case we leave it for the next run.
+if docker volume inspect "devbox-claude-bin" >/dev/null 2>&1; then
+    if docker volume rm "devbox-claude-bin" >/dev/null 2>&1; then
+        echo "Removed obsolete 'devbox-claude-bin' volume (claude now bind-mounted from host)"
+    fi
 fi
 
 # Auto-cleanup obsolete devbox-codex-bin volume (Codex CLI moved to

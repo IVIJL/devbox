@@ -26,6 +26,7 @@ Usage:
   devbox prune [--all]             Remove old build cache (--all = everything)
   devbox claude-token              Generate/regenerate Claude Code token
   devbox allow [domain]            List or add allowed firewall domain
+                                   (entry matches domain + all subdomains)
   devbox deny [domain]             Remove allowed domain (interactive)
   devbox blocked                   Show blocked DNS queries, allow interactively
   devbox cursor [name]             Open Cursor attached to running devbox
@@ -53,7 +54,7 @@ Examples:
   devbox stop --clean              Stop + remove Docker/history volumes
   devbox remove                    Interactive project data cleanup
   devbox port 3000                 Route 3000.<project>.127.0.0.1.traefik.me
-  devbox allow pypi.org            Allow pypi.org through firewall
+  devbox allow pypi.org            Allow pypi.org (and *.pypi.org) through firewall
   devbox deny                      Interactive domain removal
   devbox blocked                   See blocked queries, allow with fzf
 EOF
@@ -64,6 +65,10 @@ IMAGE="vlcak/devbox:latest"
 SSH_WARNING=""
 DEVBOX_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 TRAEFIK_CONFIG_DIR="$HOME/.config/devbox/traefik/dynamic"
+
+# Allowlist module — defines ALLOWLIST_HOST_FILE, IPSET_NAME, allowlist::* fns
+# shellcheck source=lib/allowlist.sh
+source "$DEVBOX_DIR/lib/allowlist.sh"
 
 # Migrate from old ~/.devbox to ~/.config/devbox
 if [ -d "$HOME/.devbox" ] && [ ! -d "$HOME/.config/devbox" ]; then
@@ -115,79 +120,7 @@ bootstrap_traefik() {
 }
 
 seed_allowed_domains() {
-    local domains_file="$HOME/.config/devbox/allowed-domains.conf"
-    mkdir -p "$HOME/.config/devbox"
-
-    local defaults
-    defaults=$(cat <<'DOMAINS'
-# Devbox allowed domains — edit freely, one domain per line
-# Claude Code
-api.anthropic.com
-platform.claude.com
-claude.ai
-sentry.io
-statsig.anthropic.com
-statsig.com
-mcp-proxy.anthropic.com
-# npm
-registry.npmjs.org
-# PyPI
-pypi.org
-files.pythonhosted.org
-# Rust crates
-crates.io
-static.crates.io
-# VS Code / Cursor
-marketplace.visualstudio.com
-vscode.blob.core.windows.net
-update.code.visualstudio.com
-*.vscode-cdn.net
-*.vsassets.io
-cursor.com
-cursor.sh
-raw.githubusercontent.com
-# Docker Hub (rootless DinD)
-registry-1.docker.io
-auth.docker.io
-production.cloudflare.docker.com
-docker.io
-docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com
-# OpenAI / Codex
-*.openai.com
-*.chatgpt.com
-# Custom
-gaiagroup.cz
-DOMAINS
-)
-
-    if [ ! -f "$domains_file" ]; then
-        echo "$defaults" > "$domains_file"
-    elif ! grep -q '^# Devbox allowed domains' "$domains_file" 2>/dev/null; then
-        # Migration: old file without defaults — prepend defaults, keep user entries
-        local user_entries
-        user_entries=$(grep -v '^\s*#' "$domains_file" 2>/dev/null | grep -v '^\s*$' || true)
-        echo "$defaults" > "$domains_file"
-        if [ -n "$user_entries" ]; then
-            echo "" >> "$domains_file"
-            echo "# User-added" >> "$domains_file"
-            while IFS= read -r entry; do
-                grep -qxF "$entry" "$domains_file" 2>/dev/null || echo "$entry" >> "$domains_file"
-            done <<< "$user_entries"
-        fi
-    fi
-
-    # Migration: add VS Code CDN domains if missing from existing config
-    if [ -f "$domains_file" ]; then
-        for d in "*.vscode-cdn.net" "*.vsassets.io"; do
-            grep -qF "$d" "$domains_file" 2>/dev/null || echo "$d" >> "$domains_file"
-        done
-    fi
-
-    # Migration: add OpenAI/ChatGPT domains for Codex if missing
-    if [ -f "$domains_file" ]; then
-        grep -qF "*.openai.com" "$domains_file" 2>/dev/null || echo "*.openai.com" >> "$domains_file"
-        grep -qF "*.chatgpt.com" "$domains_file" 2>/dev/null || echo "*.chatgpt.com" >> "$domains_file"
-    fi
+    allowlist::ensure_seeded "$ALLOWLIST_HOST_FILE" "$DEVBOX_DIR/config/default-allowlist.conf"
 }
 
 seed_default_ports() {
@@ -329,54 +262,26 @@ list_running_containers() {
     fi
 }
 
-# Regenerate dnsmasq runtime config and restart in all running containers
-# $1 = optional domain to resolve after restart (for allow)
-# $2 = optional space-separated domains to remove from ipset (for deny)
-reload_dnsmasq_in_containers() {
-    local resolve_domain="${1:-}"
-    local deny_domains="${2:-}"
+# Trigger dnsmasq config reload in all running devbox containers.
+# Implementation lives in /usr/local/bin/devbox-firewall-reload (in the image);
+# this is just the per-container fan-out.
+#
+# Usage:
+#   reload_firewall_in_containers                  # plain reload
+#   reload_firewall_in_containers allow <domain>   # warm DNS cache for new domain
+#   reload_firewall_in_containers deny  "<doms>"   # space-separated domains to drop from ipset
+reload_firewall_in_containers() {
+    local action="${1:-}"
+    local domains="${2:-}"
     local containers
     containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
     [ -z "$containers" ] && return 0
     while IFS= read -r container; do
-        docker exec -u root "$container" bash -c '
-            # Regenerate runtime config from shared file
-            : > /etc/dnsmasq.d/devbox-runtime.conf
-            if [ -f /etc/devbox-shared/allowed-domains.conf ]; then
-                while IFS= read -r line; do
-                    line=$(echo "$line" | sed "s/#.*//" | xargs)
-                    [ -n "$line" ] && echo "ipset=/${line}/allowed-domains" >> /etc/dnsmasq.d/devbox-runtime.conf
-                done < /etc/devbox-shared/allowed-domains.conf
-            fi
-            # Kill dnsmasq reliably
-            pkill -9 dnsmasq 2>/dev/null || true
-            # Wait for process to actually die
-            for _i in 1 2 3 4 5; do
-                pgrep -x dnsmasq >/dev/null 2>&1 || break
-                sleep 0.1
-            done
-            rm -f /run/dnsmasq/dnsmasq.pid /var/run/dnsmasq/dnsmasq.pid 2>/dev/null
-            # Start dnsmasq and verify
-            if ! dnsmasq --conf-dir=/etc/dnsmasq.d 2>&1; then
-                echo "ERROR: dnsmasq failed to start" >&2
-                exit 1
-            fi
-            sleep 0.3
-            if ! pgrep -x dnsmasq >/dev/null 2>&1; then
-                echo "ERROR: dnsmasq not running after start" >&2
-                exit 1
-            fi
-            # Remove denied domains IPs from ipset
-            for deny_domain in '"$deny_domains"'; do
-                nslookup "$deny_domain" 127.0.0.1 2>/dev/null | grep -oP "Address: \K[0-9.]+" | while read -r ip; do
-                    ipset del allowed-domains "$ip" 2>/dev/null || true
-                done
-            done
-            # Resolve new domain to populate ipset (if allow)
-            if [ -n "'"$resolve_domain"'" ]; then
-                nslookup "'"$resolve_domain"'" 127.0.0.1 > /dev/null 2>&1 || true
-            fi
-        ' && echo "  Reloaded: $container" || echo "  Failed: $container" >&2
+        if docker exec -u root "$container" /usr/local/bin/devbox-firewall-reload "$action" "$domains"; then
+            echo "  Reloaded: $container"
+        else
+            echo "  Failed: $container" >&2
+        fi
     done <<< "$containers"
 }
 
@@ -1034,14 +939,10 @@ fi
 # --- devbox allow <domain> ----------------------------------------------------
 
 if [ "$MODE" = "allow" ]; then
-    CONF="$HOME/.config/devbox/allowed-domains.conf"
-    mkdir -p "$HOME/.config/devbox"
-    touch "$CONF"
-
     # No domain specified → list allowed domains
     if [ -z "${DOMAIN:-}" ]; then
         echo "Povolené domény (~/.config/devbox/allowed-domains.conf):"
-        allowed_list=$(grep -v '^\s*#' "$CONF" 2>/dev/null | grep -v '^\s*$' | sort || true)
+        allowed_list=$(allowlist::read "$ALLOWLIST_HOST_FILE" | sort)
         if [ -n "$allowed_list" ]; then
             echo "$allowed_list" | while read -r d; do echo "  $d"; done
         else
@@ -1049,27 +950,24 @@ if [ "$MODE" = "allow" ]; then
         fi
         echo ""
         echo "Použití: devbox allow <domain>  |  devbox deny <domain>"
+        echo "Pozn.: Záznam matchuje doménu i všechny její subdomény."
         exit 0
     fi
 
-    # Add domain
-    if grep -qxF "$DOMAIN" "$CONF" 2>/dev/null; then
-        echo "Již povoleno: $DOMAIN"
+    if allowlist::add "$ALLOWLIST_HOST_FILE" "$DOMAIN"; then
+        echo "Povoleno: $DOMAIN (a všechny subdomény)"
     else
-        echo "$DOMAIN" >> "$CONF"
-        echo "Povoleno: $DOMAIN"
+        echo "Již povoleno: $DOMAIN"
     fi
 
-    reload_dnsmasq_in_containers "$DOMAIN" ""
+    reload_firewall_in_containers allow "$DOMAIN"
     exit 0
 fi
 
 # --- devbox deny [domain] ----------------------------------------------------
 
 if [ "$MODE" = "deny" ]; then
-    CONF="$HOME/.config/devbox/allowed-domains.conf"
-
-    if [ ! -f "$CONF" ] || ! grep -v '^\s*#' "$CONF" 2>/dev/null | grep -qv '^\s*$'; then
+    if [ ! -f "$ALLOWLIST_HOST_FILE" ] || [ -z "$(allowlist::read "$ALLOWLIST_HOST_FILE")" ]; then
         echo "Žádné domény k odebrání."
         exit 0
     fi
@@ -1078,7 +976,7 @@ if [ "$MODE" = "deny" ]; then
 
     if [ -z "${DOMAIN:-}" ]; then
         # Interactive selection
-        runtime=$(grep -v '^\s*#' "$CONF" | grep -v '^\s*$' | sort)
+        runtime=$(allowlist::read "$ALLOWLIST_HOST_FILE" | sort)
         if command -v fzf &>/dev/null; then
             selected=$(echo "$runtime" | fzf --prompt="Odebrat doménu: " --multi) || exit 1
         else
@@ -1108,13 +1006,13 @@ if [ "$MODE" = "deny" ]; then
 
         while IFS= read -r sel; do
             [ -z "$sel" ] && continue
-            { grep -vxF "$sel" "$CONF" || true; } > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
-            echo "Odebráno: $sel"
-            DENIED+="$sel "
+            if allowlist::remove "$ALLOWLIST_HOST_FILE" "$sel"; then
+                echo "Odebráno: $sel"
+                DENIED+="$sel "
+            fi
         done <<< "$selected"
     else
-        if grep -qxF "$DOMAIN" "$CONF" 2>/dev/null; then
-            { grep -vxF "$DOMAIN" "$CONF" || true; } > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
+        if allowlist::remove "$ALLOWLIST_HOST_FILE" "$DOMAIN"; then
             echo "Odebráno: $DOMAIN"
             DENIED="$DOMAIN"
         else
@@ -1123,7 +1021,7 @@ if [ "$MODE" = "deny" ]; then
         fi
     fi
 
-    reload_dnsmasq_in_containers "" "$DENIED"
+    reload_firewall_in_containers deny "$DENIED"
     exit 0
 fi
 
@@ -1370,11 +1268,6 @@ if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ ! -f "$HOME/.claude/.credentials.j
     DOCKER_ARGS+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
 fi
 
-# Pass through extra domains
-if [ -n "${DEVBOX_EXTRA_DOMAINS:-}" ]; then
-    DOCKER_ARGS+=(-e "DEVBOX_EXTRA_DOMAINS=$DEVBOX_EXTRA_DOMAINS")
-fi
-
 # Auto-detect NTFY_TOKEN from host's Claude hooks if not set
 if [ -z "${NTFY_TOKEN:-}" ] && [ -d "$HOME/.claude/hooks" ]; then
     NTFY_TOKEN=$(grep -ohm1 'TOKEN="tk_[^"]*"' "$HOME/.claude/hooks/"*.sh 2>/dev/null | head -1 | cut -d'"' -f2 || true)
@@ -1403,10 +1296,9 @@ fi
 DOCKER_ARGS+=(-e "HOST_HOME=$HOME")
 
 # Shared firewall allowlist (host → all containers, read-only)
-DEVBOX_CONFIG_DIR="$HOME/.config/devbox"
-mkdir -p "$DEVBOX_CONFIG_DIR"
-touch "$DEVBOX_CONFIG_DIR/allowed-domains.conf"
-DOCKER_ARGS+=(-v "$DEVBOX_CONFIG_DIR/allowed-domains.conf:/etc/devbox-shared/allowed-domains.conf:ro")
+mkdir -p "$ALLOWLIST_HOST_DIR"
+touch "$ALLOWLIST_HOST_FILE"
+DOCKER_ARGS+=(-v "$ALLOWLIST_HOST_FILE:$ALLOWLIST_CONTAINER_FILE:ro")
 
 # Clipboard images shared directory (host → container, same ~/.clipboard-images path)
 CLIPBOARD_DIR="$HOME/.clipboard-images"

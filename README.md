@@ -492,7 +492,10 @@ devbox/
 ├── build.sh                        # Build script with cleanup
 ├── install.sh                      # Automated installer
 ├── init-firewall.sh                # Default-deny firewall (iptables/ipset/dnsmasq)
-├── extra-domains.conf              # Build-time extra allowed domains
+├── lib/
+│   └── allowlist.sh                # Firewall allowlist module (sourced by host + container)
+├── docs/
+│   └── adr/                        # Architecture decision records
 ├── completions/
 │   └── _devbox                     # Zsh completion script
 ├── config/

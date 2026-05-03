@@ -311,18 +311,19 @@ RUN mkdir -p /etc/devbox-shared
 COPY --chown=node:node config/claude/ /etc/claude-defaults/
 RUN chmod +x /etc/claude-defaults/hooks/*.sh /etc/claude-defaults/statusline-info.sh
 
+COPY lib/allowlist.sh /usr/local/share/devbox/lib/allowlist.sh
 COPY init-firewall.sh /usr/local/bin/
-COPY extra-domains.conf /usr/local/etc/devbox-extra-domains.conf
 COPY scripts/setup-chezmoi.sh /usr/local/bin/
 COPY scripts/n scripts/nx /usr/local/bin/
 COPY scripts/start-rootless-docker.sh /usr/local/bin/
 COPY scripts/devbox-entrypoint.sh /usr/local/bin/
+COPY scripts/devbox-firewall-reload.sh /usr/local/bin/devbox-firewall-reload
 COPY scripts/setup-claude.sh /usr/local/bin/
 COPY scripts/setup-nvim-data.sh /usr/local/bin/
 
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/n /usr/local/bin/nx /usr/local/bin/start-rootless-docker.sh \
-    /usr/local/bin/devbox-entrypoint.sh \
+    /usr/local/bin/devbox-entrypoint.sh /usr/local/bin/devbox-firewall-reload \
     /usr/local/bin/setup-claude.sh /usr/local/bin/setup-nvim-data.sh
 
 # Sudo with password — prevents AI agents from modifying firewall rules

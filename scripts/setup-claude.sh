@@ -1,72 +1,30 @@
 #!/bin/bash
 set -euo pipefail
-# Seed Claude Code config from image defaults into the shared volume.
-# Settings/hooks are always refreshed; credentials are symlinked to host bind mount.
+# Seed Claude Code config in /home/node/.claude (= host ~/.claude bind mount).
+# See docs/adr/0002 for why we share the dir directly instead of symlinking.
+# Devbox-specific defaults are seeded only when the host file is missing,
+# so existing host config is never overwritten.
 
 DEFAULTS="/etc/claude-defaults"
 TARGET="/home/node/.claude"
-HOST="/home/node/.claude-host"
 PROJECT_NAME="${DEVBOX_PROJECT_NAME:-}"
 
 [ -d "$DEFAULTS" ] || { echo "No claude defaults found, skipping"; exit 0; }
 
-# Ensure .claude.json exists (prevents "config not found" warnings on fresh volume)
-if [ ! -f "$TARGET/.claude.json" ]; then
-    if [ -f "$HOST/.claude.json" ]; then
-        cp "$HOST/.claude.json" "$TARGET/.claude.json"
-        echo "Copied .claude.json from host"
-    elif compgen -G "$TARGET/backups/.claude.json.backup.*" >/dev/null; then
-        latest=$(find "$TARGET/backups" -name '.claude.json.backup.*' -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
-        cp "$latest" "$TARGET/.claude.json"
-        echo "Restored .claude.json from backup"
-    else
-        echo '{}' > "$TARGET/.claude.json"
-        echo "Created empty .claude.json"
-    fi
-fi
+# Seed devbox defaults only when the host has no equivalent file. Host files
+# always win — atomic-rename refresh from host or any container is visible to
+# all instances via the shared bind mount.
+[ -f "$TARGET/settings.json" ] || cp "$DEFAULTS/settings.json" "$TARGET/settings.json"
+[ -f "$TARGET/statusline-info.sh" ] || cp "$DEFAULTS/statusline-info.sh" "$TARGET/statusline-info.sh"
 
-# Always overwrite declarative config (devbox-specific)
-cp "$DEFAULTS/settings.json" "$TARGET/settings.json"
-cp "$DEFAULTS/statusline-info.sh" "$TARGET/statusline-info.sh"
 mkdir -p "$TARGET/hooks"
-cp "$DEFAULTS/hooks/"*.sh "$TARGET/hooks/"
-
-# Symlink credentials + lock to host bind mount (shared OAuth with host)
-if [ -d "$HOST" ]; then
-    for f in .credentials.json .credentials.lock; do
-        if [ -f "$HOST/$f" ] || [ "$f" = ".credentials.lock" ]; then
-            ln -sf "$HOST/$f" "$TARGET/$f"
-        fi
-    done
-
-    # Symlink CLAUDE.md from host (live, follows host changes)
-    if [ -f "$HOST/CLAUDE.md" ]; then
-        ln -sf "$HOST/CLAUDE.md" "$TARGET/CLAUDE.md"
-    fi
-
-    # Sync skills from host (additive — never removes container-only skills)
-    if [ -d "$HOST/skills" ]; then
-        mkdir -p "$TARGET/skills"
-        rsync -a "$HOST/skills/" "$TARGET/skills/"
-        echo "Skills synced from host"
-    fi
-
-    # Sync plugins from host (marketplace repos, cache, config)
-    if [ -d "$HOST/plugins" ]; then
-        rsync -a "$HOST/plugins/" "$TARGET/plugins/"
-        # Fix host-specific absolute paths in plugin registries
-        if [ -n "${HOST_HOME:-}" ]; then
-            for pfile in installed_plugins.json known_marketplaces.json; do
-                if [ -f "$TARGET/plugins/$pfile" ]; then
-                    sed -i "s|${HOST_HOME}/.claude|/home/node/.claude|g" "$TARGET/plugins/$pfile"
-                fi
-            done
-        fi
-        echo "Plugins synced from host"
-    fi
-fi
+for hook in "$DEFAULTS/hooks/"*.sh; do
+    name=$(basename "$hook")
+    [ -f "$TARGET/hooks/$name" ] || cp "$hook" "$TARGET/hooks/$name"
+done
 
 # Pre-trust /workspace/<project> so the safety prompt doesn't appear on every startup
+[ -f "$TARGET/.claude.json" ] || echo '{}' > "$TARGET/.claude.json"
 if [ -n "$PROJECT_NAME" ] && [ -f "$TARGET/.claude.json" ]; then
     WORKSPACE="/workspace/$PROJECT_NAME"
     jq --arg ws "$WORKSPACE" '.projects[$ws].hasTrustDialogAccepted = true' \
@@ -89,9 +47,9 @@ if [ ! -x /usr/local/share/npm-global/bin/codex ]; then
     fi
 fi
 
-# Repair claude symlink: ~/.local/bin/claude lives in the image layer (not in
-# the devbox-claude-bin volume), so docker run resets it to the image-baked
-# version. Pick the highest-versioned binary in the persisted volume and re-link.
+# Repair claude symlink: ~/.local/bin/claude lives in the image layer and
+# docker run resets it to the image-baked path. Re-link to the highest version
+# in the (RO bind-mounted) host claude dir.
 if [ -d /home/node/.local/share/claude/versions ]; then
     LATEST=$(find /home/node/.local/share/claude/versions/ -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null \
         | sort -V | tail -1)
@@ -101,4 +59,4 @@ if [ -d /home/node/.local/share/claude/versions ]; then
     fi
 fi
 
-echo "Claude Code config seeded from image defaults"
+echo "Claude Code config seeded"

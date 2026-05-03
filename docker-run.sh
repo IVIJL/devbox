@@ -22,6 +22,7 @@ Usage:
   devbox ports                     List active port routes
   devbox build [flags]             Build/rebuild the devbox image
   devbox update                    Update devbox (pull repo + rebuild image)
+  devbox migrate                   Migrate data to new layout (interactive; auto-run by 'devbox update')
   devbox uninstall                 Remove everything (containers, volumes, image)
   devbox prune [--all]             Remove old build cache (--all = everything)
   devbox claude-token              Generate/regenerate Claude Code token
@@ -182,7 +183,7 @@ YAML
 # Gracefully stop a devbox container — stop inner DinD containers first
 graceful_stop_container() {
     local name="$1"
-    docker exec "$name" bash -c '
+    docker exec -u node "$name" bash -c '
         if [ -S "$XDG_RUNTIME_DIR/docker.sock" ] && docker info >/dev/null 2>&1; then
             inner=$(docker ps --format "{{.ID}} {{.Names}}" 2>/dev/null)
             if [ -n "$inner" ]; then
@@ -212,10 +213,10 @@ attach_to_container() {
     echo "Attaching to running container: $name"
     set_tab_title "${name#devbox-}"
     local ws="/workspace/${name#devbox-}"
-    if ! docker exec "$name" test -d "$ws" 2>/dev/null; then
+    if ! docker exec -u node "$name" test -d "$ws" 2>/dev/null; then
         ws="/workspace"
     fi
-    exec docker exec -it -w "$ws" "$name" zsh
+    exec docker exec -it -u node -w "$ws" "$name" zsh
 }
 
 # Restart an exited devbox container and re-run init scripts
@@ -228,9 +229,10 @@ restart_exited_container() {
         docker rm "$name" > /dev/null
         return 1
     fi
-    # Re-run init scripts (firewall, rootless docker, chezmoi, claude)
-    docker exec -u root "$name" bash -c 'cp /home/node/.gitconfig-host /etc/gitconfig 2>/dev/null; /usr/local/bin/init-firewall.sh'
-    docker exec "$name" bash -c \
+    # Root-context setup (firewall, gitconfig, host-home symlink) is handled by
+    # the entrypoint on every container start. Here we only run the user-mode
+    # setup as node.
+    docker exec -u node "$name" bash -c \
         '/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh'
     # Re-apply port routes
     apply_port_routes "$name"
@@ -351,6 +353,7 @@ case "${1:-}" in
     claude-token) MODE="claude-token"; shift ;;
     build)     MODE="build";     shift ;;
     update)    MODE="update";    shift ;;
+    migrate)   MODE="migrate";   shift ;;
     uninstall) MODE="uninstall"; shift ;;
     prune)     MODE="prune";     shift; PRUNE_ALL=false
                [[ "${1:-}" == "--all" ]] && PRUNE_ALL=true
@@ -377,21 +380,11 @@ fi
 # --- devbox sync-skills -- sync host skills to all running containers --------
 
 if [ "$MODE" = "sync-skills" ]; then
-    if [ ! -d "$HOME/.claude/skills" ]; then
-        echo "No skills found at ~/.claude/skills/"
-        exit 0
-    fi
-    skill_count=$(find "$HOME/.claude/skills" -maxdepth 2 -name 'SKILL.md' | wc -l)
-    containers=$(docker ps --filter "name=^devbox-" --filter "status=running" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
-    if [ -z "$containers" ]; then
-        echo "No running devbox containers found"
-        exit 0
-    fi
-    for c in $containers; do
-        docker exec "$c" bash -c 'mkdir -p /home/node/.claude/skills && rsync -a /home/node/.claude-host/skills/ /home/node/.claude/skills/'
-        echo "  synced $c"
-    done
-    echo "Synced $skill_count skill(s) to $(echo "$containers" | wc -l) container(s)"
+    # Obsolete: ~/.claude is now bind-mounted directly into every container
+    # (see docs/adr/0002), so host-side changes to skills/ are immediately
+    # visible without any sync step.
+    echo "Skills are now live-shared via the host bind mount — no sync needed."
+    echo "Drop new skills into ~/.claude/skills/ and they appear in every running devbox instantly."
     exit 0
 fi
 
@@ -496,6 +489,18 @@ if [ "$MODE" = "update" ]; then
                 echo "Note: zsh completion not updated. Run install.sh to (re)install it."
             fi
         fi
+        # Auto-run migration if any old Claude volume detected. Covers both the
+        # unified `devbox-claude` and per-project `devbox-<name>-claude` legacy.
+        if docker volume ls --format '{{.Name}}' | grep -qE '^devbox-(.+-)?claude$'; then
+            echo ""
+            echo -e "\033[1;36m==> Detected pre-migration Claude volume(s) — auto-migrating to bind mount\033[0m"
+            echo "    (host files preserved; container-only data merged into ~/.claude)"
+            if ! "$DEVBOX_DIR/scripts/migrate-to-bindmount.sh" --auto; then
+                echo -e "\033[1;31m==> Migration FAILED. Aborting update.\033[0m"
+                echo "    Run 'devbox migrate' interactively to diagnose."
+                exit 1
+            fi
+        fi
         echo "Rebuilding image..."
         exec "$DEVBOX_DIR/build.sh" "$@"
     else
@@ -508,6 +513,12 @@ fi
 
 if [ "$MODE" = "uninstall" ]; then
     exec "$DEVBOX_DIR/build.sh" --uninstall
+fi
+
+# --- devbox migrate ----------------------------------------------------------
+
+if [ "$MODE" = "migrate" ]; then
+    exec "$DEVBOX_DIR/scripts/migrate-to-bindmount.sh" "$@"
 fi
 
 # --- devbox prune ------------------------------------------------------------
@@ -860,7 +871,7 @@ if [ "$MODE" = "blocked" ]; then
 
     # Get list of allowed domains from dnsmasq ipset config (inside first container)
     first_container=$(echo "$containers" | head -1)
-    allowed_domains=$(docker exec "$first_container" bash -c '
+    allowed_domains=$(docker exec -u node "$first_container" bash -c '
         grep "^ipset=" /etc/dnsmasq.d/*.conf 2>/dev/null \
             | grep -oP "ipset=/\K[^/]+" \
             | sort -u
@@ -1186,6 +1197,9 @@ bootstrap_traefik
 DOCKER_ARGS=(
     --hostname "$PROJECT_NAME"
     --network devproxy
+    # Entrypoint needs root to set up firewall + symlinks, then drops to node
+    # via runuser. See scripts/devbox-entrypoint.sh and docs/adr/0003.
+    --user 0
     --cap-add=SYS_ADMIN
     --cap-add=NET_ADMIN
     --cap-add=NET_RAW
@@ -1197,7 +1211,6 @@ DOCKER_ARGS=(
     # Per-project volumes
     -v "devbox-${PROJECT_NAME}-history:/home/node/.local/share/atuin"
     -v "devbox-${PROJECT_NAME}-docker:/home/node/.local/share/docker"
-    -v "devbox-claude:/home/node/.claude"
     # Shared volumes
     -v devbox-nvim-data:/home/node/.local/share/nvim
     -v devbox-npm-global:/usr/local/share/npm-global
@@ -1215,9 +1228,9 @@ DOCKER_ARGS=(
 GIT_GLOBAL_IGNORE="$HOME/.config/git/ignore"
 [ -f "$GIT_GLOBAL_IGNORE" ] && DOCKER_ARGS+=(-v "$GIT_GLOBAL_IGNORE:/home/node/.config/git/ignore:ro")
 
-# Host ~/.claude directory (RW bind mount; credentials symlinked from shared volume)
+# Host ~/.claude directory (RW bind mount; full sharing — see docs/adr/0002)
 mkdir -p "$HOME/.claude"
-DOCKER_ARGS+=(-v "$HOME/.claude:/home/node/.claude-host")
+DOCKER_ARGS+=(-v "$HOME/.claude:/home/node/.claude")
 
 # Host ~/.agents directory (RO; targets of ~/.claude/skills symlinks)
 [ -d "$HOME/.agents" ] && DOCKER_ARGS+=(-v "$HOME/.agents:/home/node/.agents:ro")
@@ -1229,9 +1242,6 @@ DOCKER_ARGS+=(-v "$HOME/.claude:/home/node/.claude-host")
 # Host ~/.codex directory (RW; Codex CLI auth + config shared with host)
 mkdir -p "$HOME/.codex"
 DOCKER_ARGS+=(-v "$HOME/.codex:/home/node/.codex")
-
-# Host ~/.claude.json (onboarding state, account info)
-[ -f "$HOME/.claude.json" ] && DOCKER_ARGS+=(-v "$HOME/.claude.json:/home/node/.claude-host/.claude.json:ro")
 
 # SSH config: --ssh-config uses full host config, otherwise devbox-specific config
 DEVBOX_SSH_CONFIG="$HOME/.config/devbox/ssh_config"
@@ -1321,11 +1331,20 @@ if [ -n "$SSH_WARNING" ]; then
     echo "$SSH_WARNING"
 fi
 
-# Migration notice for legacy per-project Claude volumes
-if docker volume inspect "devbox-${PROJECT_NAME}-claude" >/dev/null 2>&1; then
-    echo "NOTE: Legacy volume 'devbox-${PROJECT_NAME}-claude' detected."
-    echo "  Credentials now come from host ~/.claude (shared)."
-    echo "  To remove: docker volume rm devbox-${PROJECT_NAME}-claude"
+# Hard gate: refuse to start if any pre-migration Claude volume exists. Catches
+# the unified `devbox-claude` and any per-project `devbox-<name>-claude` from
+# the older layout (commit d364a16). Both must be merged into ~/.claude before
+# the bind-mount layout is safe to use.
+mapfile -t stale_volumes < <(docker volume ls --format '{{.Name}}' | grep -E '^devbox-(.+-)?claude$' || true)
+if [ ${#stale_volumes[@]} -gt 0 ]; then
+    echo
+    echo -e "\033[1;31m==> MIGRATION REQUIRED <==\033[0m"
+    echo "    Pre-migration volume(s) detected: ${stale_volumes[*]}"
+    echo "    The container layout has changed (see docs/adr/0002)."
+    echo
+    printf "    Run \033[1;36mdevbox update\033[0m to migrate automatically (recommended),\n"
+    printf "    or \033[1;36mdevbox migrate\033[0m to run the migration interactively.\n"
+    exit 1
 fi
 
 # Auto-cleanup obsolete devbox-claude-bin volume (claude binaries now bind-mounted
@@ -1368,13 +1387,11 @@ else
     echo "  Set port: devbox port <port>"
 fi
 
-# Init scripts: firewall runs as root (no sudo needed), rest as node
-# Fix IDE server directory permissions (volumes may be created as root)
-docker exec -u root "$CONTAINER_NAME" bash -c \
-    'cp /home/node/.gitconfig-host /etc/gitconfig 2>/dev/null; chown node:node /home/node/.cursor-server /home/node/.vscode-server 2>/dev/null; /usr/local/bin/init-firewall.sh'
-docker exec "$CONTAINER_NAME" bash -c \
+# Root-context setup (firewall, gitconfig, host-home symlink, IDE server
+# ownership) is handled by the entrypoint on every container start.
+docker exec -u node "$CONTAINER_NAME" bash -c \
     '/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh'
 
 # Attach first interactive session
 set_tab_title "$PROJECT_NAME"
-exec docker exec -it -w "/workspace/$(sanitize "$PROJECT_NAME")" "$CONTAINER_NAME" zsh
+exec docker exec -it -u node -w "/workspace/$(sanitize "$PROJECT_NAME")" "$CONTAINER_NAME" zsh

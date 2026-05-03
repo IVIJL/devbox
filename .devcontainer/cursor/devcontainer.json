@@ -2,6 +2,7 @@
   "name": "Devbox (Cursor)",
   "image": "vlcak/devbox:latest",
   "runArgs": [
+    "--user", "0",
     "--security-opt", "seccomp=unconfined",
     "--security-opt", "apparmor=unconfined",
     "--security-opt", "systempaths=unconfined",
@@ -35,8 +36,7 @@
   "mounts": [
     "source=${localEnv:HOME}/.gitconfig,target=/home/node/.gitconfig-host,type=bind,readonly",
     "source=devbox-history-${devcontainerId},target=/home/node/.local/share/atuin,type=volume",
-    "source=devbox-claude,target=/home/node/.claude,type=volume",
-    "source=${localEnv:HOME}/.claude,target=/home/node/.claude-host,type=bind",
+    "source=${localEnv:HOME}/.claude,target=/home/node/.claude,type=bind",
     "source=devbox-docker-${devcontainerId},target=/home/node/.local/share/docker,type=volume",
     "source=devbox-nvim-data-${devcontainerId},target=/home/node/.local/share/nvim,type=volume",
     "source=devbox-cursor-server-${devcontainerId},target=/home/node/.cursor-server,type=volume",
@@ -50,6 +50,6 @@
   },
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/${localWorkspaceFolderBasename},type=bind,consistency=delegated",
   "workspaceFolder": "/workspace/${localWorkspaceFolderBasename}",
-  "postStartCommand": "sudo cp /home/node/.gitconfig-host /etc/gitconfig 2>/dev/null || true; sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh",
+  "postStartCommand": "/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh",
   "waitFor": "postStartCommand"
 }

@@ -11,6 +11,7 @@
     }
   },
   "runArgs": [
+    "--user", "0",
     "--security-opt", "seccomp=unconfined",
     "--security-opt", "apparmor=unconfined",
     "--security-opt", "systempaths=unconfined",
@@ -45,8 +46,7 @@
     "source=${localEnv:HOME}/.ssh/config,target=/home/node/.ssh/config,type=bind,readonly",
     "source=${localEnv:HOME}/.ssh/known_hosts,target=/home/node/.ssh/known_hosts,type=bind,readonly",
     "source=devbox-history,target=/home/node/.local/share/atuin,type=volume",
-    "source=devbox-claude,target=/home/node/.claude,type=volume",
-    "source=${localEnv:HOME}/.claude,target=/home/node/.claude-host,type=bind",
+    "source=${localEnv:HOME}/.claude,target=/home/node/.claude,type=bind",
     "source=devbox-workspace,target=/workspace,type=volume",
     "source=devbox-docker,target=/home/node/.local/share/docker,type=volume",
     "source=devbox-nvim-data,target=/home/node/.local/share/nvim,type=volume",
@@ -62,6 +62,6 @@
     "CHEZMOI_REPO": "${localEnv:CHEZMOI_REPO}"
   },
   "workspaceFolder": "/workspace",
-  "postStartCommand": "sudo cp /home/node/.gitconfig-host /etc/gitconfig 2>/dev/null || true; sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh",
+  "postStartCommand": "/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh",
   "waitFor": "postStartCommand"
 }

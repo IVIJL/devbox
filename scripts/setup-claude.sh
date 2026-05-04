@@ -23,13 +23,45 @@ for hook in "$DEFAULTS/hooks/"*.sh; do
     [ -f "$TARGET/hooks/$name" ] || cp "$hook" "$TARGET/hooks/$name"
 done
 
-# Pre-trust /workspace/<project> so the safety prompt doesn't appear on every startup
+# Backwards-compat: keep /workspace/<projectname> as an alias for the actual
+# project mount. /workspace is created and chown'd to node:node in the
+# Dockerfile, so node can write here without sudo. Phase 2 mounts the project
+# at the host's absolute path (see docs/adr/0004); the symlink lets users and
+# scripts that hardcode /workspace/<name> keep working.
+if [ -n "$PROJECT_NAME" ] && [ -n "${DEVBOX_PROJECT_HOST_PATH:-}" ]; then
+    ln -sfn "$DEVBOX_PROJECT_HOST_PATH" "/workspace/$PROJECT_NAME"
+fi
+
+# Pre-trust the host project path AND the /workspace alias so Claude doesn't
+# prompt regardless of which CWD the user enters from.
 [ -f "$TARGET/.claude.json" ] || echo '{}' > "$TARGET/.claude.json"
 if [ -n "$PROJECT_NAME" ] && [ -f "$TARGET/.claude.json" ]; then
-    WORKSPACE="/workspace/$PROJECT_NAME"
-    jq --arg ws "$WORKSPACE" '.projects[$ws].hasTrustDialogAccepted = true' \
-        "$TARGET/.claude.json" > "$TARGET/.claude.json.tmp" \
-        && mv "$TARGET/.claude.json.tmp" "$TARGET/.claude.json"
+    for ws in "${DEVBOX_PROJECT_HOST_PATH:-}" "/workspace/$PROJECT_NAME"; do
+        [ -n "$ws" ] || continue
+        jq --arg ws "$ws" '.projects[$ws].hasTrustDialogAccepted = true' \
+            "$TARGET/.claude.json" > "$TARGET/.claude.json.tmp" \
+            && mv "$TARGET/.claude.json.tmp" "$TARGET/.claude.json"
+    done
+fi
+
+# One-time notice: if there are orphaned /workspace-keyed sessions/projects
+# from the pre-Phase-2 layout, point the user at the translation helper.
+# Marker is in the bind-mounted dir — shared with host & all containers, so
+# the notice fires once per host. Idempotent.
+NOTICE_MARKER="$TARGET/.translate-notice-shown"
+if [ ! -f "$NOTICE_MARKER" ]; then
+    orphan_count=$(find "$TARGET/sessions" "$TARGET/projects" \
+        -maxdepth 1 -type d -name '-workspace-*' 2>/dev/null | wc -l)
+    if [ "$orphan_count" -gt 0 ]; then
+        echo
+        echo -e "\033[1;33m==> Note: $orphan_count orphaned container session/project dir(s) detected.\033[0m"
+        echo "    These were created with the old /workspace/ CWD layout."
+        echo "    To make them visible to /resume, run on host:"
+        echo -e "      \033[1;36mdevbox migrate --translate-keys\033[0m"
+        echo "    (Interactive — asks where each project lives on your host.)"
+        echo
+    fi
+    touch "$NOTICE_MARKER"
 fi
 
 # Ensure npm-global/bin exists so zshrc path filter ($^path(N-/)) keeps it in PATH

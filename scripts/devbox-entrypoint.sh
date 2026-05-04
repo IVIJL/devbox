@@ -21,12 +21,35 @@ if [ "$(id -u)" = "0" ]; then
     # Volumes for IDE servers may be created as root on first mount.
     chown node:node /home/node/.cursor-server /home/node/.vscode-server 2>/dev/null || true
 
-    # Claude plugin registry stores absolute paths rooted in the host home
-    # (e.g. /home/<host-user>/.claude/plugins/cache/...). Without this
-    # symlink those paths don't resolve inside the container. See ADR 0002.
-    if [ -n "${HOST_HOME:-}" ] && [ "$HOST_HOME" != "/home/node" ] && [ ! -e "$HOST_HOME" ]; then
-        mkdir -p "$(dirname "$HOST_HOME")"
-        ln -sfn /home/node "$HOST_HOME"
+    # Bridge $HOST_HOME (host user's home dir) to /home/node (container user's
+    # home, where the bind mounts live). Two requirements collide:
+    #
+    # 1. Claude's plugin registry stores absolute paths under
+    #    /home/<host-user>/.claude/... (see ADR 0002), so those paths must
+    #    resolve into the bind mount.
+    # 2. Phase 2 (ADR 0004) bind-mounts each project at its literal host path
+    #    (e.g. /home/<host-user>/Projekty/X) so getcwd(2) inside the
+    #    container returns the host path — needed for plugin/session parity.
+    #    A whole-dir symlink at /home/<host-user> would make the kernel
+    #    canonicalise getcwd() to /home/node/... and defeat parity.
+    #
+    # Solution: $HOST_HOME is a real directory whose contents mirror
+    # /home/node via per-entry symlinks. Project mounts live as real subdirs
+    # alongside the mirror, so their canonical paths match the host.
+    if [ -n "${HOST_HOME:-}" ] && [ "$HOST_HOME" != "/home/node" ]; then
+        # Heal pre-Phase-2 layout (whole-dir symlink) by replacing it.
+        if [ -L "$HOST_HOME" ]; then
+            rm -f "$HOST_HOME"
+        fi
+        mkdir -p "$HOST_HOME"
+        chown node:node "$HOST_HOME"
+        shopt -s dotglob nullglob
+        for entry in /home/node/*; do
+            name=$(basename "$entry")
+            [ -e "$HOST_HOME/$name" ] || [ -L "$HOST_HOME/$name" ] || \
+                ln -sfn "$entry" "$HOST_HOME/$name"
+        done
+        shopt -u dotglob nullglob
     fi
 
     /usr/local/bin/init-firewall.sh

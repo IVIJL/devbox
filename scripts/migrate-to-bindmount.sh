@@ -10,7 +10,94 @@ set -euo pipefail
 CYAN='\033[1;36m'; YELLOW='\033[1;33m'; GREEN='\033[1;32m'; RED='\033[1;31m'; NC='\033[0m'
 
 AUTO=false
-[ "${1:-}" = "--auto" ] && AUTO=true
+TRANSLATE_ONLY=false
+for arg in "$@"; do
+    case "$arg" in
+        --auto) AUTO=true ;;
+        --translate-keys) TRANSLATE_ONLY=true ;;
+    esac
+done
+
+# Translate /workspace-keyed session/project subdirs in ~/.claude to host-path
+# encoding so /resume picks them up under Phase 2's host-path CWD.
+# Idempotent and opt-in: skipping a project leaves its data on disk under the
+# old key, recoverable manually later.
+translate_workspace_keys() {
+    echo
+    echo -e "${CYAN}=== Phase 2: session/project key translation ===${NC}"
+    echo "Container CWD changed from /workspace/<project> to your host project path."
+    echo "Old session/project subdirs keyed by /workspace/* would be invisible to /resume."
+    echo
+
+    mapfile -t old_keys < <(find "$HOME/.claude/sessions" "$HOME/.claude/projects" \
+        -maxdepth 1 -type d -name '-workspace-*' 2>/dev/null | sort -u)
+
+    if [ ${#old_keys[@]} -eq 0 ]; then
+        echo "No /workspace-keyed sessions to translate. Done."
+        return 0
+    fi
+
+    echo "Found old session/project subdirs:"
+    printf '  %s\n' "${old_keys[@]}"
+    echo
+    echo "To translate, you must tell me where each project lives on your host."
+    if [ "$AUTO" = true ]; then
+        echo "(auto mode: skipping translation — run 'devbox migrate --translate-keys' to do it interactively)"
+        return 0
+    fi
+    read -rp "Translate now? [y/N] " ans
+    if ! [[ "$ans" =~ ^[Yy] ]]; then
+        echo "Skipped. Old data remains on disk under -workspace- keys."
+        return 0
+    fi
+
+    declare -A name_to_key
+    for dir in "${old_keys[@]}"; do
+        name=$(basename "$dir" | sed 's/^-workspace-//')
+        [ -n "${name_to_key[$name]:-}" ] && continue
+
+        echo
+        read -rp "Host path for project '$name' (empty to skip): " hostpath
+        if [ -z "$hostpath" ]; then
+            name_to_key[$name]="SKIP"
+            continue
+        fi
+        if [ ! -d "$hostpath" ]; then
+            echo "Path doesn't exist, skipping."
+            name_to_key[$name]="SKIP"
+            continue
+        fi
+        # Encode host path: /home/vlcak/Projekty/devbox → -home-vlcak-Projekty-devbox
+        new_key="-${hostpath#/}"
+        new_key="${new_key//\//-}"
+        name_to_key[$name]="$new_key"
+    done
+
+    for dir in "${old_keys[@]}"; do
+        name=$(basename "$dir" | sed 's/^-workspace-//')
+        [ "${name_to_key[$name]}" = "SKIP" ] && continue
+
+        parent=$(dirname "$dir")
+        new_dir="$parent/${name_to_key[$name]}"
+
+        if [ -e "$new_dir" ]; then
+            rsync -a --ignore-existing "$dir/" "$new_dir/"
+            rm -rf "$dir"
+            echo "Merged $dir -> $new_dir"
+        else
+            mv "$dir" "$new_dir"
+            echo "Renamed $dir -> $new_dir"
+        fi
+    done
+
+    echo -e "${GREEN}Translation complete.${NC}"
+}
+
+# `devbox migrate --translate-keys` runs only the translation step.
+if [ "$TRANSLATE_ONLY" = true ]; then
+    translate_workspace_keys
+    exit 0
+fi
 
 echo -e "${CYAN}=== Devbox migration: per-container volume(s) → host bind mount ===${NC}"
 echo "Backs up nothing — this is a merge into your existing ~/.claude/."
@@ -47,6 +134,7 @@ if [ ${#volumes[@]} -eq 0 ]; then
             docker volume rm "$vol" >/dev/null 2>&1 && echo "Removed obsolete: $vol"
         fi
     done
+    translate_workspace_keys
     exit 0
 fi
 
@@ -115,6 +203,9 @@ for vol in devbox-claude-bin devbox-codex-bin; do
         docker volume rm "$vol" >/dev/null 2>&1 && echo "Removed obsolete: $vol"
     fi
 done
+
+# 8. (Phase 2) Optionally translate /workspace-keyed session/project subdirs.
+translate_workspace_keys
 
 echo
 echo -e "${GREEN}Migration done.${NC} Next steps:"

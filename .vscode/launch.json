@@ -7,7 +7,7 @@
       "request": "launch",
       "program": "${file}",
       "console": "integratedTerminal",
-      "cwd": "/workspace"
+      "cwd": "${workspaceFolder}"
     },
     {
       "name": "Node.js: Attach (9229)",
@@ -15,8 +15,8 @@
       "request": "attach",
       "port": 9229,
       "restart": true,
-      "localRoot": "/workspace",
-      "remoteRoot": "/workspace"
+      "localRoot": "${workspaceFolder}",
+      "remoteRoot": "${workspaceFolder}"
     },
     {
       "name": "Node.js: npm start",
@@ -25,7 +25,7 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["start"],
       "console": "integratedTerminal",
-      "cwd": "/workspace"
+      "cwd": "${workspaceFolder}"
     },
     {
       "name": "Python: Current File",
@@ -33,7 +33,7 @@
       "request": "launch",
       "program": "${file}",
       "console": "integratedTerminal",
-      "cwd": "/workspace"
+      "cwd": "${workspaceFolder}"
     },
     {
       "name": "Python: Attach (5678)",

@@ -46,10 +46,12 @@
     "NODE_OPTIONS": "--max-old-space-size=4096",
     "CLAUDE_CONFIG_DIR": "/home/node/.claude",
     "TZ": "${localEnv:TZ:Europe/Prague}",
-    "NTFY_TOKEN": "${localEnv:NTFY_TOKEN}"
+    "NTFY_TOKEN": "${localEnv:NTFY_TOKEN}",
+    "DEVBOX_PROJECT_HOST_PATH": "${localWorkspaceFolder}",
+    "DEVBOX_PROJECT_NAME": "${localWorkspaceFolderBasename}"
   },
-  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/${localWorkspaceFolderBasename},type=bind,consistency=delegated",
-  "workspaceFolder": "/workspace/${localWorkspaceFolderBasename}",
+  "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind,consistency=delegated",
+  "workspaceFolder": "${localWorkspaceFolder}",
   "postStartCommand": "/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh",
   "waitFor": "postStartCommand"
 }

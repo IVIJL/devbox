@@ -43,7 +43,7 @@ Build flags:
   devbox build --progress=plain    Show full build log
 
 Examples:
-  devbox                           Mount CWD as /workspace/<project>
+  devbox                           Mount CWD at host project path inside container
   devbox ~/projects/app            Mount specific project
   devbox --ssh-config ~/app        Mount with full host SSH config
   devbox ssh-config add            Add SSH host to devbox config
@@ -82,6 +82,24 @@ fi
 
 sanitize() {
     echo "$1" | tr -cs 'a-zA-Z0-9_.-' '-' | sed 's/^-//;s/-$//'
+}
+
+# Percent-encode a filesystem path for embedding in a URI path component.
+# RFC 3986 unreserved chars and `/` pass through; everything else is
+# %-encoded. Needed because host project paths can contain spaces or
+# diacritics (e.g. ~/Code/My App) that would otherwise produce an invalid
+# folder URI for vscode-remote://.
+url_encode_path() {
+    local LC_ALL=C s="$1" out="" c
+    local -i i
+    for ((i=0; i<${#s}; i++)); do
+        c="${s:$i:1}"
+        case "$c" in
+            [a-zA-Z0-9._~/-]) out+="$c" ;;
+            *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+        esac
+    done
+    printf '%s' "$out"
 }
 
 set_tab_title() {
@@ -212,9 +230,15 @@ attach_to_container() {
     local name="$1"
     echo "Attaching to running container: $name"
     set_tab_title "${name#devbox-}"
-    local ws="/workspace/${name#devbox-}"
-    if ! docker exec -u node "$name" test -d "$ws" 2>/dev/null; then
-        ws="/workspace"
+    # Prefer the host project path advertised by Phase 2 containers; fall back
+    # to /workspace/<name> for legacy containers that pre-date this layout.
+    local ws
+    ws=$(docker exec -u node "$name" sh -c 'printf %s "$DEVBOX_PROJECT_HOST_PATH"' 2>/dev/null || true)
+    if [ -z "$ws" ] || ! docker exec -u node "$name" test -d "$ws" 2>/dev/null; then
+        ws="/workspace/${name#devbox-}"
+        if ! docker exec -u node "$name" test -d "$ws" 2>/dev/null; then
+            ws="/workspace"
+        fi
     fi
     exec docker exec -it -u node -w "$ws" "$name" zsh
 }
@@ -573,15 +597,20 @@ if [ "$MODE" = "cursor" ]; then
         CONTAINER_NAME="$selected"
     fi
 
-    # Build attached-container URI for Cursor
-    # Format: vscode-remote://attached-container+<hex-encoded-json>/workspace
+    # Build attached-container URI for Cursor.
+    # Format: vscode-remote://attached-container+<hex-encoded-json><path>
+    # Prefer the host project path (set as $DEVBOX_PROJECT_HOST_PATH inside the
+    # container by docker-run.sh); fall back to /workspace/<name> for older
+    # containers that pre-date Phase 2.
     ATTACH_JSON="{\"containerName\":\"/${CONTAINER_NAME}\"}"
     if command -v xxd &>/dev/null; then
         HEX=$(printf '%s' "$ATTACH_JSON" | xxd -p | tr -d '\n')
     else
         HEX=$(printf '%s' "$ATTACH_JSON" | od -A n -t x1 | tr -d ' \n')
     fi
-    FOLDER_URI="vscode-remote://attached-container+${HEX}/workspace/${CONTAINER_NAME#devbox-}"
+    HOSTPATH=$(docker exec "$CONTAINER_NAME" sh -c 'printf %s "$DEVBOX_PROJECT_HOST_PATH"' 2>/dev/null || true)
+    HOSTPATH=${HOSTPATH:-/workspace/${CONTAINER_NAME#devbox-}}
+    FOLDER_URI="vscode-remote://attached-container+${HEX}$(url_encode_path "$HOSTPATH")"
 
     echo "Opening Cursor attached to $CONTAINER_NAME..."
     cursor --folder-uri "$FOLDER_URI"
@@ -613,14 +642,16 @@ if [ "$MODE" = "code" ]; then
         CONTAINER_NAME="$selected"
     fi
 
-    # Build attached-container URI for VS Code
+    # Build attached-container URI for VS Code (see Cursor block for fallback rationale).
     ATTACH_JSON="{\"containerName\":\"/${CONTAINER_NAME}\"}"
     if command -v xxd &>/dev/null; then
         HEX=$(printf '%s' "$ATTACH_JSON" | xxd -p | tr -d '\n')
     else
         HEX=$(printf '%s' "$ATTACH_JSON" | od -A n -t x1 | tr -d ' \n')
     fi
-    FOLDER_URI="vscode-remote://attached-container+${HEX}/workspace/${CONTAINER_NAME#devbox-}"
+    HOSTPATH=$(docker exec "$CONTAINER_NAME" sh -c 'printf %s "$DEVBOX_PROJECT_HOST_PATH"' 2>/dev/null || true)
+    HOSTPATH=${HOSTPATH:-/workspace/${CONTAINER_NAME#devbox-}}
+    FOLDER_URI="vscode-remote://attached-container+${HEX}$(url_encode_path "$HOSTPATH")"
 
     echo "Opening VS Code attached to $CONTAINER_NAME..."
     code --folder-uri "$FOLDER_URI"
@@ -1315,8 +1346,12 @@ CLIPBOARD_DIR="$HOME/.clipboard-images"
 mkdir -p "$CLIPBOARD_DIR"
 DOCKER_ARGS+=(-v "$CLIPBOARD_DIR:/home/node/.clipboard-images")
 
-# Mount workspace
-DOCKER_ARGS+=(-v "$PROJECT_PATH:/workspace/$(sanitize "$PROJECT_NAME")")
+# Mount workspace at the host's absolute path. The entrypoint creates
+# $HOST_HOME as a real directory mirroring /home/node, so binding under it
+# produces a real subdir whose canonical path (getcwd(2)) matches the host
+# path — which is what plugin/session parity hinges on (see docs/adr/0004).
+DOCKER_ARGS+=(-v "$PROJECT_PATH:$PROJECT_PATH")
+DOCKER_ARGS+=(-e "DEVBOX_PROJECT_HOST_PATH=$PROJECT_PATH")
 
 # --- Start detached container ------------------------------------------------
 
@@ -1365,7 +1400,7 @@ if docker volume inspect "devbox-codex-bin" >/dev/null 2>&1; then
     fi
 fi
 
-echo "Mounting project: $PROJECT_PATH -> /workspace/$(sanitize "$PROJECT_NAME") ($CONTAINER_NAME)"
+echo "Mounting project: $PROJECT_PATH ($CONTAINER_NAME)"
 echo "Starting devbox..."
 
 # Start container in background
@@ -1394,4 +1429,4 @@ docker exec -u node "$CONTAINER_NAME" bash -c \
 
 # Attach first interactive session
 set_tab_title "$PROJECT_NAME"
-exec docker exec -it -u node -w "/workspace/$(sanitize "$PROJECT_NAME")" "$CONTAINER_NAME" zsh
+exec docker exec -it -u node -w "$PROJECT_PATH" "$CONTAINER_NAME" zsh

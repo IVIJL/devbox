@@ -18,67 +18,138 @@ for arg in "$@"; do
     esac
 done
 
+# Rewrite the top-level .cwd JSON field in every *.jsonl in $dir from $from to
+# $to. Only the structural .cwd field — string occurrences inside text content
+# (tool inputs, transcripts) are preserved by going through jq, not sed.
+rewrite_cwd_in_jsonl() {
+    local dir="$1" from="$2" to="$3" f count=0
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}Warning: jq not found, skipping .cwd rewrite in $(basename "$dir")${NC}"
+        return 0
+    fi
+    shopt -s nullglob
+    for f in "$dir"/*.jsonl; do
+        # Cheap pre-filter avoids rewriting files that don't contain the stale value.
+        if grep -q "\"cwd\":\"$from\"" "$f"; then
+            jq -c --arg from "$from" --arg to "$to" \
+                'if .cwd == $from then .cwd = $to else . end' "$f" > "$f.tmp" \
+                && mv "$f.tmp" "$f"
+            count=$((count + 1))
+        fi
+    done
+    shopt -u nullglob
+    if [ "$count" -gt 0 ]; then
+        echo "  Rewrote .cwd in $count jsonl file(s) under $(basename "$dir")"
+    fi
+}
+
 # Translate /workspace-keyed session/project subdirs in ~/.claude to host-path
-# encoding so /resume picks them up under Phase 2's host-path CWD.
-# Idempotent and opt-in: skipping a project leaves its data on disk under the
-# old key, recoverable manually later.
+# encoding so /resume picks them up under Phase 2's host-path CWD. Two passes:
+#   A) -workspace-<name> dirs that were never renamed → rename + rewrite .cwd
+#   B) already-renamed dirs whose jsonl still holds /workspace/<name> .cwd
+#      (heal pass for installs that ran an older translate-keys that only
+#      renamed the dir without touching contents)
+# Idempotent and opt-in: skipping a project leaves its data as-is.
 translate_workspace_keys() {
     echo
     echo -e "${CYAN}=== Phase 2: session/project key translation ===${NC}"
     echo "Container CWD changed from /workspace/<project> to your host project path."
-    echo "Old session/project subdirs keyed by /workspace/* would be invisible to /resume."
+    echo "Old subdirs keyed by /workspace/* and stale .cwd inside jsonl would be invisible to /resume."
     echo
 
     mapfile -t old_keys < <(find "$HOME/.claude/sessions" "$HOME/.claude/projects" \
-        -maxdepth 1 -type d -name '-workspace-*' 2>/dev/null | sort -u)
+        -mindepth 1 -maxdepth 1 -type d -name '-workspace-*' 2>/dev/null | sort -u)
 
-    if [ ${#old_keys[@]} -eq 0 ]; then
-        echo "No /workspace-keyed sessions to translate. Done."
+    mapfile -t stale_dirs < <(
+        find "$HOME/.claude/sessions" "$HOME/.claude/projects" \
+            -mindepth 1 -maxdepth 1 -type d ! -name '-workspace*' ! -name '.*' 2>/dev/null \
+        | while IFS= read -r d; do
+            if grep -lq '"cwd":"/workspace/' "$d"/*.jsonl 2>/dev/null; then
+                printf '%s\n' "$d"
+            fi
+        done | sort -u
+    )
+
+    if [ ${#old_keys[@]} -eq 0 ] && [ ${#stale_dirs[@]} -eq 0 ]; then
+        echo "Nothing to translate. Done."
         return 0
     fi
 
-    echo "Found old session/project subdirs:"
-    printf '  %s\n' "${old_keys[@]}"
+    if [ ${#old_keys[@]} -gt 0 ]; then
+        echo "Old /workspace-keyed dirs (will rename + rewrite .cwd):"
+        printf '  %s\n' "${old_keys[@]}"
+    fi
+    if [ ${#stale_dirs[@]} -gt 0 ]; then
+        echo "Renamed dirs with stale .cwd inside jsonl (will rewrite .cwd):"
+        printf '  %s\n' "${stale_dirs[@]}"
+    fi
     echo
-    echo "To translate, you must tell me where each project lives on your host."
+
     if [ "$AUTO" = true ]; then
         echo "(auto mode: skipping translation — run 'devbox migrate --translate-keys' to do it interactively)"
         return 0
     fi
-    read -rp "Translate now? [y/N] " ans
+    # `|| ans=""` so EOF on stdin (closed pipe, Ctrl-D) cleanly skips instead
+    # of tripping `set -e`. Same pattern on every read in this function.
+    read -rp "Translate now? [y/N] " ans || ans=""
     if ! [[ "$ans" =~ ^[Yy] ]]; then
-        echo "Skipped. Old data remains on disk under -workspace- keys."
+        echo "Skipped. Old data left as-is."
         return 0
     fi
 
-    declare -A name_to_key
-    for dir in "${old_keys[@]}"; do
-        name=$(basename "$dir" | sed 's/^-workspace-//')
-        [ -n "${name_to_key[$name]:-}" ] && continue
+    # One root prompt up front: most people keep all projects under one parent
+    # (~/Projekty, ~/src, ~/work). When set, <root>/<name> is auto-resolved
+    # without a per-project prompt; only unmatched names fall through to ask.
+    echo
+    read -rp "Common project root (e.g. /home/vlcak/Projekty), empty to prompt per project: " projects_root || projects_root=""
+    projects_root="${projects_root%/}"
 
+    # Collect every project NAME we need to resolve, from both passes.
+    declare -A name_seen
+    for dir in "${old_keys[@]}"; do
+        n=$(basename "$dir" | sed 's/^-workspace-//')
+        name_seen[$n]=1
+    done
+    for dir in "${stale_dirs[@]}"; do
+        while IFS= read -r n; do
+            [ -n "$n" ] && name_seen[$n]=1
+        done < <(grep -oh '"cwd":"/workspace/[^"]*"' "$dir"/*.jsonl 2>/dev/null \
+            | sed 's|"cwd":"/workspace/||;s|"$||' | sort -u)
+    done
+
+    # Resolve each name to its host path: auto under root, else prompt.
+    declare -A name_to_path
+    for name in "${!name_seen[@]}"; do
+        if [ -n "$projects_root" ] && [ -d "$projects_root/$name" ]; then
+            name_to_path[$name]="$projects_root/$name"
+            echo "  '$name' → $projects_root/$name (auto-detected under root)"
+            continue
+        fi
         echo
-        read -rp "Host path for project '$name' (empty to skip): " hostpath
+        read -rp "Host path for project '$name' (empty to skip): " hostpath || hostpath=""
         if [ -z "$hostpath" ]; then
-            name_to_key[$name]="SKIP"
+            name_to_path[$name]="SKIP"
             continue
         fi
         if [ ! -d "$hostpath" ]; then
-            echo "Path doesn't exist, skipping."
-            name_to_key[$name]="SKIP"
+            echo "  Path doesn't exist, skipping '$name'."
+            name_to_path[$name]="SKIP"
             continue
         fi
+        name_to_path[$name]="$hostpath"
+    done
+
+    # Pass A: rename/merge -workspace-<name> dirs and rewrite .cwd inside.
+    for dir in "${old_keys[@]}"; do
+        name=$(basename "$dir" | sed 's/^-workspace-//')
+        hostpath="${name_to_path[$name]:-SKIP}"
+        [ "$hostpath" = "SKIP" ] && continue
+
         # Encode host path: /home/vlcak/Projekty/devbox → -home-vlcak-Projekty-devbox
         new_key="-${hostpath#/}"
         new_key="${new_key//\//-}"
-        name_to_key[$name]="$new_key"
-    done
-
-    for dir in "${old_keys[@]}"; do
-        name=$(basename "$dir" | sed 's/^-workspace-//')
-        [ "${name_to_key[$name]}" = "SKIP" ] && continue
-
         parent=$(dirname "$dir")
-        new_dir="$parent/${name_to_key[$name]}"
+        new_dir="$parent/$new_key"
 
         if [ -e "$new_dir" ]; then
             rsync -a --ignore-existing "$dir/" "$new_dir/"
@@ -88,6 +159,19 @@ translate_workspace_keys() {
             mv "$dir" "$new_dir"
             echo "Renamed $dir -> $new_dir"
         fi
+
+        rewrite_cwd_in_jsonl "$new_dir" "/workspace/$name" "$hostpath"
+    done
+
+    # Pass B: heal already-renamed dirs by rewriting stale .cwd fields inside.
+    for dir in "${stale_dirs[@]}"; do
+        mapfile -t stale_names < <(grep -oh '"cwd":"/workspace/[^"]*"' "$dir"/*.jsonl 2>/dev/null \
+            | sed 's|"cwd":"/workspace/||;s|"$||' | sort -u)
+        for name in "${stale_names[@]}"; do
+            hostpath="${name_to_path[$name]:-SKIP}"
+            [ "$hostpath" = "SKIP" ] && continue
+            rewrite_cwd_in_jsonl "$dir" "/workspace/$name" "$hostpath"
+        done
     done
 
     echo -e "${GREEN}Translation complete.${NC}"

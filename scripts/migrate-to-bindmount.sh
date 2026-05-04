@@ -21,8 +21,13 @@ done
 # Rewrite the top-level .cwd JSON field in every *.jsonl in $dir from $from to
 # $to. Only the structural .cwd field — string occurrences inside text content
 # (tool inputs, transcripts) are preserved by going through jq, not sed.
+#
+# After rewrite, restore mtime to the latest "timestamp" entry inside the
+# jsonl. /resume sorts by file mtime, and `jq > tmp && mv` would otherwise
+# stamp every touched session with the migration moment, collapsing them all
+# to "X minutes ago" in the picker.
 rewrite_cwd_in_jsonl() {
-    local dir="$1" from="$2" to="$3" f count=0
+    local dir="$1" from="$2" to="$3" f max_ts count=0
     if ! command -v jq >/dev/null 2>&1; then
         echo -e "  ${YELLOW}Warning: jq not found, skipping .cwd rewrite in $(basename "$dir")${NC}"
         return 0
@@ -34,6 +39,8 @@ rewrite_cwd_in_jsonl() {
             jq -c --arg from "$from" --arg to "$to" \
                 'if .cwd == $from then .cwd = $to else . end' "$f" > "$f.tmp" \
                 && mv "$f.tmp" "$f"
+            max_ts=$(grep -oE '"timestamp":"[^"]+"' "$f" | sed 's/"timestamp":"//;s/"$//' | sort -u | tail -1)
+            [ -n "$max_ts" ] && touch -d "$max_ts" "$f"
             count=$((count + 1))
         fi
     done

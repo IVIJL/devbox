@@ -71,6 +71,12 @@ TRAEFIK_CONFIG_DIR="$HOME/.config/devbox/traefik/dynamic"
 # shellcheck source=lib/allowlist.sh
 source "$DEVBOX_DIR/lib/allowlist.sh"
 
+# Naming module — owns the format of container names, volumes, hostname,
+# workspace alias and traefik route hosts. See lib/naming.sh and
+# docs/adr/0005-project-naming-from-sanitized-basename.md.
+# shellcheck source=lib/naming.sh
+source "$DEVBOX_DIR/lib/naming.sh"
+
 # Migrate from old ~/.devbox to ~/.config/devbox
 if [ -d "$HOME/.devbox" ] && [ ! -d "$HOME/.config/devbox" ]; then
     echo "Migrating config: ~/.devbox → ~/.config/devbox"
@@ -79,10 +85,6 @@ if [ -d "$HOME/.devbox" ] && [ ! -d "$HOME/.config/devbox" ]; then
 fi
 
 # --- Helper functions --------------------------------------------------------
-
-sanitize() {
-    echo "$1" | tr -cs 'a-zA-Z0-9_.-' '-' | sed 's/^-//;s/-$//'
-}
 
 # Percent-encode a filesystem path for embedding in a URI path component.
 # RFC 3986 unreserved chars and `/` pass through; everything else is
@@ -177,7 +179,8 @@ apply_port_routes() {
         port="${port%%#*}"
         [ -z "$port" ] && continue
 
-        local host_rule="${port}.${project}.127.0.0.1.traefik.me"
+        local host_rule
+        host_rule="$(devbox::route_host "$project" "$port")"
         local config_file="${TRAEFIK_CONFIG_DIR}/${container}-${port}.yml"
         local router_name="${container}-${port}"
 
@@ -270,8 +273,9 @@ list_running_containers() {
     else
         printf '%-25s %-50s %s\n' "NAME" "URL" "STATUS"
         while IFS=$'\t' read -r name status running; do
-            local project="${name#devbox-}"
-            local url="http://<port>.${project}.127.0.0.1.traefik.me"
+            local project url
+            project="${name#devbox-}"
+            url="http://$(devbox::route_host "$project" '<port>')"
             printf '%-25s %-50s %s\n' "$name" "$url" "$status"
         done <<< "$containers"
     fi
@@ -583,11 +587,11 @@ if [ "$MODE" = "cursor" ]; then
 
     # Determine target container
     if [ -n "${CURSOR_TARGET:-}" ]; then
-        CONTAINER_NAME="devbox-$(sanitize "$CURSOR_TARGET")"
+        devbox::names_from_token "$CURSOR_TARGET"
     else
-        PROJECT_NAME="$(sanitize "$(basename "$(pwd)")")"
-        CONTAINER_NAME="devbox-${PROJECT_NAME}"
+        devbox::names_from_path "$(pwd)"
     fi
+    CONTAINER_NAME="$DEVBOX_CONTAINER_NAME"
 
     # Verify container is running
     if ! docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.Names}}' | grep -q .; then
@@ -628,11 +632,11 @@ if [ "$MODE" = "code" ]; then
 
     # Determine target container
     if [ -n "${CODE_TARGET:-}" ]; then
-        CONTAINER_NAME="devbox-$(sanitize "$CODE_TARGET")"
+        devbox::names_from_token "$CODE_TARGET"
     else
-        PROJECT_NAME="$(sanitize "$(basename "$(pwd)")")"
-        CONTAINER_NAME="devbox-${PROJECT_NAME}"
+        devbox::names_from_path "$(pwd)"
     fi
+    CONTAINER_NAME="$DEVBOX_CONTAINER_NAME"
 
     # Verify container is running
     if ! docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.Names}}' | grep -q .; then
@@ -695,7 +699,7 @@ if [ "$MODE" = "port" ]; then
     while IFS= read -r container; do
         [ -z "$container" ] && continue
         local_project="${container#devbox-}"
-        echo "  http://${PORT_NUM}.${local_project}.127.0.0.1.traefik.me → ${container}:${PORT_NUM}"
+        echo "  http://$(devbox::route_host "$local_project" "$PORT_NUM") → ${container}:${PORT_NUM}"
     done <<< "$running"
     exit 0
 fi
@@ -727,18 +731,19 @@ fi
 if [ "$MODE" = "stop" ]; then
     remove_project_volumes() {
         local proj="$1"
-        for suffix in docker history; do
-            docker volume rm "devbox-${proj}-${suffix}" > /dev/null 2>&1 || true
+        for suffix in "${DEVBOX_PROJECT_VOLUME_SUFFIXES[@]}"; do
+            docker volume rm "$(devbox::volume_name "$proj" "$suffix")" > /dev/null 2>&1 || true
         done
     }
 
     if [ -n "$PROJECT_FILTER" ]; then
-        name="devbox-${PROJECT_FILTER}"
+        devbox::names_from_token "$PROJECT_FILTER"
+        name="$DEVBOX_CONTAINER_NAME"
         if docker ps -a --filter "name=^${name}$" --format '{{.ID}}' | grep -q .; then
             graceful_stop_container "$name"
             docker rm "$name" > /dev/null
             if [ "$CLEAN_VOLUMES" = true ]; then
-                remove_project_volumes "$PROJECT_FILTER"
+                remove_project_volumes "$DEVBOX_PROJECT_NAME"
                 echo "Zastaven + odstraněna data: $name"
             else
                 echo "Zastaven: $name"
@@ -791,8 +796,9 @@ if [ "$MODE" = "remove" ]; then
     remove_project_data() {
         local proj="$1"
         local found=false
-        for suffix in docker history; do
-            local vol="devbox-${proj}-${suffix}"
+        for suffix in "${DEVBOX_PROJECT_VOLUME_SUFFIXES[@]}"; do
+            local vol
+            vol="$(devbox::volume_name "$proj" "$suffix")"
             if docker volume inspect "$vol" > /dev/null 2>&1; then
                 docker volume rm "$vol" > /dev/null
                 echo "  Smazán volume: $vol"
@@ -805,21 +811,38 @@ if [ "$MODE" = "remove" ]; then
         fi
     }
 
-    # Find projects that have per-project volumes
+    # Find projects that have per-project volumes. The suffix-strip sed mirrors
+    # DEVBOX_PROJECT_VOLUME_SUFFIXES — keep them in sync if a suffix is added.
     list_projects_with_volumes() {
         docker volume ls -q --filter "name=devbox-" 2>/dev/null \
-            | grep -E -- '^devbox-.+-(docker|history)$' \
+            | grep -E -- "$(devbox::project_volume_regex)" \
             | sed 's/^devbox-//;s/-\(docker\|history\)$//' \
             | sort -u || true
     }
 
     if [ -n "$PROJECT_FILTER" ]; then
-        if is_project_running "$PROJECT_FILTER"; then
-            echo "Kontejner devbox-${PROJECT_FILTER} běží — nejdřív ho zastav." >&2
+        # Legacy un-sanitized volumes (created before sanitize-end-to-end)
+        # remain reachable: prefer the literal token when a matching volume
+        # exists, otherwise use the sanitized form for the current convention.
+        target="$PROJECT_FILTER"
+        legacy_match=false
+        for suffix in "${DEVBOX_PROJECT_VOLUME_SUFFIXES[@]}"; do
+            if docker volume inspect "devbox-${PROJECT_FILTER}-${suffix}" >/dev/null 2>&1; then
+                legacy_match=true
+                break
+            fi
+        done
+        if [ "$legacy_match" = false ]; then
+            devbox::names_from_token "$PROJECT_FILTER"
+            target="$DEVBOX_PROJECT_NAME"
+        fi
+
+        if is_project_running "$target"; then
+            echo "Kontejner devbox-${target} běží — nejdřív ho zastav." >&2
             exit 1
         fi
-        echo "Odstraňuji data projektu: $PROJECT_FILTER"
-        remove_project_data "$PROJECT_FILTER"
+        echo "Odstraňuji data projektu: $target"
+        remove_project_data "$target"
         exit $?
     fi
 
@@ -1139,8 +1162,21 @@ done
 if [ -d "${1:-.}" ]; then
     # Argument is a directory (or none → CWD) → create/attach mode
     PROJECT_PATH="$(realpath "${1:-.}")"
-    PROJECT_NAME="$(basename "$PROJECT_PATH")"
-    CONTAINER_NAME="devbox-$(sanitize "$PROJECT_NAME")"
+    devbox::names_from_path "$PROJECT_PATH"
+    PROJECT_NAME="$DEVBOX_PROJECT_NAME"
+    CONTAINER_NAME="$DEVBOX_CONTAINER_NAME"
+
+    # Warn about legacy (un-sanitized) volumes from an earlier devbox layout.
+    # Reverse derivation never matched these, so `devbox reset/remove` couldn't
+    # find them. No auto-rename — user removes manually with `docker volume rm`.
+    if [ "$DEVBOX_PROJECT_NAME_RAW" != "$DEVBOX_PROJECT_NAME" ]; then
+        for suffix in "${DEVBOX_PROJECT_VOLUME_SUFFIXES[@]}"; do
+            legacy_vol="devbox-${DEVBOX_PROJECT_NAME_RAW}-${suffix}"
+            if docker volume inspect "$legacy_vol" >/dev/null 2>&1; then
+                echo "WARNING: legacy volume '${legacy_vol}' found — remove with: docker volume rm '${legacy_vol}'" >&2
+            fi
+        done
+    fi
 
     if docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.ID}}' | grep -q .; then
         if [ "$SSH_CONFIG_MOUNT" = true ]; then
@@ -1163,8 +1199,9 @@ if [ -d "${1:-.}" ]; then
 
     # Container not running → create new one (detached) below
 else
-    # Argument is not a directory → attach by name
-    CONTAINER_NAME="devbox-${1}"
+    # Argument is not a directory → attach by name (idempotent sanitize)
+    devbox::names_from_token "$1"
+    CONTAINER_NAME="$DEVBOX_CONTAINER_NAME"
     if docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.ID}}' | grep -q .; then
         attach_to_container "$CONTAINER_NAME"
     elif docker ps -a --filter "name=^${CONTAINER_NAME}$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
@@ -1226,7 +1263,7 @@ bootstrap_traefik
 # --- Build docker arguments -------------------------------------------------
 
 DOCKER_ARGS=(
-    --hostname "$PROJECT_NAME"
+    --hostname "$DEVBOX_HOSTNAME"
     --network devproxy
     # Entrypoint needs root to set up firewall + symlinks, then drops to node
     # via runuser. See scripts/devbox-entrypoint.sh and docs/adr/0003.
@@ -1240,15 +1277,15 @@ DOCKER_ARGS=(
     --device=/dev/net/tun
     --device=/dev/fuse
     # Per-project volumes
-    -v "devbox-${PROJECT_NAME}-history:/home/node/.local/share/atuin"
-    -v "devbox-${PROJECT_NAME}-docker:/home/node/.local/share/docker"
+    -v "${DEVBOX_VOL_HISTORY}:/home/node/.local/share/atuin"
+    -v "${DEVBOX_VOL_DOCKER}:/home/node/.local/share/docker"
     # Shared volumes
     -v devbox-nvim-data:/home/node/.local/share/nvim
     -v devbox-npm-global:/usr/local/share/npm-global
     -v devbox-cursor-server:/home/node/.cursor-server
     -v devbox-vscode-server:/home/node/.vscode-server
     -e CLAUDE_CONFIG_DIR=/home/node/.claude
-    -e "DEVBOX_PROJECT_NAME=$(sanitize "$PROJECT_NAME")"
+    -e "DEVBOX_PROJECT_NAME=$DEVBOX_PROJECT_NAME"
 )
 
 # Git config from host (staging path — copied to /etc/gitconfig by entrypoint
@@ -1416,7 +1453,7 @@ if [ -f "$ports_file" ] && [ -s "$ports_file" ]; then
     while read -r port _rest; do
         port="${port%%#*}"
         [ -z "$port" ] && continue
-        echo "  http://${port}.${PROJECT_NAME}.127.0.0.1.traefik.me → ${CONTAINER_NAME}:${port}"
+        echo "  http://$(devbox::route_host "$PROJECT_NAME" "$port") → ${CONTAINER_NAME}:${port}"
     done < "$ports_file"
 else
     echo "  Set port: devbox port <port>"

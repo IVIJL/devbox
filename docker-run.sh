@@ -77,6 +77,12 @@ source "$DEVBOX_DIR/lib/allowlist.sh"
 # shellcheck source=lib/naming.sh
 source "$DEVBOX_DIR/lib/naming.sh"
 
+# Picker module — single + multi interactive selection with consistent UX
+# across fzf and the no-fzf fallback. See lib/picker.sh and
+# docs/adr/0006-interactive-picker-conventions.md.
+# shellcheck source=lib/picker.sh
+source "$DEVBOX_DIR/lib/picker.sh"
+
 # Migrate from old ~/.devbox to ~/.config/devbox
 if [ -d "$HOME/.devbox" ] && [ ! -d "$HOME/.config/devbox" ]; then
     echo "Migrating config: ~/.devbox → ~/.config/devbox"
@@ -315,12 +321,11 @@ reload_firewall_in_containers() {
     done <<< "$containers"
 }
 
-# Interactive container picker
-# $1 = prompt text, $2 = optionally "with_all" to add "stop all" option
-# Returns selected name on stdout, returns 1 on cancel/empty
+# Thin wrapper around picker::one for devbox containers.
+# $1 = prompt text, $2 = optionally "with_all" to add "stop all" sentinel.
+# Returns selected name on stdout, 1 on cancel/empty.
 pick_container() {
-    local prompt="$1"
-    local with_all="${2:-}"
+    local prompt="$1" with_all="${2:-}"
     local running
     running=$(docker ps -a --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
 
@@ -329,26 +334,9 @@ pick_container() {
         return 1
     fi
 
-    local options="$running"
-    if [ "$with_all" = "with_all" ]; then
-        options=$(printf '%s\n%s' "$running" "* Zastavit všechny")
-    fi
-
-    if command -v fzf &>/dev/null; then
-        echo "$options" | fzf --prompt="$prompt" || return 1
-    else
-        # Fallback: numbered menu
-        echo "" >&2
-        local i=1
-        while IFS= read -r line; do
-            echo "  $i) $line" >&2
-            i=$((i + 1))
-        done <<< "$options"
-        echo "" >&2
-        printf "%s" "$prompt" >&2
-        read -r choice
-        sed -n "${choice}p" <<< "$options"
-    fi
+    local args=(--prompt "$prompt")
+    [ "$with_all" = "with_all" ] && args+=(--first-option "* Zastavit všechny")
+    printf '%s\n' "$running" | picker::one "${args[@]}"
 }
 
 # Open an IDE attached to a devbox container ($1 = cursor|code, $2 = optional target).
@@ -843,27 +831,8 @@ if [ "$MODE" = "remove" ]; then
         exit 0
     fi
 
-    options=$(printf "* Odstranit všechny\n%s" "$projects")
-    if command -v fzf &>/dev/null; then
-        selected=$(echo "$options" | fzf --prompt="Odstranit projekt: ") || exit 1
-    else
-        echo "" >&2
-        echo "Projekty s volumes:" >&2
-        i=1
-        while IFS= read -r line; do
-            echo "  $i) $line" >&2
-            i=$((i + 1))
-        done <<< "$options"
-        echo "" >&2
-        printf "Vyberte projekt k odstranění: " >&2
-        read -r choice
-        selected=$(sed -n "${choice}p" <<< "$options")
-    fi
-
-    if [ -z "$selected" ]; then
-        echo "Neplatná volba." >&2
-        exit 1
-    fi
+    selected=$(printf '%s\n' "$projects" \
+        | picker::one --prompt "Odstranit projekt:" --first-option "* Odstranit všechny") || exit 1
 
     if [ "$selected" = "* Odstranit všechny" ]; then
         while IFS= read -r proj; do
@@ -945,39 +914,14 @@ if [ "$MODE" = "blocked" ]; then
         exit 0
     fi
 
-    # Build menu
     declare -a domains=()
     while IFS= read -r d; do
         [ -z "$d" ] && continue
         domains+=("$d")
     done <<< "$blocked"
 
-    if command -v fzf &>/dev/null; then
-        options=$(printf "* Povolit všechny\n%s" "$blocked")
-        selected=$(echo "$options" | fzf --prompt="Povolit doménu: " --multi) || exit 1
-    else
-        echo "Blokované domény:"
-        echo ""
-        for i in "${!domains[@]}"; do
-            echo "  $((i + 1))) ${domains[$i]}"
-        done
-        echo "  a) Povolit všechny"
-        echo "  q) Zrušit"
-        echo ""
-        printf "Vyber (číslo/a/q): "
-        read -r choice
-
-        if [ "$choice" = "q" ]; then
-            exit 0
-        elif [ "$choice" = "a" ]; then
-            selected="* Povolit všechny"
-        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#domains[@]}" ]; then
-            selected="${domains[$((choice - 1))]}"
-        else
-            echo "Neplatná volba." >&2
-            exit 1
-        fi
-    fi
+    selected=$(printf '%s\n' "${domains[@]}" \
+        | picker::many --prompt "Povolit doménu:" --first-option "* Povolit všechny") || exit 1
 
     while IFS= read -r sel; do
         if [ "$sel" = "* Povolit všechny" ]; then
@@ -1030,34 +974,9 @@ if [ "$MODE" = "deny" ]; then
     DENIED=""
 
     if [ -z "${DOMAIN:-}" ]; then
-        # Interactive selection
         runtime=$(allowlist::read "$ALLOWLIST_HOST_FILE" | sort)
-        if command -v fzf &>/dev/null; then
-            selected=$(echo "$runtime" | fzf --prompt="Odebrat doménu: " --multi) || exit 1
-        else
-            echo "Runtime domény:"
-            echo ""
-            declare -a items=()
-            while IFS= read -r d; do
-                [ -z "$d" ] && continue
-                items+=("$d")
-            done <<< "$runtime"
-            for i in "${!items[@]}"; do
-                echo "  $((i + 1))) ${items[$i]}"
-            done
-            echo "  q) Zrušit"
-            echo ""
-            printf "Vyber (číslo/q): "
-            read -r choice
-            if [ "$choice" = "q" ]; then
-                exit 0
-            elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#items[@]}" ]; then
-                selected="${items[$((choice - 1))]}"
-            else
-                echo "Neplatná volba." >&2
-                exit 1
-            fi
-        fi
+        selected=$(printf '%s\n' "$runtime" \
+            | picker::many --prompt "Odebrat doménu:") || exit 1
 
         while IFS= read -r sel; do
             [ -z "$sel" ] && continue

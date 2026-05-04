@@ -8,19 +8,20 @@ set -euo pipefail
 DEFAULTS="/etc/claude-defaults"
 TARGET="/home/node/.claude"
 PROJECT_NAME="${DEVBOX_PROJECT_NAME:-}"
+seeded=0
 
 [ -d "$DEFAULTS" ] || { echo "No claude defaults found, skipping"; exit 0; }
 
 # Seed devbox defaults only when the host has no equivalent file. Host files
 # always win — atomic-rename refresh from host or any container is visible to
 # all instances via the shared bind mount.
-[ -f "$TARGET/settings.json" ] || cp "$DEFAULTS/settings.json" "$TARGET/settings.json"
-[ -f "$TARGET/statusline-info.sh" ] || cp "$DEFAULTS/statusline-info.sh" "$TARGET/statusline-info.sh"
+[ -f "$TARGET/settings.json" ] || { cp "$DEFAULTS/settings.json" "$TARGET/settings.json"; seeded=$((seeded+1)); }
+[ -f "$TARGET/statusline-info.sh" ] || { cp "$DEFAULTS/statusline-info.sh" "$TARGET/statusline-info.sh"; seeded=$((seeded+1)); }
 
 mkdir -p "$TARGET/hooks"
 for hook in "$DEFAULTS/hooks/"*.sh; do
     name=$(basename "$hook")
-    [ -f "$TARGET/hooks/$name" ] || cp "$hook" "$TARGET/hooks/$name"
+    [ -f "$TARGET/hooks/$name" ] || { cp "$hook" "$TARGET/hooks/$name"; seeded=$((seeded+1)); }
 done
 
 # Backwards-compat: keep /workspace/<projectname> as an alias for the actual
@@ -91,4 +92,8 @@ if [ -d /home/node/.local/share/claude/versions ]; then
     fi
 fi
 
-echo "Claude Code config seeded"
+if [ "$seeded" -gt 0 ]; then
+    echo "Claude Code config seeded ($seeded file(s))"
+else
+    echo "Claude Code config OK"
+fi

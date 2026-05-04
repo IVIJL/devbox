@@ -11,8 +11,8 @@ and divergent UX:
 | Site             | Mode  | "Expand all" sentinel    | Fallback shortcuts        |
 |------------------|-------|--------------------------|---------------------------|
 | `pick_container` | one   | optional `with_all`      | numbered only             |
-| `remove`         | one   | always "* Odstranit všechny" | numbered only         |
-| `blocked`        | many (fzf) | "* Povolit všechny" | numbered + `a`/`q`        |
+| `remove`         | one   | always "* Remove all"    | numbered only             |
+| `blocked`        | many (fzf) | "* Allow all"       | numbered + `a`/`q`        |
 | `deny`           | many (fzf) | none                | numbered + `q`, **single-only fallback** |
 
 Each site re-implemented `command -v fzf` detection, the numbered fallback

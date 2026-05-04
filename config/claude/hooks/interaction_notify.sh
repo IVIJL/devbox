@@ -35,7 +35,7 @@ fi
 # This might need refinement based on actual usage patterns
 if echo "$*" | grep -qi "potvrdit\|schválit\|povolit\|souhlasit"; then
     INTERACTION_NEEDED=true
-    log_message "Czech interaction keywords detected"
+    log_message "Interaction keywords (cs) detected"
 fi
 
 # If interaction needed, send notification
@@ -52,7 +52,7 @@ if [ "$INTERACTION_NEEDED" = true ]; then
     ) &
 
     # Send ntfy notification (separate process with timeout)
-    MESSAGE="⏳ Claude čeká na tvoje potvrzení"
+    MESSAGE="⏳ Claude is waiting for your confirmation"
     (
         if [ -n "$TOKEN" ] && [ -n "$NTFY_URL" ]; then
             curl -s -o /dev/null -H "Authorization: Bearer $TOKEN" -d "$MESSAGE" "$NTFY_URL"

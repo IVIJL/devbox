@@ -90,9 +90,9 @@ if [ "$ERROR_DETECTED" = true ]; then
     ) &
 
     # Send ntfy notification (separate process with timeout)
-    MESSAGE="❌ Claude narazil na chybu při používání nástroje"
+    MESSAGE="❌ Claude hit an error while using a tool"
     if [ -n "$TOOL_NAME" ]; then
-        MESSAGE="❌ Claude narazil na chybu při používání: $TOOL_NAME"
+        MESSAGE="❌ Claude hit an error while using: $TOOL_NAME"
     fi
     log_message "Sending notification: $MESSAGE"
     (

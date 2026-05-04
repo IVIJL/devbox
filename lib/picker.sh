@@ -95,14 +95,14 @@ _picker::fallback() {
             printf "  %d) %s\n" "$((i + 1))" "${items[$i]}" >&2
         done
     fi
-    echo "  q) Zrušit" >&2
+    echo "  q) Cancel" >&2
     echo "" >&2
 
     local hint
     if [ "$mode" = many ]; then
-        hint="(čísla oddělená čárkou$([ "$has_first" = 1 ] && echo ", a")/q)"
+        hint="(comma-separated numbers$([ "$has_first" = 1 ] && echo ", a")/q)"
     else
-        hint="(číslo$([ "$has_first" = 1 ] && echo "/a")/q)"
+        hint="(number$([ "$has_first" = 1 ] && echo "/a")/q)"
     fi
     printf "%s %s: " "$prompt" "$hint" >&2
 
@@ -154,7 +154,7 @@ _picker::select() {
             printf '%s\n' "$first_option"
             return 0
         fi
-        echo "Neplatná volba: a" >&2
+        echo "Invalid choice: a" >&2
         return 1
     fi
 
@@ -170,7 +170,7 @@ _picker::select() {
         for idx in "${raw[@]}"; do
             idx="${idx// /}"
             if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "$max" ]; then
-                echo "Neplatná volba: $idx" >&2
+                echo "Invalid choice: $idx" >&2
                 return 1
             fi
             picked+=("${items[$((offset + idx - 1))]}")
@@ -178,7 +178,7 @@ _picker::select() {
         printf '%s\n' "${picked[@]}"
     else
         if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$max" ]; then
-            echo "Neplatná volba." >&2
+            echo "Invalid choice." >&2
             return 1
         fi
         printf '%s\n' "${items[$((offset + choice - 1))]}"

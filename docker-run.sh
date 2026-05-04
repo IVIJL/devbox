@@ -231,7 +231,7 @@ stop_traefik_if_idle() {
     if [ -z "$remaining" ] && docker ps --format '{{.Names}}' | grep -qx devbox-traefik; then
         docker stop devbox-traefik > /dev/null
         docker rm devbox-traefik > /dev/null
-        echo "Zastaven: devbox-traefik (žádné zbývající kontejnery)"
+        echo "Stopped: devbox-traefik (no remaining containers)"
     fi
 }
 
@@ -275,7 +275,7 @@ list_running_containers() {
     local containers
     containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}\t{{.Status}}\t{{.RunningFor}}' | grep -v '^devbox-traefik\b' || true)
     if [ -z "$containers" ]; then
-        echo "Žádné běžící devbox kontejnery."
+        echo "No running devbox containers."
     else
         printf '%-25s %-50s %s\n' "NAME" "URL" "STATUS"
         while IFS=$'\t' read -r name status running; do
@@ -330,12 +330,12 @@ pick_container() {
     running=$(docker ps -a --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
 
     if [ -z "$running" ]; then
-        echo "Žádné devbox kontejnery." >&2
+        echo "No devbox containers." >&2
         return 1
     fi
 
     local args=(--prompt "$prompt")
-    [ "$with_all" = "with_all" ] && args+=(--first-option "* Zastavit všechny")
+    [ "$with_all" = "with_all" ] && args+=(--first-option "* Stop all")
     printf '%s\n' "$running" | picker::one "${args[@]}"
 }
 
@@ -662,7 +662,7 @@ if [ "$MODE" = "port" ]; then
     # Apply to all running containers
     running=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
     if [ -z "$running" ]; then
-        echo "Port uložen do default-ports.conf. Žádné běžící kontejnery."
+        echo "Port saved to default-ports.conf. No running containers."
         exit 0
     fi
 
@@ -673,7 +673,7 @@ if [ "$MODE" = "port" ]; then
     done <<< "$running"
 
     # Print summary
-    echo "Route přidána pro všechny běžící kontejnery:"
+    echo "Route added to all running containers:"
     while IFS= read -r container; do
         [ -z "$container" ] && continue
         local_project="${container#devbox-}"
@@ -686,7 +686,7 @@ fi
 
 if [ "$MODE" = "ports" ]; then
     if [ ! -d "$TRAEFIK_CONFIG_DIR" ] || [ -z "$(ls -A "$TRAEFIK_CONFIG_DIR" 2>/dev/null)" ]; then
-        echo "Žádné aktivní port routy."
+        echo "No active port routes."
         exit 0
     fi
 
@@ -722,28 +722,28 @@ if [ "$MODE" = "stop" ]; then
             docker rm "$name" > /dev/null
             if [ "$CLEAN_VOLUMES" = true ]; then
                 remove_project_volumes "$DEVBOX_PROJECT_NAME"
-                echo "Zastaven + odstraněna data: $name"
+                echo "Stopped + data removed:$name"
             else
-                echo "Zastaven: $name"
+                echo "Stopped:$name"
             fi
             rm -f "$TRAEFIK_CONFIG_DIR/${name}"*.yml 2>/dev/null
             stop_traefik_if_idle
             exit 0
         fi
-        echo "Kontejner $name neběží." >&2
+        echo "Container $name is not running." >&2
     fi
     # No argument or container not found → interactive selection
-    selected=$(pick_container "Zastavit kontejner: " "with_all") || exit 1
-    if [ "$selected" = "* Zastavit všechny" ]; then
+    selected=$(pick_container "Stop container: " "with_all") || exit 1
+    if [ "$selected" = "* Stop all" ]; then
         docker ps -a --filter "name=^devbox-" --format '{{.Names}}' | { grep -v '^devbox-traefik$' || true; } | while IFS= read -r c; do
             proj="${c#devbox-}"
             graceful_stop_container "$c"
             docker rm "$c" > /dev/null
             if [ "$CLEAN_VOLUMES" = true ]; then
                 remove_project_volumes "$proj"
-                echo "Zastaven + odstraněna data: $c"
+                echo "Stopped + data removed:$c"
             else
-                echo "Zastaven: $c"
+                echo "Stopped:$c"
             fi
             rm -f "$TRAEFIK_CONFIG_DIR/${c}"*.yml 2>/dev/null
         done
@@ -754,9 +754,9 @@ if [ "$MODE" = "stop" ]; then
         docker rm "$selected" > /dev/null
         if [ "$CLEAN_VOLUMES" = true ]; then
             remove_project_volumes "$proj"
-            echo "Zastaven + odstraněna data: $selected"
+            echo "Stopped + data removed: $selected"
         else
-            echo "Zastaven: $selected"
+            echo "Stopped: $selected"
         fi
         rm -f "$TRAEFIK_CONFIG_DIR/${selected}"*.yml 2>/dev/null
         stop_traefik_if_idle
@@ -779,12 +779,12 @@ if [ "$MODE" = "remove" ]; then
             vol="$(devbox::volume_name "$proj" "$suffix")"
             if docker volume inspect "$vol" > /dev/null 2>&1; then
                 docker volume rm "$vol" > /dev/null
-                echo "  Smazán volume: $vol"
+                echo "  Removed volume: $vol"
                 found=true
             fi
         done
         if [ "$found" = false ]; then
-            echo "  Žádné volumes pro projekt $proj." >&2
+            echo "  No volumes for project $proj." >&2
             return 1
         fi
     }
@@ -816,10 +816,10 @@ if [ "$MODE" = "remove" ]; then
         fi
 
         if is_project_running "$target"; then
-            echo "Kontejner devbox-${target} běží — nejdřív ho zastav." >&2
+            echo "Container devbox-${target} is running — stop it first." >&2
             exit 1
         fi
-        echo "Odstraňuji data projektu: $target"
+        echo "Removing data for project: $target"
         remove_project_data "$target"
         exit $?
     fi
@@ -827,28 +827,28 @@ if [ "$MODE" = "remove" ]; then
     # Interactive: list projects with volumes
     projects=$(list_projects_with_volumes)
     if [ -z "$projects" ]; then
-        echo "Žádné devbox projektové volumes."
+        echo "No devbox project volumes."
         exit 0
     fi
 
     selected=$(printf '%s\n' "$projects" \
-        | picker::one --prompt "Odstranit projekt:" --first-option "* Odstranit všechny") || exit 1
+        | picker::one --prompt "Remove project:" --first-option "* Remove all") || exit 1
 
-    if [ "$selected" = "* Odstranit všechny" ]; then
+    if [ "$selected" = "* Remove all" ]; then
         while IFS= read -r proj; do
             if is_project_running "$proj"; then
-                echo "Kontejner devbox-${proj} běží — přeskakuji." >&2
+                echo "Container devbox-${proj} is running — skipping." >&2
                 continue
             fi
-            echo "Odstraňuji data projektu: $proj"
+            echo "Removing data for project: $proj"
             remove_project_data "$proj" || true
         done <<< "$projects"
     else
         if is_project_running "$selected"; then
-            echo "Kontejner devbox-${selected} běží — nejdřív ho zastav." >&2
+            echo "Container devbox-${selected} is running — stop it first." >&2
             exit 1
         fi
-        echo "Odstraňuji data projektu: $selected"
+        echo "Removing data for project: $selected"
         remove_project_data "$selected"
     fi
     exit 0
@@ -859,7 +859,7 @@ fi
 if [ "$MODE" = "blocked" ]; then
     containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
     if [ -z "$containers" ]; then
-        echo "Žádné běžící devbox kontejnery."
+        echo "No running devbox containers."
         exit 0
     fi
 
@@ -878,7 +878,7 @@ if [ "$MODE" = "blocked" ]; then
     all_queried=$(echo "$all_queried" | grep -v '^$' | sort -u)
 
     if [ -z "$all_queried" ]; then
-        echo "Žádné DNS dotazy v logu."
+        echo "No DNS queries in the log."
         exit 0
     fi
 
@@ -910,7 +910,7 @@ if [ "$MODE" = "blocked" ]; then
     blocked=$(echo "$blocked" | grep -v '^$' | sort -u)
 
     if [ -z "$blocked" ]; then
-        echo "Žádné blokované domény."
+        echo "No blocked domains."
         exit 0
     fi
 
@@ -921,10 +921,10 @@ if [ "$MODE" = "blocked" ]; then
     done <<< "$blocked"
 
     selected=$(printf '%s\n' "${domains[@]}" \
-        | picker::many --prompt "Povolit doménu:" --first-option "* Povolit všechny") || exit 1
+        | picker::many --prompt "Allow domain:" --first-option "* Allow all") || exit 1
 
     while IFS= read -r sel; do
-        if [ "$sel" = "* Povolit všechny" ]; then
+        if [ "$sel" = "* Allow all" ]; then
             for d in "${domains[@]}"; do
                 "$0" allow "$d"
             done
@@ -940,23 +940,23 @@ fi
 if [ "$MODE" = "allow" ]; then
     # No domain specified → list allowed domains
     if [ -z "${DOMAIN:-}" ]; then
-        echo "Povolené domény (~/.config/devbox/allowed-domains.conf):"
+        echo "Allowed domains (~/.config/devbox/allowed-domains.conf):"
         allowed_list=$(allowlist::read "$ALLOWLIST_HOST_FILE" | sort)
         if [ -n "$allowed_list" ]; then
             echo "$allowed_list" | while read -r d; do echo "  $d"; done
         else
-            echo "  (žádné)"
+            echo "  (none)"
         fi
         echo ""
-        echo "Použití: devbox allow <domain>  |  devbox deny <domain>"
-        echo "Pozn.: Záznam matchuje doménu i všechny její subdomény."
+        echo "Usage: devbox allow <domain>  |  devbox deny <domain>"
+        echo "Note: An entry matches the domain and all of its subdomains."
         exit 0
     fi
 
     if allowlist::add "$ALLOWLIST_HOST_FILE" "$DOMAIN"; then
-        echo "Povoleno: $DOMAIN (a všechny subdomény)"
+        echo "Allowed: $DOMAIN (and all subdomains)"
     else
-        echo "Již povoleno: $DOMAIN"
+        echo "Already allowed: $DOMAIN"
     fi
 
     reload_firewall_in_containers allow "$DOMAIN"
@@ -967,7 +967,7 @@ fi
 
 if [ "$MODE" = "deny" ]; then
     if [ ! -f "$ALLOWLIST_HOST_FILE" ] || [ -z "$(allowlist::read "$ALLOWLIST_HOST_FILE")" ]; then
-        echo "Žádné domény k odebrání."
+        echo "No domains to remove."
         exit 0
     fi
 
@@ -976,21 +976,21 @@ if [ "$MODE" = "deny" ]; then
     if [ -z "${DOMAIN:-}" ]; then
         runtime=$(allowlist::read "$ALLOWLIST_HOST_FILE" | sort)
         selected=$(printf '%s\n' "$runtime" \
-            | picker::many --prompt "Odebrat doménu:") || exit 1
+            | picker::many --prompt "Remove domain:") || exit 1
 
         while IFS= read -r sel; do
             [ -z "$sel" ] && continue
             if allowlist::remove "$ALLOWLIST_HOST_FILE" "$sel"; then
-                echo "Odebráno: $sel"
+                echo "Removed: $sel"
                 DENIED+="$sel "
             fi
         done <<< "$selected"
     else
         if allowlist::remove "$ALLOWLIST_HOST_FILE" "$DOMAIN"; then
-            echo "Odebráno: $DOMAIN"
+            echo "Removed: $DOMAIN"
             DENIED="$DOMAIN"
         else
-            echo "Doména $DOMAIN není v seznamu." >&2
+            echo "Domain $DOMAIN is not in the list." >&2
             exit 1
         fi
     fi
@@ -1007,19 +1007,19 @@ if [ "$MODE" = "ssh-config" ]; then
 
     case "${SSH_CONFIG_ACTION:-}" in
         add)
-            printf "Host alias (např. rep): "
+            printf "Host alias (e.g. rep): "
             read -r host_alias
-            [ -z "$host_alias" ] && { echo "Host alias je povinný." >&2; exit 1; }
+            [ -z "$host_alias" ] && { echo "Host alias is required." >&2; exit 1; }
 
-            printf "HostName (adresa serveru): "
+            printf "HostName (server address): "
             read -r hostname
-            [ -z "$hostname" ] && { echo "HostName je povinný." >&2; exit 1; }
+            [ -z "$hostname" ] && { echo "HostName is required." >&2; exit 1; }
 
-            printf "Port (výchozí 22): "
+            printf "Port (default 22): "
             read -r port
             port="${port:-22}"
 
-            printf "User (volitelné): "
+            printf "User (optional): "
             read -r ssh_user
 
             {
@@ -1030,7 +1030,7 @@ if [ "$MODE" = "ssh-config" ]; then
                 [ -n "$ssh_user" ] && echo "    User $ssh_user"
             } >> "$SSH_CONFIG_FILE"
 
-            echo "Přidáno do $SSH_CONFIG_FILE:"
+            echo "Added to $SSH_CONFIG_FILE:"
             echo "  Host $host_alias → $hostname${port:+ :$port}"
             ;;
         edit)
@@ -1046,13 +1046,13 @@ if [ "$MODE" = "ssh-config" ]; then
                 echo ""
                 cat "$SSH_CONFIG_FILE"
             else
-                echo "Devbox SSH config je prázdný."
+                echo "Devbox SSH config is empty."
             fi
             echo ""
-            echo "Použití:"
-            echo "  devbox ssh-config          Zobrazit config"
-            echo "  devbox ssh-config add      Přidat host interaktivně"
-            echo "  devbox ssh-config edit     Otevřít v \$EDITOR"
+            echo "Usage:"
+            echo "  devbox ssh-config          Show config"
+            echo "  devbox ssh-config add      Add a host interactively"
+            echo "  devbox ssh-config edit     Open in \$EDITOR"
             ;;
     esac
     exit 0
@@ -1089,8 +1089,8 @@ if [ -d "${1:-.}" ]; then
 
     if docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.ID}}' | grep -q .; then
         if [ "$SSH_CONFIG_MOUNT" = true ]; then
-            echo "WARNING: --ssh-config ignorován — kontejner již běží."
-            echo "  Pro změnu mountů: devbox stop && devbox --ssh-config"
+            echo "WARNING: --ssh-config ignored — container is already running."
+            echo "  To change mounts: devbox stop && devbox --ssh-config"
         fi
         attach_to_container "$CONTAINER_NAME"
         # exec → script ends here
@@ -1118,12 +1118,12 @@ else
         if restart_exited_container "$CONTAINER_NAME"; then
             attach_to_container "$CONTAINER_NAME"
         else
-            echo "Kontejner $CONTAINER_NAME odstraněn. Spusťte znovu pro vytvoření nového." >&2
+            echo "Container $CONTAINER_NAME removed. Run again to create a new one." >&2
             exit 1
         fi
     else
-        echo "Kontejner $CONTAINER_NAME neběží." >&2
-        selected=$(pick_container "Vyber kontejner: ") || exit 1
+        echo "Container $CONTAINER_NAME is not running." >&2
+        selected=$(pick_container "Pick a container: ") || exit 1
         attach_to_container "$selected"
     fi
 fi

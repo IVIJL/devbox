@@ -24,7 +24,7 @@ log_message() {
 ) &
 
 # Send ntfy notification (separate process with timeout)
-MESSAGE="✅ Claude dokončil úlohu úspěšně"
+MESSAGE="✅ Claude completed the task successfully"
 (
     if [ -n "$TOKEN" ] && [ -n "$NTFY_URL" ]; then
         curl -s -o /dev/null -H "Authorization: Bearer $TOKEN" -d "$MESSAGE" "$NTFY_URL"

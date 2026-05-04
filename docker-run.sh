@@ -351,6 +351,68 @@ pick_container() {
     fi
 }
 
+# Open an IDE attached to a devbox container ($1 = cursor|code, $2 = optional target).
+attach_ide() {
+    local ide="$1" target="${2:-}"
+    local binary display_name install_hint
+    case "$ide" in
+        cursor)
+            binary=cursor
+            display_name="Cursor"
+            install_hint="Cursor → Cmd+Shift+P → 'Install cursor command in PATH'"
+            ;;
+        code)
+            binary=code
+            display_name="VS Code"
+            install_hint="VS Code → Cmd+Shift+P → 'Install code command in PATH'"
+            ;;
+        *)
+            echo "Unknown IDE: $ide" >&2
+            exit 1
+            ;;
+    esac
+
+    if ! command -v "$binary" &>/dev/null; then
+        echo "Error: '$binary' CLI not found in PATH." >&2
+        echo "Install it: $install_hint" >&2
+        exit 1
+    fi
+
+    if [ -n "$target" ]; then
+        devbox::names_from_token "$target"
+    else
+        devbox::names_from_path "$(pwd)"
+    fi
+    local container="$DEVBOX_CONTAINER_NAME"
+
+    if ! docker ps --filter "name=^${container}$" --format '{{.Names}}' | grep -q .; then
+        echo "Container $container is not running." >&2
+        container=$(pick_container "Select container: ") || exit 1
+    fi
+
+    local hostpath
+    hostpath=$(docker exec "$container" sh -c 'printf %s "$DEVBOX_PROJECT_HOST_PATH"' 2>/dev/null || true)
+    if [ -z "$hostpath" ]; then
+        echo "Container $container predates Phase 2 layout (ADR 0004)." >&2
+        echo "Restart it to pick up the new mount: devbox stop $container && devbox" >&2
+        exit 1
+    fi
+
+    local attach_json="{\"containerName\":\"/${container}\"}"
+    local hex
+    if command -v xxd &>/dev/null; then
+        hex=$(printf '%s' "$attach_json" | xxd -p | tr -d '\n')
+    else
+        hex=$(printf '%s' "$attach_json" | od -A n -t x1 | tr -d ' \n')
+    fi
+    local encoded_path folder_uri
+    encoded_path=$(url_encode_path "$hostpath")
+    folder_uri="vscode-remote://attached-container+${hex}${encoded_path}"
+
+    echo "Opening $display_name attached to $container..."
+    "$binary" --folder-uri "$folder_uri"
+}
+
 # --- Subcommand parsing ------------------------------------------------------
 
 CLEAN_VOLUMES=false
@@ -579,86 +641,14 @@ fi
 # --- devbox cursor [name] ---------------------------------------------------
 
 if [ "$MODE" = "cursor" ]; then
-    if ! command -v cursor &>/dev/null; then
-        echo "Error: 'cursor' CLI not found in PATH." >&2
-        echo "Install it: Cursor → Cmd+Shift+P → 'Install cursor command in PATH'" >&2
-        exit 1
-    fi
-
-    # Determine target container
-    if [ -n "${CURSOR_TARGET:-}" ]; then
-        devbox::names_from_token "$CURSOR_TARGET"
-    else
-        devbox::names_from_path "$(pwd)"
-    fi
-    CONTAINER_NAME="$DEVBOX_CONTAINER_NAME"
-
-    # Verify container is running
-    if ! docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.Names}}' | grep -q .; then
-        echo "Container $CONTAINER_NAME is not running." >&2
-        # Try to pick from running containers
-        selected=$(pick_container "Select container: ") || exit 1
-        CONTAINER_NAME="$selected"
-    fi
-
-    # Build attached-container URI for Cursor.
-    # Format: vscode-remote://attached-container+<hex-encoded-json><path>
-    # Prefer the host project path (set as $DEVBOX_PROJECT_HOST_PATH inside the
-    # container by docker-run.sh); fall back to /workspace/<name> for older
-    # containers that pre-date Phase 2.
-    ATTACH_JSON="{\"containerName\":\"/${CONTAINER_NAME}\"}"
-    if command -v xxd &>/dev/null; then
-        HEX=$(printf '%s' "$ATTACH_JSON" | xxd -p | tr -d '\n')
-    else
-        HEX=$(printf '%s' "$ATTACH_JSON" | od -A n -t x1 | tr -d ' \n')
-    fi
-    HOSTPATH=$(docker exec "$CONTAINER_NAME" sh -c 'printf %s "$DEVBOX_PROJECT_HOST_PATH"' 2>/dev/null || true)
-    HOSTPATH=${HOSTPATH:-/workspace/${CONTAINER_NAME#devbox-}}
-    FOLDER_URI="vscode-remote://attached-container+${HEX}$(url_encode_path "$HOSTPATH")"
-
-    echo "Opening Cursor attached to $CONTAINER_NAME..."
-    cursor --folder-uri "$FOLDER_URI"
+    attach_ide cursor "${CURSOR_TARGET:-}"
     exit 0
 fi
 
 # --- devbox code [name] ----------------------------------------------------
 
 if [ "$MODE" = "code" ]; then
-    if ! command -v code &>/dev/null; then
-        echo "Error: 'code' CLI not found in PATH." >&2
-        echo "Install it: VS Code → Cmd+Shift+P → 'Install code command in PATH'" >&2
-        exit 1
-    fi
-
-    # Determine target container
-    if [ -n "${CODE_TARGET:-}" ]; then
-        devbox::names_from_token "$CODE_TARGET"
-    else
-        devbox::names_from_path "$(pwd)"
-    fi
-    CONTAINER_NAME="$DEVBOX_CONTAINER_NAME"
-
-    # Verify container is running
-    if ! docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.Names}}' | grep -q .; then
-        echo "Container $CONTAINER_NAME is not running." >&2
-        # Try to pick from running containers
-        selected=$(pick_container "Select container: ") || exit 1
-        CONTAINER_NAME="$selected"
-    fi
-
-    # Build attached-container URI for VS Code (see Cursor block for fallback rationale).
-    ATTACH_JSON="{\"containerName\":\"/${CONTAINER_NAME}\"}"
-    if command -v xxd &>/dev/null; then
-        HEX=$(printf '%s' "$ATTACH_JSON" | xxd -p | tr -d '\n')
-    else
-        HEX=$(printf '%s' "$ATTACH_JSON" | od -A n -t x1 | tr -d ' \n')
-    fi
-    HOSTPATH=$(docker exec "$CONTAINER_NAME" sh -c 'printf %s "$DEVBOX_PROJECT_HOST_PATH"' 2>/dev/null || true)
-    HOSTPATH=${HOSTPATH:-/workspace/${CONTAINER_NAME#devbox-}}
-    FOLDER_URI="vscode-remote://attached-container+${HEX}$(url_encode_path "$HOSTPATH")"
-
-    echo "Opening VS Code attached to $CONTAINER_NAME..."
-    code --folder-uri "$FOLDER_URI"
+    attach_ide code "${CODE_TARGET:-}"
     exit 0
 fi
 

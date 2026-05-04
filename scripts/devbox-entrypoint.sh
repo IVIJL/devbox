@@ -5,9 +5,11 @@ set -euo pipefail
 #
 # Container starts as UID 0 via `docker run --user 0`. This script's root
 # phase runs the only operations that require root (firewall, host-home
-# symlink, system gitconfig), then exec's runuser to drop to node. Once
-# dropped, PID 1 is node and there is no path back to root from inside the
-# container — there are no NOPASSWD sudoers entries and no setuid bridges.
+# symlink, system gitconfig), then exec's setpriv to drop to node. setpriv
+# performs a clean execve after switching credentials (no fork), so PID 1
+# becomes this script running as node — no residual root parent in the
+# process tree. Combined with no NOPASSWD sudoers entries and no setuid
+# bridges, there is no path back to root from inside the container.
 # See docs/adr/0003 for the security rationale.
 
 if [ "$(id -u)" = "0" ]; then
@@ -29,7 +31,7 @@ if [ "$(id -u)" = "0" ]; then
 
     /usr/local/bin/init-firewall.sh
 
-    exec runuser -u node -- "$0" "$@"
+    exec setpriv --reuid=node --regid=node --init-groups -- "$0" "$@"
 fi
 
 # Node phase: keep PID 1 alive with graceful shutdown for inner DinD.

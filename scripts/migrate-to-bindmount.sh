@@ -19,6 +19,16 @@ echo ".credentials.json uses newer-mtime-wins so a refreshed token in the"
 echo "  volume isn't lost (the bug this migration is fixing — see ADR 0002)."
 echo
 
+# 0. Idempotent cleanup of pre-bind-mount symlink-dance leftovers. Older
+# setup-claude.sh symlinked ~/.claude/.credentials.lock into the now-removed
+# ~/.claude-host sidecar; the dangling symlink survives in the bind-mounted
+# dir and breaks Claude's OAuth refresh flock. Runs every invocation so
+# instances coming up after their peers also get healed.
+if [ -L "$HOME/.claude/.credentials.lock" ] && [ ! -e "$HOME/.claude/.credentials.lock" ]; then
+    rm -f "$HOME/.claude/.credentials.lock"
+    echo "Removed stale ~/.claude/.credentials.lock (dangling symlink into retired sidecar)"
+fi
+
 # 1. Stop all running devbox containers (skips traefik) so volumes can be read.
 running=$(docker ps --filter "name=^devbox-" --filter "status=running" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
 if [ -n "$running" ]; then

@@ -1,4 +1,4 @@
-# ADR 0003 — Privileged entrypoint with runuser drop, no sudo from inside the container
+# ADR 0003 — Privileged entrypoint with setpriv drop, no sudo from inside the container
 
 - **Status:** accepted
 - **Date:** 2026-05-03
@@ -42,15 +42,19 @@ The container starts as UID 0 (`docker run --user 0` from `docker-run.sh`,
 entrypoint `scripts/devbox-entrypoint.sh` runs its **root phase** —
 copy gitconfig to `/etc/gitconfig`, fix IDE-server volume ownership,
 create the `HOST_HOME → /home/node` compatibility symlink, run
-`init-firewall.sh` — and then `exec runuser -u node -- "$0" "$@"` to
+`init-firewall.sh` — and then
+`exec setpriv --reuid=node --regid=node --init-groups -- "$0" "$@"` to
 re-enter the same script as `node`. The node phase installs the SIGTERM
 handler that gracefully stops inner DinD containers and keeps PID 1
 alive.
 
 After the privilege drop:
 
-- PID 1 is `node`. Every subsequent process inside the container inherits
-  UID 1000.
+- **PID 1 is `node`.** `setpriv` performs `setuid`/`setgid`/`setgroups`
+  followed by `execve` with no intermediate fork, so the same process
+  that started as root is the same process that ends up as node — no
+  residual root parent stays alive in the process tree. Every
+  subsequent process inside the container inherits UID 1000.
 - `/etc/sudoers` and `/etc/sudoers.d/` are unchanged from the previous
   layout — `node` has `sudo` but only with password. **No NOPASSWD
   entries are added.**
@@ -63,11 +67,15 @@ After the privilege drop:
   command itself only runs the user-mode steps (`start-rootless-docker`,
   `setup-chezmoi`, `setup-claude`).
 
-`runuser` is part of util-linux and ships with the Debian-based
-`node:22` image — no additional package install is required. It does
-not authenticate (root → unprivileged user is always free) and does
-not create a PAM login session by default, so the privilege drop is
-deterministic and side-effect free.
+`setpriv` is part of util-linux and ships with the Debian-based
+`node:22` image — no additional package install is required. It is the
+right tool for entrypoint privilege drops specifically because it
+exec-replaces the calling process; `runuser -u` (also util-linux) was
+considered first but its semantics fork a child and keep the original
+process alive as a root parent, which contradicts the "no root process
+in the running container" property this ADR commits to. `--init-groups`
+populates supplementary groups from `/etc/group` so `node`'s group
+membership matches an interactive login.
 
 ## Consequences
 
@@ -105,9 +113,9 @@ deterministic and side-effect free.
   node phase) instead of a five-line keep-alive loop. Slight increase
   in surface area, but the alternative was per-script `sudo` blocks
   duplicated across `setup-claude.sh`, IDE flows, etc.
-- `runuser`'s default behaviour preserves environment variables (HOST_HOME,
-  PATH, etc.), which is what we want. If a future Debian release
-  changes that default or PAM policy, the privilege drop could
+- `setpriv` preserves the calling process's environment by default
+  (HOST_HOME, PATH, etc.), which is what we want. If a future
+  util-linux release changes that default, the privilege drop could
   silently strip env. Mitigation: smoke test on image rebuild
   verifies `$HOST_HOME` is visible after the drop.
 
@@ -134,6 +142,7 @@ deterministic and side-effect free.
 - `.devcontainer/devcontainer.json`, `.devcontainer/cursor/devcontainer.json`,
   `devcontainer-standalone.json` — `runArgs` adds `--user 0`,
   `postStartCommand` no longer carries `sudo`.
-- `runuser(1)` — util-linux manual; "executes a command with substitute
-  user and group ID". When invoked as root, never prompts.
+- `setpriv(1)` — util-linux manual; "run a program with different
+  Linux privilege settings". Used here for its `--reuid` / `--regid` /
+  `--init-groups` flags and exec-without-fork semantics.
 - ADR 0002 — the bind-mount layout this entrypoint cooperates with.

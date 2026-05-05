@@ -304,6 +304,15 @@ RUN STAMP=$(date +%s) && \
 # Ensure npm-global bin is in PATH for all zsh sessions (survives chezmoi dotfiles)
 RUN echo 'export PATH="$PATH:/usr/local/share/npm-global/bin"' >> /etc/zsh/zshenv
 
+# Ensure login shells that source /etc/profile also see global npm binaries.
+# /etc/profile resets PATH, so the earlier Docker ENV alone is not enough.
+RUN printf '%s\n' \
+    'case ":$PATH:" in' \
+    '  *:/usr/local/share/npm-global/bin:*) ;;' \
+    '  *) export PATH="$PATH:/usr/local/share/npm-global/bin" ;;' \
+    'esac' \
+    > /etc/profile.d/npm-global-path.sh
+
 # Shared firewall allowlist mount point (bind-mounted :ro from host)
 RUN mkdir -p /etc/devbox-shared
 

@@ -39,15 +39,49 @@ make_workspace_symlink() {
 
 # Every-start. Pre-accept trust for both host path and /workspace alias so
 # Claude doesn't prompt regardless of which CWD the user enters from.
+#
+# Multi-instance safety: ~/.claude is bind-mounted (ADR 0002) so concurrent
+# container starts race on this file. flock serialises the read-modify-write
+# and mktemp gives each process its own staging file — a fixed .tmp name
+# would let two redirects truncate each other's content and leave a 0-byte
+# file after one of the renames. Self-heals an empty/corrupt .claude.json so
+# a survivor of any past race recovers on next start.
 pretrust_workspace_paths() {
     [ -n "$PROJECT_NAME" ] || return 0
-    [ -f "$TARGET/.claude.json" ] || echo '{}' > "$TARGET/.claude.json"
-    for ws in "${DEVBOX_PROJECT_HOST_PATH:-}" "/workspace/$PROJECT_NAME"; do
-        [ -n "$ws" ] || continue
-        jq --arg ws "$ws" '.projects[$ws].hasTrustDialogAccepted = true' \
-            "$TARGET/.claude.json" > "$TARGET/.claude.json.tmp" \
-            && mv "$TARGET/.claude.json.tmp" "$TARGET/.claude.json"
-    done
+
+    local paths=()
+    [ -n "${DEVBOX_PROJECT_HOST_PATH:-}" ] && paths+=("$DEVBOX_PROJECT_HOST_PATH")
+    paths+=("/workspace/$PROJECT_NAME")
+
+    (
+        flock 9
+
+        if [ ! -s "$TARGET/.claude.json" ] \
+           || ! jq -e . "$TARGET/.claude.json" >/dev/null 2>&1; then
+            echo '{}' > "$TARGET/.claude.json"
+        fi
+
+        local needs_update=0 ws
+        for ws in "${paths[@]}"; do
+            if ! jq -e --arg ws "$ws" \
+                '.projects[$ws].hasTrustDialogAccepted == true' \
+                "$TARGET/.claude.json" >/dev/null 2>&1; then
+                needs_update=1
+                break
+            fi
+        done
+        [ "$needs_update" -eq 1 ] || exit 0
+
+        local paths_json tmp
+        paths_json=$(printf '%s\n' "${paths[@]}" | jq -R . | jq -s .)
+        tmp=$(mktemp "$TARGET/.claude.json.XXXXXX")
+        trap 'rm -f "$tmp"' EXIT
+        jq --argjson paths "$paths_json" \
+            'reduce $paths[] as $ws (.; .projects[$ws].hasTrustDialogAccepted = true)' \
+            "$TARGET/.claude.json" > "$tmp"
+        mv "$tmp" "$TARGET/.claude.json"
+        trap - EXIT
+    ) 9>"$TARGET/.claude.json.lock"
 }
 
 # One-shot via marker. Marker is in the bind-mounted dir, shared with host

@@ -20,6 +20,10 @@ Usage:
   devbox remove [name]             Remove project data (volumes)
   devbox port <port>               Expose port via Traefik
   devbox ports                     List active port routes
+  devbox connect                   Pick source, target devboxes, and services
+  devbox connect <target> <port>   Forward one TCP port to another devbox
+                                   (use 10.0.2.2:<local-port> from inner Docker)
+  devbox connections               List cross-devbox TCP forwards
   devbox build [flags]             Build/rebuild the devbox image
   devbox update                    Update devbox (pull repo + rebuild image)
   devbox migrate                   Migrate data to new layout (interactive; auto-run by 'devbox update')
@@ -56,6 +60,9 @@ Examples:
   devbox stop --clean              Stop + remove Docker/history volumes
   devbox remove                    Interactive project data cleanup
   devbox port 3000                 Route 3000.<project>.127.0.0.1.traefik.me
+  devbox connect                   Interactive cross-devbox service picker
+  devbox connect api 5432          Forward current devbox -> devbox-api:5432
+  devbox connect db 5432 15432     Use an explicit local forward port
   devbox allow pypi.org            Allow pypi.org (and *.pypi.org) through firewall
   devbox deny                      Interactive domain removal
   devbox blocked                   See blocked queries, allow with fzf
@@ -67,6 +74,7 @@ IMAGE="vlcak/devbox:latest"
 SSH_WARNING=""
 DEVBOX_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 TRAEFIK_CONFIG_DIR="$HOME/.config/devbox/traefik/dynamic"
+CONNECT_CONFIG_DIR="$HOME/.config/devbox/connect"
 
 # Allowlist module — defines ALLOWLIST_HOST_FILE, IPSET_NAME, allowlist::* fns
 # shellcheck source=lib/allowlist.sh
@@ -208,6 +216,125 @@ YAML
     done < "$ports_file"
 }
 
+connection_config_file() {
+    local source_project="$1"
+    printf '%s/%s.tsv' "$CONNECT_CONFIG_DIR" "$source_project"
+}
+
+allocate_connection_port() {
+    local source="$1" target="$2" target_port="$3" used_file="$4"
+    local checksum candidate i
+    checksum=$(printf '%s' "${source}:${target}:${target_port}" | cksum | awk '{print $1}')
+    candidate=$((15000 + checksum % 1000))
+
+    for i in $(seq 0 999); do
+        local port=$((15000 + (candidate - 15000 + i) % 1000))
+        if ! awk -F '\t' -v p="$port" '$4 == p { found=1 } END { exit found ? 0 : 1 }' "$used_file" 2>/dev/null; then
+            printf '%s' "$port"
+            return 0
+        fi
+    done
+
+    echo "No free devbox connection port in 15000-15999." >&2
+    return 1
+}
+
+start_container_connection() {
+    local source_container="$1" target_container="$2" target_port="$3" local_port="$4" alias="$5"
+    local log_file="/tmp/devbox-connect-${local_port}.log"
+    local pid_file="/tmp/devbox-connect-${local_port}.pid"
+
+    docker exec -u node \
+        -e TARGET_CONTAINER="$target_container" \
+        -e TARGET_PORT="$target_port" \
+        -e LOCAL_PORT="$local_port" \
+        -e CONNECT_ALIAS="$alias" \
+        -e LOG_FILE="$log_file" \
+        -e PID_FILE="$pid_file" \
+        "$source_container" bash -lc '
+            set -euo pipefail
+            if ss -ltn "sport = :${LOCAL_PORT}" | grep -q ":${LOCAL_PORT}"; then
+                exit 0
+            fi
+            if ! command -v socat >/dev/null 2>&1; then
+                echo "socat is not installed in this devbox image." >&2
+                exit 1
+            fi
+            rm -f "$PID_FILE"
+            nohup socat TCP-LISTEN:"${LOCAL_PORT}",bind=127.0.0.1,reuseaddr,fork TCP:"${TARGET_CONTAINER}:${TARGET_PORT}" >"$LOG_FILE" 2>&1 &
+            echo $! > "$PID_FILE"
+        '
+}
+
+start_devbox_connections() {
+    local container="$1"
+    local source_project="${container#devbox-}"
+    local config_file
+    config_file="$(connection_config_file "$source_project")"
+    [ -f "$config_file" ] || return 0
+
+    while IFS=$'\t' read -r alias target_container target_port local_port; do
+        [ -n "${alias:-}" ] || continue
+        case "$alias" in \#*) continue ;; esac
+        if start_container_connection "$container" "$target_container" "$target_port" "$local_port" "$alias"; then
+            echo "Connection: ${alias} 10.0.2.2:${local_port} → ${target_container}:${target_port}"
+        else
+            echo "Failed to start connection ${alias} for ${container}." >&2
+        fi
+    done < "$config_file"
+}
+
+list_devbox_container_names() {
+    docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true
+}
+
+discover_published_tcp_services() {
+    local target_container="$1"
+    local target_project="${target_container#devbox-}"
+    local rows
+    rows=$(docker exec -u node "$target_container" bash -lc \
+        'docker ps --format "{{.Names}}\t{{.Ports}}"' 2>/dev/null || true)
+    [ -n "$rows" ] || return 0
+
+    while IFS=$'\t' read -r inner_name ports; do
+        [ -n "${inner_name:-}" ] || continue
+        [ -n "${ports:-}" ] || continue
+        IFS=',' read -ra entries <<< "$ports"
+        local entry
+        for entry in "${entries[@]}"; do
+            entry="${entry#"${entry%%[![:space:]]*}"}"
+            entry="${entry%"${entry##*[![:space:]]}"}"
+            [[ "$entry" == *"->"*"/tcp"* ]] || continue
+
+            local left right host_port private_port
+            left="${entry%%->*}"
+            right="${entry#*->}"
+            right="${right%%/*}"
+            host_port="${left##*:}"
+            private_port="$right"
+            [[ "$host_port" =~ ^[0-9]+$ ]] || continue
+            [[ "$private_port" =~ ^[0-9]+$ ]] || continue
+
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+                "$target_project" "$target_container" "$inner_name" "$host_port" "$private_port"
+        done
+    done <<< "$rows"
+}
+
+upsert_connection_record() {
+    local source_project="$1" alias="$2" target_container="$3" target_port="$4" local_port="$5"
+    local config_file tmp
+    config_file="$(connection_config_file "$source_project")"
+    mkdir -p "$CONNECT_CONFIG_DIR"
+    touch "$config_file"
+
+    tmp="${config_file}.tmp"
+    awk -F '\t' -v t="$target_container" -v p="$target_port" -v lp="$local_port" \
+        'BEGIN { OFS = FS } !($2 == t && $3 == p) && !($4 == lp)' "$config_file" > "$tmp"
+    printf '%s\t%s\t%s\t%s\n' "$alias" "$target_container" "$target_port" "$local_port" >> "$tmp"
+    mv "$tmp" "$config_file"
+}
+
 # Gracefully stop a devbox container — stop inner DinD containers first
 graceful_stop_container() {
     local name="$1"
@@ -270,6 +397,7 @@ restart_exited_container() {
         '/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh'
     # Re-apply port routes
     apply_port_routes "$name"
+    start_devbox_connections "$name"
 }
 
 list_running_containers() {
@@ -422,6 +550,8 @@ case "${1:-}" in
     remove)  MODE="remove";  shift; PROJECT_FILTER="${1:-}" ;;
     port)    MODE="port";    shift; PORT_NUM="${1:-}" ;;
     ports)   MODE="ports";   shift ;;
+    connect) MODE="connect"; shift ;;
+    connections) MODE="connections"; shift ;;
     allow)   MODE="allow";   shift; DOMAIN="${1:-}" ;;
     deny)    MODE="deny";    shift; DOMAIN="${1:-}" ;;
     blocked)   MODE="blocked";   shift ;;
@@ -719,6 +849,191 @@ if [ "$MODE" = "ports" ]; then
         if [ -n "$host" ] && [ -n "$target" ]; then
             printf '%-55s %s\n' "http://${host}" "$target"
         fi
+    done
+    exit 0
+fi
+
+# --- devbox connect <target> <port> [local-port] [--from source] -------------
+
+if [ "$MODE" = "connect" ]; then
+    if [ "$#" -eq 0 ]; then
+        running="$(list_devbox_container_names)"
+        if [ -z "$running" ]; then
+            echo "No running devbox containers." >&2
+            exit 1
+        fi
+
+        SOURCE_CONTAINER=$(printf '%s\n' "$running" | picker::one --prompt "Source devbox: ") || exit 1
+        SOURCE_PROJECT="${SOURCE_CONTAINER#devbox-}"
+
+        target_candidates=$(printf '%s\n' "$running" | grep -vx "$SOURCE_CONTAINER" || true)
+        if [ -z "$target_candidates" ]; then
+            echo "No other running devbox containers to connect." >&2
+            exit 1
+        fi
+
+        TARGET_CONTAINERS=$(printf '%s\n' "$target_candidates" | picker::many --prompt "Target devboxes: ") || exit 1
+
+        service_rows=""
+        while IFS= read -r target_container; do
+            [ -n "$target_container" ] || continue
+            discovered=$(discover_published_tcp_services "$target_container")
+            [ -n "$discovered" ] && service_rows=$(printf '%s\n%s' "$service_rows" "$discovered")
+        done <<< "$TARGET_CONTAINERS"
+        service_rows=$(printf '%s\n' "$service_rows" | grep -v '^$' | sort -u || true)
+
+        if [ -z "$service_rows" ]; then
+            echo "No published TCP ports found in selected target devboxes." >&2
+            echo "Only compose services with 'ports:' can be connected across devboxes." >&2
+            exit 1
+        fi
+
+        service_choices=$(while IFS=$'\t' read -r target_project _target_container inner_name host_port private_port; do
+            printf '%s / %s  %s->%s/tcp\n' \
+                "$target_project" "$inner_name" "$host_port" "$private_port"
+        done <<< "$service_rows")
+
+        SELECTED_SERVICES=$(printf '%s\n' "$service_choices" | picker::many --prompt "Services to connect: ") || exit 1
+
+        mkdir -p "$CONNECT_CONFIG_DIR"
+        config_file="$(connection_config_file "$SOURCE_PROJECT")"
+        touch "$config_file"
+
+        echo "Connections for ${SOURCE_CONTAINER}:"
+        while IFS= read -r display; do
+            [ -n "${display:-}" ] || continue
+            matched=$(while IFS=$'\t' read -r row_target_project row_target_container row_inner_name row_host_port row_private_port; do
+                row_display=$(printf '%s / %s  %s->%s/tcp' "$row_target_project" "$row_inner_name" "$row_host_port" "$row_private_port")
+                if [ "$row_display" = "$display" ]; then
+                    printf '%s\t%s\t%s\t%s\t%s\n' "$row_target_project" "$row_target_container" "$row_inner_name" "$row_host_port" "$row_private_port"
+                    break
+                fi
+            done <<< "$service_rows")
+            [ -n "$matched" ] || continue
+            IFS=$'\t' read -r target_project target_container inner_name host_port private_port <<< "$matched"
+            existing=$(awk -F '\t' -v t="$target_container" -v p="$host_port" '$2 == t && $3 == p { print $4; exit }' "$config_file")
+            if [ -n "$existing" ]; then
+                local_port="$existing"
+            else
+                local_port="$(allocate_connection_port "$SOURCE_PROJECT" "$target_container" "$host_port" "$config_file")"
+            fi
+            alias="${inner_name}.${target_project}.devbox"
+            upsert_connection_record "$SOURCE_PROJECT" "$alias" "$target_container" "$host_port" "$local_port"
+            start_container_connection "$SOURCE_CONTAINER" "$target_container" "$host_port" "$local_port" "$alias"
+            printf '  %-32s 10.0.2.2:%s -> %s:%s\n' "${inner_name}.${target_project}.devbox" "$local_port" "$target_container" "$host_port"
+        done <<< "$SELECTED_SERVICES"
+
+        echo "Persisted in: $config_file"
+        exit 0
+    fi
+
+    SOURCE_TOKEN=""
+    POSITIONAL=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --from)
+                shift
+                SOURCE_TOKEN="${1:-}"
+                [ -n "$SOURCE_TOKEN" ] || { echo "Usage: devbox connect <target> <port> [local-port] [--from source]" >&2; exit 1; }
+                ;;
+            --from=*)
+                SOURCE_TOKEN="${1#--from=}"
+                ;;
+            -h|--help)
+                echo "Usage: devbox connect"
+                echo "       devbox connect <target> <port> [local-port] [--from source]"
+                echo "Example: devbox connect api 5432"
+                echo "Inner Docker containers connect to 10.0.2.2:<local-port>."
+                exit 0
+                ;;
+            *)
+                POSITIONAL+=("$1")
+                ;;
+        esac
+        shift || true
+    done
+
+    TARGET_TOKEN="${POSITIONAL[0]:-}"
+    TARGET_PORT="${POSITIONAL[1]:-}"
+    LOCAL_PORT="${POSITIONAL[2]:-}"
+
+    if [ -z "$TARGET_TOKEN" ] || [ -z "$TARGET_PORT" ]; then
+        echo "Usage: devbox connect <target> <port> [local-port] [--from source]" >&2
+        exit 1
+    fi
+    if ! [[ "$TARGET_PORT" =~ ^[0-9]+$ ]] || [ "$TARGET_PORT" -lt 1 ] || [ "$TARGET_PORT" -gt 65535 ]; then
+        echo "Target port must be a number from 1 to 65535." >&2
+        exit 1
+    fi
+    if [ -n "$LOCAL_PORT" ] && { ! [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]] || [ "$LOCAL_PORT" -lt 1 ] || [ "$LOCAL_PORT" -gt 65535 ]; }; then
+        echo "Local port must be a number from 1 to 65535." >&2
+        exit 1
+    fi
+
+    if [ -n "$SOURCE_TOKEN" ]; then
+        devbox::names_from_token "$SOURCE_TOKEN"
+    else
+        devbox::names_from_path "$(pwd)"
+    fi
+    SOURCE_PROJECT="$DEVBOX_PROJECT_NAME"
+    SOURCE_CONTAINER="$DEVBOX_CONTAINER_NAME"
+
+    devbox::names_from_token "$TARGET_TOKEN"
+    TARGET_PROJECT="$DEVBOX_PROJECT_NAME"
+    TARGET_CONTAINER="$DEVBOX_CONTAINER_NAME"
+
+    if ! docker ps --filter "name=^${SOURCE_CONTAINER}$" --format '{{.Names}}' | grep -qx "$SOURCE_CONTAINER"; then
+        echo "Source container is not running: $SOURCE_CONTAINER" >&2
+        echo "Use --from <source> when running outside the source project directory." >&2
+        exit 1
+    fi
+    if ! docker ps --filter "name=^${TARGET_CONTAINER}$" --format '{{.Names}}' | grep -qx "$TARGET_CONTAINER"; then
+        echo "Target container is not running: $TARGET_CONTAINER" >&2
+        exit 1
+    fi
+
+    CONFIG_FILE="$(connection_config_file "$SOURCE_PROJECT")"
+    mkdir -p "$CONNECT_CONFIG_DIR"
+    touch "$CONFIG_FILE"
+
+    if [ -z "$LOCAL_PORT" ]; then
+        existing=$(awk -F '\t' -v t="$TARGET_CONTAINER" -v p="$TARGET_PORT" '$2 == t && $3 == p { print $4; exit }' "$CONFIG_FILE")
+        if [ -n "$existing" ]; then
+            LOCAL_PORT="$existing"
+        else
+            LOCAL_PORT="$(allocate_connection_port "$SOURCE_PROJECT" "$TARGET_CONTAINER" "$TARGET_PORT" "$CONFIG_FILE")"
+        fi
+    fi
+
+    ALIAS="${TARGET_PROJECT}-${TARGET_PORT}"
+    upsert_connection_record "$SOURCE_PROJECT" "$ALIAS" "$TARGET_CONTAINER" "$TARGET_PORT" "$LOCAL_PORT"
+
+    start_container_connection "$SOURCE_CONTAINER" "$TARGET_CONTAINER" "$TARGET_PORT" "$LOCAL_PORT" "$ALIAS"
+
+    echo "Connected: ${SOURCE_CONTAINER} -> ${TARGET_CONTAINER}:${TARGET_PORT}"
+    echo "Use from inner Docker containers: 10.0.2.2:${LOCAL_PORT}"
+    echo "Persisted in: $CONFIG_FILE"
+    exit 0
+fi
+
+# --- devbox connections ------------------------------------------------------
+
+if [ "$MODE" = "connections" ]; then
+    if [ ! -d "$CONNECT_CONFIG_DIR" ] || [ -z "$(ls -A "$CONNECT_CONFIG_DIR" 2>/dev/null)" ]; then
+        echo "No devbox connections."
+        exit 0
+    fi
+
+    printf '%-25s %-28s %-16s %s\n' "SOURCE" "TARGET" "INNER ENDPOINT" "ALIAS"
+    for f in "$CONNECT_CONFIG_DIR"/*.tsv; do
+        [ -f "$f" ] || continue
+        source_project="$(basename "$f" .tsv)"
+        while IFS=$'\t' read -r alias target_container target_port local_port; do
+            [ -n "${alias:-}" ] || continue
+            case "$alias" in \#*) continue ;; esac
+            printf '%-25s %-28s %-16s %s\n' \
+                "devbox-${source_project}" "${target_container}:${target_port}" "10.0.2.2:${local_port}" "$alias"
+        done < "$f"
     done
     exit 0
 fi
@@ -1221,6 +1536,7 @@ DOCKER_ARGS=(
     -v devbox-vscode-server:/home/node/.vscode-server
     -e CLAUDE_CONFIG_DIR=/home/node/.claude
     -e "DEVBOX_PROJECT_NAME=$DEVBOX_PROJECT_NAME"
+    -e DOCKERD_ROOTLESS_ROOTLESSKIT_DISABLE_HOST_LOOPBACK=false
 )
 
 # Git config from host (staging path — copied to /etc/gitconfig by entrypoint
@@ -1398,6 +1714,8 @@ fi
 # ownership) is handled by the entrypoint on every container start.
 docker exec -u node "$CONTAINER_NAME" bash -c \
     '/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh'
+
+start_devbox_connections "$CONTAINER_NAME"
 
 # Attach first interactive session
 set_tab_title "$PROJECT_NAME"

@@ -17,6 +17,11 @@ if [ -S "$SOCKET" ] && docker info >/dev/null 2>&1; then
 fi
 
 echo "Starting rootless Docker daemon..."
+# Inner containers need to reach services listening on the outer devbox
+# loopback via 10.0.2.2. This still does not expose the host Docker socket or
+# host ports; it only opens the parent namespace seen by RootlessKit.
+: "${DOCKERD_ROOTLESS_ROOTLESSKIT_DISABLE_HOST_LOOPBACK:=false}"
+export DOCKERD_ROOTLESS_ROOTLESSKIT_DISABLE_HOST_LOOPBACK
 dockerd-rootless.sh >/tmp/dockerd-rootless.log 2>&1 &
 
 # Wait for the socket to appear

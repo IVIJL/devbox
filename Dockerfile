@@ -12,7 +12,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
     # Claude Code packages
     less git procps sudo zsh man-db unzip gnupg2 gh \
-    iptables ipset iproute2 dnsutils aggregate jq nano vim dnsmasq iputils-ping \
+    iptables ipset iproute2 dnsutils aggregate jq nano vim dnsmasq iputils-ping socat \
     # Rootless Docker prerequisites
     uidmap fuse-overlayfs slirp4netns \
     # User packages

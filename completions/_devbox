@@ -27,6 +27,8 @@ _devbox() {
                 'remove:Remove project data (volumes)'
                 'port:Expose port via Traefik'
                 'ports:List active port routes'
+                'connect:Forward inner containers to another devbox'
+                'connections:List cross-devbox TCP forwards'
                 'build:Build/rebuild the devbox image'
                 'update:Update devbox (pull repo + rebuild image)'
                 'uninstall:Remove everything (containers, volumes, image)'
@@ -56,6 +58,15 @@ _devbox() {
                     ;;
                 cursor|code|remove)
                     _devbox_containers
+                    ;;
+                connect)
+                    if (( CURRENT == 3 )); then
+                        _devbox_containers
+                    elif (( CURRENT == 5 )); then
+                        local -a flags
+                        flags=('--from:Source devbox container')
+                        _describe 'flags' flags
+                    fi
                     ;;
                 build)
                     local -a flags

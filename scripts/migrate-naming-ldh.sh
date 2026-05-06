@@ -42,6 +42,13 @@ done
 # Discover raw project names that need migration. A project needs migration
 # if any of its devbox- objects (container or per-project volume) carries
 # chars that LDH-sanitize would now change.
+#
+# Degenerate raws (empty, or sanitize-to-empty like "_" or ".") are skipped:
+# they have no valid LDH target name to migrate to. Such resources are
+# orphans from earlier experiments or hand-crafted names; the migration
+# can't safely rewrite them and would otherwise emit blank "==  →  =="
+# rows. They show up in the runtime warning instead, where the user can
+# remove them manually.
 discover_projects() {
     local seen=()
 
@@ -50,9 +57,11 @@ discover_projects() {
         [ -z "$c" ] && continue
         local raw="${c#devbox-}"
         [ "$raw" = "$c" ] && continue          # safety: prefix didn't strip
+        [ -z "$raw" ] && continue              # bare "devbox-" (degenerate)
         [ "$raw" = "traefik" ] && continue     # devbox-traefik is shared infra
         local sanitized
         sanitized="$(devbox::sanitize "$raw")"
+        [ -z "$sanitized" ] && continue        # nothing left after sanitize
         [ "$raw" = "$sanitized" ] && continue
         seen+=("$raw")
     done < <(docker ps -a --filter "name=^devbox-" --format '{{.Names}}' 2>/dev/null || true)
@@ -72,13 +81,19 @@ discover_projects() {
                 break
             fi
         done
+        [ -z "$raw" ] && continue              # bare "devbox--<suffix>"
         local sanitized
         sanitized="$(devbox::sanitize "$raw")"
+        [ -z "$sanitized" ] && continue        # nothing left after sanitize
         [ "$raw" = "$sanitized" ] && continue
         seen+=("$raw")
     done < <(docker volume ls --format '{{.Name}}' 2>/dev/null || true)
 
-    printf '%s\n' "${seen[@]+"${seen[@]}"}" | sort -u
+    # Guard against `printf '%s\n'` with zero args emitting a single blank
+    # line — that would round-trip through mapfile as a 1-element array of
+    # an empty string, falsely claiming "Found 1 project" with empty raw.
+    [ ${#seen[@]} -eq 0 ] && return 0
+    printf '%s\n' "${seen[@]}" | sort -u
 }
 
 mapfile -t projects < <(discover_projects)

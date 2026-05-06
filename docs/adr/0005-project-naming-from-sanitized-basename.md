@@ -111,3 +111,50 @@ We deliberately do **not**:
   test harness — adding a bats harness is intentionally deferred.
 - Users with legacy un-sanitized volumes see a one-time warning; the data
   is not deleted automatically.
+
+## Updates 2026-05-06 — tighten allowlist to RFC 1034/1035 LDH
+
+The original sanitize accepted `[A-Za-z0-9_.-]`. Both `_` and `.` are valid
+in docker container/volume names but **not** in DNS labels (RFC 1034/1035).
+The same project name flows into the Traefik route host
+`[<port>.]<project>.127.0.0.1.traefik.me`, where Django and other
+RFC-strict frameworks reject hosts containing `_` with `DisallowedHost`.
+A project at `~/Projekty/universe_media_api` produced exactly this:
+the container started, but every browser hit died at the WSGI/ASGI host
+check.
+
+Tighten the allowlist to strict LDH (`[a-zA-Z0-9-]`). Same algorithm,
+narrower set. `tr -s` collapse and edge-trim are unchanged; idempotency
+holds.
+
+**Active migration, not warn-only.** The original ADR took a deliberate
+warn-only stance for un-sanitized volumes — "volumes can be large and the
+failure modes are unpleasant." That policy assumed a user-driven cause
+(rename the project directory, change basename). The LDH tightening is
+different: it's a **break-fix** where every existing project with `_` or
+`.` in its basename has been silently broken under Traefik routing.
+Leaving those projects warn-only would force every user to manually
+rename containers + copy volumes by hand.
+
+`scripts/migrate-naming-ldh.sh` therefore actively migrates:
+
+- per-project volumes are data-copied (`alpine cp -a`) into
+  freshly-created LDH-named volumes, then the legacy volumes are
+  removed. The migration **refuses** to migrate a volume whose LDH
+  target already exists: two distinct legacy basenames can sanitize to
+  the same LDH name (e.g. `foo_bar` and `foo.bar` both → `foo-bar`),
+  and silent merge under `--auto` would mix unrelated projects' data.
+  The user resolves manually with `docker volume rm <stale>` and
+  `devbox migrate-naming`.
+- the legacy container is stopped and removed (its `--hostname` is
+  immutable post-`docker run`, so a rename would leave the un-LDH
+  hostname inside; the next `devbox <project>` recreates the container
+  cleanly against the migrated volumes)
+- stale Traefik dynamic configs keyed by the legacy container name are
+  deleted; `apply_port_routes()` regenerates them on the next start
+
+`devbox update` runs the migration with `--auto`, mirroring the
+`migrate-to-bindmount.sh` hook pattern (ADR 0002). For users who don't
+run `devbox update`, `docker-run.sh` still emits a runtime warning when
+`DEVBOX_PROJECT_NAME_RAW != DEVBOX_PROJECT_NAME` and a legacy
+container/volume is found, pointing at `devbox migrate-naming`.

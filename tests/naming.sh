@@ -8,7 +8,7 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source-path=SCRIPTDIR source=../lib/naming.sh
+# shellcheck source-path=SCRIPTDIR source=../lib/naming.sh disable=SC1091
 source "$SCRIPT_DIR/../lib/naming.sh"
 
 fail_count=0
@@ -30,6 +30,10 @@ assert_eq "sanitize ascii"           "my-app"     "$(devbox::sanitize "my-app")"
 assert_eq "sanitize space"           "Foo-Bar"    "$(devbox::sanitize "Foo Bar")"
 assert_eq "sanitize multi-space"     "a-b"        "$(devbox::sanitize "a   b")"
 assert_eq "sanitize diacritics"      "v-ce"       "$(devbox::sanitize "více")"
+assert_eq "sanitize underscore"      "foo-bar"    "$(devbox::sanitize "foo_bar")"
+assert_eq "sanitize underscore run"  "foo-bar"    "$(devbox::sanitize "foo___bar")"
+assert_eq "sanitize dot"             "foo-bar"    "$(devbox::sanitize "foo.bar")"
+assert_eq "sanitize mixed bad"       "foo-bar"    "$(devbox::sanitize "foo_.bar")"
 assert_eq "sanitize trim leading"    "x"          "$(devbox::sanitize "-x")"
 assert_eq "sanitize trim trailing"   "x"          "$(devbox::sanitize "x-")"
 assert_eq "sanitize idempotent"      "my-app"     "$(devbox::sanitize "$(devbox::sanitize "my app")")"
@@ -66,6 +70,14 @@ assert_eq "from_path sanitized name"     "Foo-Bar"                      "$DEVBOX
 assert_eq "from_path sanitized container" "devbox-Foo-Bar"              "$DEVBOX_CONTAINER_NAME"
 assert_eq "from_path sanitized hostname"  "Foo-Bar"                     "$DEVBOX_HOSTNAME"
 assert_eq "from_path sanitized history"   "devbox-Foo-Bar-history"      "$DEVBOX_VOL_HISTORY"
+
+# Path with underscore (the LDH-tightening scenario — RFC 1034/1035 forbids `_`)
+devbox::names_from_path "/home/u/Projekty/foo_bar"
+assert_eq "from_path underscore RAW"     "foo_bar"                      "$DEVBOX_PROJECT_NAME_RAW"
+assert_eq "from_path underscore name"    "foo-bar"                      "$DEVBOX_PROJECT_NAME"
+assert_eq "from_path underscore cont"    "devbox-foo-bar"               "$DEVBOX_CONTAINER_NAME"
+assert_eq "from_path underscore host"    "foo-bar"                      "$DEVBOX_HOSTNAME"
+assert_eq "from_path underscore vol"     "devbox-foo-bar-history"       "$DEVBOX_VOL_HISTORY"
 
 # --- devbox::names_from_token ------------------------------------------------
 

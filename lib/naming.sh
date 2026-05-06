@@ -23,13 +23,18 @@ DEVBOX_ROUTE_DOMAIN="127.0.0.1.traefik.me"
 
 # --- Public API --------------------------------------------------------------
 
-# Sanitize an arbitrary string into a name safe for docker objects:
-# replace runs of non-[A-Za-z0-9_.-] with a single dash, then trim leading
-# and trailing dashes.
+# Sanitize an arbitrary string into a name safe for docker objects AND for
+# DNS labels (RFC 1034/1035 LDH): replace runs of non-[A-Za-z0-9-] with a
+# single dash, then trim leading and trailing dashes.
+#
+# `_` and `.` are deliberately excluded — both are valid in docker container
+# and volume names but not in DNS labels, and the same project name flows
+# into the Traefik route host. Keeping the allowlist strict at LDH lets
+# every derived name stay valid simultaneously.
 #
 # Usage: devbox::sanitize <s>
 devbox::sanitize() {
-    echo "$1" | tr -cs 'a-zA-Z0-9_.-' '-' | sed 's/^-//;s/-$//'
+    echo "$1" | tr -cs 'a-zA-Z0-9-' '-' | sed 's/^-//;s/-$//'
 }
 
 # Compute a `devbox-<project>-<suffix>` volume name.

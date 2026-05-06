@@ -23,6 +23,7 @@ Usage:
   devbox build [flags]             Build/rebuild the devbox image
   devbox update                    Update devbox (pull repo + rebuild image)
   devbox migrate                   Migrate data to new layout (interactive; auto-run by 'devbox update')
+  devbox migrate-naming            Rename legacy non-LDH containers/volumes (auto-run by 'devbox update')
   devbox uninstall                 Remove everything (containers, volumes, image)
   devbox prune [--all]             Remove old build cache (--all = everything)
   devbox claude-token              Generate/regenerate Claude Code token
@@ -432,6 +433,7 @@ case "${1:-}" in
     build)     MODE="build";     shift ;;
     update)    MODE="update";    shift ;;
     migrate)   MODE="migrate";   shift ;;
+    migrate-naming) MODE="migrate-naming"; shift ;;
     uninstall) MODE="uninstall"; shift ;;
     prune)     MODE="prune";     shift; PRUNE_ALL=false
                [[ "${1:-}" == "--all" ]] && PRUNE_ALL=true
@@ -579,6 +581,19 @@ if [ "$MODE" = "update" ]; then
                 exit 1
             fi
         fi
+        # Auto-run LDH naming migration. `--check` exits 0 iff at least one
+        # devbox container/volume carries chars the LDH-tightened sanitize
+        # would now rewrite (e.g. `_`, `.`). See ADR 0005 (2026-05-06).
+        if "$DEVBOX_DIR/scripts/migrate-naming-ldh.sh" --check; then
+            echo ""
+            echo -e "\033[1;36m==> Detected pre-LDH containers/volumes — auto-migrating names\033[0m"
+            echo "    (volume data preserved; old containers removed, recreated on next devbox)"
+            if ! "$DEVBOX_DIR/scripts/migrate-naming-ldh.sh" --auto; then
+                echo -e "\033[1;31m==> Naming migration FAILED. Aborting update.\033[0m"
+                echo "    Run 'devbox migrate-naming' interactively to diagnose."
+                exit 1
+            fi
+        fi
         echo "Rebuilding image..."
         exec "$DEVBOX_DIR/build.sh" "$@"
     else
@@ -597,6 +612,10 @@ fi
 
 if [ "$MODE" = "migrate" ]; then
     exec "$DEVBOX_DIR/scripts/migrate-to-bindmount.sh" "$@"
+fi
+
+if [ "$MODE" = "migrate-naming" ]; then
+    exec "$DEVBOX_DIR/scripts/migrate-naming-ldh.sh" "$@"
 fi
 
 # --- devbox prune ------------------------------------------------------------
@@ -1075,14 +1094,21 @@ if [ -d "${1:-.}" ]; then
     PROJECT_NAME="$DEVBOX_PROJECT_NAME"
     CONTAINER_NAME="$DEVBOX_CONTAINER_NAME"
 
-    # Warn about legacy (un-sanitized) volumes from an earlier devbox layout.
-    # Reverse derivation never matched these, so `devbox reset/remove` couldn't
-    # find them. No auto-rename — user removes manually with `docker volume rm`.
+    # Warn about legacy (un-sanitized) containers/volumes from an earlier
+    # devbox layout — including the post-LDH break-fix where old names contain
+    # `_` or `.`. Reverse derivation never matched these, so `devbox
+    # reset/remove` couldn't find them. Safety-net for users who don't run
+    # `devbox update`; the active migration there handles them.
     if [ "$DEVBOX_PROJECT_NAME_RAW" != "$DEVBOX_PROJECT_NAME" ]; then
+        legacy_container="devbox-${DEVBOX_PROJECT_NAME_RAW}"
+        if docker ps -a --filter "name=^${legacy_container}$" --format '{{.ID}}' | grep -q .; then
+            echo "WARNING: legacy container '${legacy_container}' found — run 'devbox migrate-naming' or remove with:" >&2
+            echo "  docker stop '${legacy_container}' && docker rm '${legacy_container}'" >&2
+        fi
         for suffix in "${DEVBOX_PROJECT_VOLUME_SUFFIXES[@]}"; do
             legacy_vol="devbox-${DEVBOX_PROJECT_NAME_RAW}-${suffix}"
             if docker volume inspect "$legacy_vol" >/dev/null 2>&1; then
-                echo "WARNING: legacy volume '${legacy_vol}' found — remove with: docker volume rm '${legacy_vol}'" >&2
+                echo "WARNING: legacy volume '${legacy_vol}' found — run 'devbox migrate-naming' or remove with: docker volume rm '${legacy_vol}'" >&2
             fi
         done
     fi

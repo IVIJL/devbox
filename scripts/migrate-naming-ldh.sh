@@ -101,9 +101,9 @@ for raw in "${projects[@]}"; do
 done
 echo
 echo "Per project:"
-echo "  - Stop the running container (if any)"
+echo "  - Stop and remove the legacy container (volume mounts in its config block volume rm)"
 echo "  - Copy each ${DEVBOX_PROJECT_VOLUME_SUFFIXES[*]} volume to its LDH name (data preserved)"
-echo "  - Remove the old volumes and old container"
+echo "  - Remove the old volumes"
 echo "  - Drop stale traefik dynamic configs (regenerated on next start)"
 echo
 
@@ -152,9 +152,19 @@ for raw in "${projects[@]}"; do
 
     project_failed=false
     old_container="devbox-${raw}"
-    if docker ps --filter "name=^${old_container}$" --format '{{.ID}}' | grep -q .; then
-        echo "  Stopping $old_container..."
-        docker stop -t 30 "$old_container" >/dev/null
+
+    # Stop+rm the legacy container BEFORE touching volumes. A container in
+    # Exited state still holds its volume mounts in its config, which makes
+    # `docker volume rm` fail with "volume is in use". Removing the container
+    # first releases the references; the next `devbox <project>` recreates
+    # it cleanly with an LDH hostname against the migrated volumes.
+    if docker ps -a --filter "name=^${old_container}$" --format '{{.ID}}' | grep -q .; then
+        if docker ps --filter "name=^${old_container}$" --format '{{.ID}}' | grep -q .; then
+            echo "  Stopping $old_container..."
+            docker stop -t 30 "$old_container" >/dev/null
+        fi
+        echo "  Removing container $old_container"
+        docker rm "$old_container" >/dev/null
     fi
 
     for suffix in "${DEVBOX_PROJECT_VOLUME_SUFFIXES[@]}"; do
@@ -171,17 +181,13 @@ for raw in "${projects[@]}"; do
         fi
     done
 
-    # If any volume migration failed, don't tear down container or traefik
-    # configs — the legacy resources stay self-consistent so the user can
-    # diagnose, fix, and re-run safely.
+    # If any volume migration failed, don't tear down traefik configs — the
+    # remaining legacy volumes stay discoverable so the user can diagnose,
+    # fix, and re-run safely. (The container is already gone; that's fine —
+    # next `devbox <project>` recreates it once volumes are settled.)
     if [ "$project_failed" = true ]; then
-        echo -e "  ${YELLOW}Skipping container/traefik cleanup for '$raw' — fix volume issue and re-run.${NC}" >&2
+        echo -e "  ${YELLOW}Skipping traefik cleanup for '$raw' — fix volume issue and re-run.${NC}" >&2
         continue
-    fi
-
-    if docker ps -a --filter "name=^${old_container}$" --format '{{.ID}}' | grep -q .; then
-        echo "  Removing container $old_container"
-        docker rm "$old_container" >/dev/null
     fi
 
     if [ -d "$TRAEFIK_CONFIG_DIR" ]; then

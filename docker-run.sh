@@ -953,6 +953,20 @@ if [ "$MODE" = "update" ]; then
                 exit 1
             fi
         fi
+        # Auto-rewrite Traefik dynamic configs that still reference the dead
+        # traefik.me wildcard DNS into the new dual-`Host()` rule covering
+        # both `.test` (local mode) and `.127.0.0.1.sslip.io` (external mode).
+        # If dns.conf is missing the migration also runs `dns-install` so the
+        # host resolver and the route configs end up consistent in one pass.
+        # See ADR 0007 § "Migration from traefik.me".
+        if "$DEVBOX_DIR/scripts/migrate-traefik-me-routes.sh" --check; then
+            echo ""
+            echo -e "\033[1;36m==> Detected Traefik routes referencing dead traefik.me — rewriting to dual-Host rule (.test || sslip.io)\033[0m"
+            if ! "$DEVBOX_DIR/scripts/migrate-traefik-me-routes.sh" --auto; then
+                echo -e "\033[1;31m==> traefik.me route migration FAILED. Aborting update.\033[0m"
+                exit 1
+            fi
+        fi
         echo "Rebuilding image..."
         exec "$DEVBOX_DIR/build.sh" "$@"
     else

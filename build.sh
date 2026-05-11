@@ -44,8 +44,17 @@ IMAGE="vlcak/devbox:latest"
 
 # Full reset: volumes, cache, dangling images
 full_reset() {
-    # Stop and remove all devbox containers (including traefik) so volumes can be deleted
-    CONTAINERS=$(docker ps -a --filter "name=^devbox-" --format '{{.Names}}' 2>/dev/null || true)
+    # Stop and remove every devbox-managed container — both the dash-prefix
+    # user projects (`devbox-<project>`) and the two explicit underscore
+    # shared-infra names (`devbox_traefik`, `devbox_dns`, introduced by
+    # ADR 0007). The dash-prefix half can stay broad because `devbox::sanitize`
+    # is the only producer of those names; the underscore half must list the
+    # two infra names exactly so a hand-created Docker container that happens
+    # to start with `devbox_` (e.g. a personal `devbox_postgres`) is not
+    # caught and torn down. Keep this in sync with
+    # `DEVBOX_SHARED_CONTAINER_NAMES` in docker-run.sh.
+    CONTAINERS=$(docker ps -a --format '{{.Names}}' 2>/dev/null \
+        | grep -E '^devbox-|^devbox_traefik$|^devbox_dns$' || true)
     if [ -n "$CONTAINERS" ]; then
         echo "Stopping devbox containers..."
         while IFS= read -r c; do
@@ -86,6 +95,21 @@ full_reset() {
 
 if [ "$UNINSTALL" = true ]; then
     echo "=== Uninstall: full reset ==="
+
+    # Tear down the host-side DNS resolver wiring first. It lives outside
+    # Docker (per-OS resolver drop-ins, Windows NRPT, ~/.config/devbox/dns.conf)
+    # so full_reset's container/volume cleanup wouldn't touch any of it.
+    # May prompt for sudo and on WSL2 may pop a UAC dialog for the NRPT
+    # rule — same expectations as `devbox dns-install`. `|| true` so a
+    # UAC decline (or any partial failure) doesn't abort the rest of the
+    # uninstall flow; users can re-run `devbox dns-uninstall` standalone.
+    SCRIPT_PARENT="$(cd "$(dirname "$0")" && pwd)"
+    if [ -x "$SCRIPT_PARENT/scripts/dns-install.sh" ]; then
+        echo ""
+        echo "Removing host DNS resolver configuration..."
+        "$SCRIPT_PARENT/scripts/dns-install.sh" uninstall || true
+    fi
+
     full_reset
 
     # Remove devbox image

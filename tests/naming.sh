@@ -11,6 +11,28 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source-path=SCRIPTDIR source=../lib/naming.sh disable=SC1091
 source "$SCRIPT_DIR/../lib/naming.sh"
 
+# Isolate the DNS surface from the user's real ~/.config/devbox/dns.conf by
+# pointing every load at a per-test tmp file.
+_TMP_DNS_CONF="$(mktemp)"
+export DEVBOX_DNS_CONF="$_TMP_DNS_CONF"
+trap 'rm -f "$_TMP_DNS_CONF"' EXIT
+
+# Reset dns.conf cache + on-disk content. Pass key=value pairs to seed.
+seed_dns_conf() {
+    devbox::reset_dns_cache
+    : > "$_TMP_DNS_CONF"
+    local line
+    for line in "$@"; do
+        printf '%s\n' "$line" >> "$_TMP_DNS_CONF"
+    done
+}
+
+# Force "no dns.conf" by pointing at a non-existent file.
+clear_dns_conf() {
+    devbox::reset_dns_cache
+    rm -f "$_TMP_DNS_CONF"
+}
+
 fail_count=0
 
 assert_eq() {
@@ -43,10 +65,69 @@ assert_eq "sanitize idempotent"      "my-app"     "$(devbox::sanitize "$(devbox:
 assert_eq "volume_name history"      "devbox-foo-history"   "$(devbox::volume_name foo history)"
 assert_eq "volume_name docker"       "devbox-foo-docker"    "$(devbox::volume_name foo docker)"
 
-# --- devbox::route_host ------------------------------------------------------
+# --- devbox::route_domain (default = test when dns.conf absent) --------------
 
-assert_eq "route_host w/ port"       "3000.foo.127.0.0.1.traefik.me"   "$(devbox::route_host foo 3000)"
-assert_eq "route_host no port"       "foo.127.0.0.1.traefik.me"        "$(devbox::route_host foo)"
+clear_dns_conf
+assert_eq "route_domain default"            "test"      "$(devbox::route_domain)"
+assert_eq "external_provider default"       "sslip.io"  "$(devbox::external_provider)"
+
+# active_domain overridden via dns.conf
+seed_dns_conf "active_domain=127.0.0.1.sslip.io" "external_provider=sslip.io"
+assert_eq "route_domain external override"  "127.0.0.1.sslip.io"   "$(devbox::route_domain)"
+assert_eq "external_provider from conf"     "sslip.io"             "$(devbox::external_provider)"
+
+# external_provider override is honored
+seed_dns_conf "active_domain=test" "external_provider=nip.io"
+assert_eq "route_domain local from conf"    "test"      "$(devbox::route_domain)"
+assert_eq "external_provider nip.io"        "nip.io"    "$(devbox::external_provider)"
+
+# Comments + whitespace tolerated; unknown keys ignored. Use *non-default*
+# values on both sides so a parser that silently drops the line cannot pass
+# this assertion by falling back to the built-in default.
+seed_dns_conf \
+    "# leading comment" \
+    "" \
+    "  preferred=auto   # trailing comment" \
+    "active_domain = 127.0.0.1.sslip.io " \
+    " external_provider = nip.io  # spaces around = on both sides" \
+    "bogus_key=ignored"
+assert_eq "dns.conf whitespace tolerant active_domain"   "127.0.0.1.sslip.io"  "$(devbox::route_domain)"
+assert_eq "dns.conf whitespace tolerant external"        "nip.io"              "$(devbox::external_provider)"
+
+# --- devbox::route_hosts (always dual-emits local + external) ----------------
+
+seed_dns_conf "active_domain=test" "external_provider=sslip.io"
+
+expected_with_port=$'3000.foo.test\n3000.foo.127.0.0.1.sslip.io'
+assert_eq "route_hosts w/ port"      "$expected_with_port"   "$(devbox::route_hosts foo 3000)"
+
+expected_no_port=$'foo.test\nfoo.127.0.0.1.sslip.io'
+assert_eq "route_hosts no port"      "$expected_no_port"     "$(devbox::route_hosts foo)"
+
+# Mode switch (active_domain → external) must NOT change route_hosts output —
+# both URL forms always coexist in Traefik routes.
+seed_dns_conf "active_domain=127.0.0.1.sslip.io" "external_provider=sslip.io"
+assert_eq "route_hosts unchanged in ext mode" "$expected_with_port" "$(devbox::route_hosts foo 3000)"
+
+# Custom external_provider flows into the external hostname.
+seed_dns_conf "active_domain=test" "external_provider=nip.io"
+expected_nipio=$'3000.foo.test\n3000.foo.127.0.0.1.nip.io'
+assert_eq "route_hosts uses nip.io"  "$expected_nipio"       "$(devbox::route_hosts foo 3000)"
+
+# --- devbox::route_host_display (single hostname per active mode) ------------
+
+seed_dns_conf "active_domain=test" "external_provider=sslip.io"
+assert_eq "display local w/ port"    "3000.foo.test"         "$(devbox::route_host_display foo 3000)"
+assert_eq "display local no port"    "foo.test"              "$(devbox::route_host_display foo)"
+
+seed_dns_conf "active_domain=127.0.0.1.sslip.io" "external_provider=sslip.io"
+assert_eq "display external w/ port" "3000.foo.127.0.0.1.sslip.io"  "$(devbox::route_host_display foo 3000)"
+assert_eq "display external no port" "foo.127.0.0.1.sslip.io"       "$(devbox::route_host_display foo)"
+
+# No dns.conf → defaults (test).
+clear_dns_conf
+assert_eq "display default w/ port"  "3000.foo.test"         "$(devbox::route_host_display foo 3000)"
+assert_eq "display default no port"  "foo.test"              "$(devbox::route_host_display foo)"
 
 # --- devbox::project_volume_regex --------------------------------------------
 

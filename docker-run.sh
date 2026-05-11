@@ -59,7 +59,7 @@ Examples:
   devbox stop my-app               Stop specific container
   devbox stop --clean              Stop + remove Docker/history volumes
   devbox remove                    Interactive project data cleanup
-  devbox port 3000                 Route 3000.<project>.127.0.0.1.traefik.me
+  devbox port 3000                 Route 3000.<project>.test (and external fallback URL)
   devbox connect                   Interactive cross-devbox service picker
   devbox connect api 5432          Forward current devbox -> devbox-api:5432
   devbox connect db 5432 15432     Use an explicit local forward port
@@ -194,8 +194,11 @@ apply_port_routes() {
         port="${port%%#*}"
         [ -z "$port" ] && continue
 
-        local host_rule
-        host_rule="$(devbox::route_host "$project" "$port")"
+        local host_rule="" sep="" host
+        while IFS= read -r host; do
+            host_rule+="${sep}Host(\`${host}\`)"
+            sep=" || "
+        done < <(devbox::route_hosts "$project" "$port")
         local config_file="${TRAEFIK_CONFIG_DIR}/${container}-${port}.yml"
         local router_name="${container}-${port}"
 
@@ -203,7 +206,7 @@ apply_port_routes() {
 http:
   routers:
     ${router_name}:
-      rule: "Host(\`${host_rule}\`)"
+      rule: "${host_rule}"
       entryPoints:
         - web
       service: ${router_name}
@@ -410,7 +413,7 @@ list_running_containers() {
         while IFS=$'\t' read -r name status running; do
             local project url
             project="${name#devbox-}"
-            url="http://$(devbox::route_host "$project" '<port>')"
+            url="http://$(devbox::route_host_display "$project" '<port>')"
             printf '%-25s %-50s %s\n' "$name" "$url" "$status"
         done <<< "$containers"
     fi
@@ -826,7 +829,7 @@ if [ "$MODE" = "port" ]; then
     while IFS= read -r container; do
         [ -z "$container" ] && continue
         local_project="${container#devbox-}"
-        echo "  http://$(devbox::route_host "$local_project" "$PORT_NUM") → ${container}:${PORT_NUM}"
+        echo "  http://$(devbox::route_host_display "$local_project" "$PORT_NUM") → ${container}:${PORT_NUM}"
     done <<< "$running"
     exit 0
 fi
@@ -1704,7 +1707,7 @@ if [ -f "$ports_file" ] && [ -s "$ports_file" ]; then
     while read -r port _rest; do
         port="${port%%#*}"
         [ -z "$port" ] && continue
-        echo "  http://$(devbox::route_host "$PROJECT_NAME" "$port") → ${CONTAINER_NAME}:${port}"
+        echo "  http://$(devbox::route_host_display "$PROJECT_NAME" "$port") → ${CONTAINER_NAME}:${port}"
     done < "$ports_file"
 else
     echo "  Set port: devbox port <port>"

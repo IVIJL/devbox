@@ -198,7 +198,7 @@ Shared across all containers:
 - Firewall allowlist (`~/.config/devbox/allowed-domains.conf`)
 - Host `~/.claude/` directory (read-only, for user-level `CLAUDE.md`)
 - Host `~/.config/git/ignore` (global gitignore)
-- Traefik proxy (`devbox-traefik`)
+- Traefik proxy (`devbox_traefik`) and DNS resolver (`devbox_dns`) shared infra
 
 ```bash
 devbox ~/projects/app-a          # Start first project

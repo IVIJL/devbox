@@ -75,6 +75,31 @@ SSH_WARNING=""
 DEVBOX_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 TRAEFIK_CONFIG_DIR="$HOME/.config/devbox/traefik/dynamic"
 CONNECT_CONFIG_DIR="$HOME/.config/devbox/connect"
+DNS_CONFIG_DIR="$HOME/.config/devbox/dns"
+
+# Container names that belong to shared devbox infrastructure, not to any
+# user project. Enumeration / cleanup sites filter these out via
+# `filter_user_containers` so per-project loops never accidentally stop or
+# tear down the shared proxy / resolver.
+#
+# Naming convention: shared infra uses an UNDERSCORE separator
+# (`devbox_traefik`, `devbox_dns`) — `devbox::sanitize` converts `_` to
+# `-`, so no user project token can ever produce these names, making the
+# project / infra namespaces provably disjoint (see ADR 0007).
+#
+# Legacy dash-separator names (`devbox-traefik`, `devbox-dns`) are listed
+# here only for the migration window — `scripts/migrate-shared-infra-naming.sh`
+# (auto-triggered by `devbox update`) stops and removes them so the next
+# bootstrap recreates them under the new names. Once a user has run
+# `devbox update`, the legacy entries are dead code, kept defensively so
+# enumeration during the transition window cannot misclassify a legacy
+# infra container as a user project.
+DEVBOX_SHARED_CONTAINER_NAMES=(
+    devbox_traefik
+    devbox_dns
+    devbox-traefik
+    devbox-dns
+)
 
 # Allowlist module — defines ALLOWLIST_HOST_FILE, IPSET_NAME, allowlist::* fns
 # shellcheck source=lib/allowlist.sh
@@ -124,6 +149,20 @@ set_tab_title() {
     printf '\033]0;%s\033\\' "$1"
 }
 
+# Filter a stream of `docker ps` output (one container per line, optional
+# tab-separated extra fields) down to user-owned devbox containers. Drops
+# DEVBOX_SHARED_CONTAINER_NAMES entries. awk-based so empty result still
+# exits 0 (unlike `grep -v` which needs trailing `|| true`).
+filter_user_containers() {
+    awk -F '\t' -v shared="${DEVBOX_SHARED_CONTAINER_NAMES[*]}" '
+        BEGIN {
+            n = split(shared, arr, " ")
+            for (i = 1; i <= n; i++) excl[arr[i]] = 1
+        }
+        !($1 in excl)
+    '
+}
+
 bootstrap_traefik() {
     docker network inspect devproxy >/dev/null 2>&1 || docker network create devproxy
 
@@ -132,15 +171,15 @@ bootstrap_traefik() {
     seed_default_ports
 
     # If traefik exists but is exited, restart it
-    if docker ps -a --filter "name=^devbox-traefik$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
+    if docker ps -a --filter "name=^devbox_traefik$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
         echo "Restarting Traefik proxy..."
-        docker start devbox-traefik
+        docker start devbox_traefik
         return
     fi
 
-    if ! docker ps --format '{{.Names}}' | grep -qx devbox-traefik; then
+    if ! docker ps --format '{{.Names}}' | grep -qx devbox_traefik; then
         echo "Starting Traefik proxy..."
-        docker run -d --name devbox-traefik --restart unless-stopped \
+        docker run -d --name devbox_traefik --restart unless-stopped \
             --network devproxy \
             -p 127.0.0.1:80:80 \
             -v /var/run/docker.sock:/var/run/docker.sock:ro \
@@ -157,6 +196,62 @@ bootstrap_traefik() {
 
 seed_allowed_domains() {
     allowlist::ensure_seeded "$ALLOWLIST_HOST_FILE" "$DEVBOX_DIR/config/default-allowlist.conf"
+}
+
+# Copy the baked-in dnsmasq config into the host config dir on first run so
+# the bind-mount target exists. Full self-healing (regenerate on drift,
+# SIGHUP on update) lands with Phase 4.
+seed_dns_runtime_config() {
+    mkdir -p "$DNS_CONFIG_DIR"
+    local runtime="$DNS_CONFIG_DIR/devbox.conf"
+    if [ ! -f "$runtime" ]; then
+        cp "$DEVBOX_DIR/config/dns/devbox.conf" "$runtime"
+    fi
+}
+
+# Start the devbox_dns dnsmasq container in local mode (active_domain=test).
+# Skipped in external mode — sslip.io needs no host-side resolver. Mirrors
+# bootstrap_traefik: lazy network create, restart-if-exited, run-if-missing.
+#
+# Runs dnsmasq as root inside the container so it can bind the privileged
+# port 53; the host-side port mapping stays loopback-only per ADR 0007.
+#
+# Image guard: the resolver reuses the devbox image (dnsmasq is already
+# baked in per ADR 0001). On a clean checkout without `devbox build`, the
+# image is absent; we degrade with a visible WARNING rather than letting
+# `docker run` implicit-pull an unrelated `vlcak/devbox:latest` from a
+# registry. The user's own container creation later in this script still
+# fails-loud at its own image-inspect guard.
+bootstrap_dns() {
+    [ "$(devbox::route_domain)" = "$DEVBOX_LOCAL_TLD" ] || return 0
+
+    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        echo "WARNING: devbox_dns not started — image $IMAGE not built locally." >&2
+        echo "         .test URLs will not resolve from the host until you run: devbox build" >&2
+        return 0
+    fi
+
+    docker network inspect devproxy >/dev/null 2>&1 || docker network create devproxy
+    seed_dns_runtime_config
+
+    if docker ps -a --filter "name=^devbox_dns$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
+        echo "Restarting DNS resolver..."
+        docker start devbox_dns
+        return
+    fi
+
+    if ! docker ps --format '{{.Names}}' | grep -qx devbox_dns; then
+        echo "Starting DNS resolver..."
+        docker run -d --name devbox_dns --pull=never --restart unless-stopped \
+            --network devproxy \
+            -u root \
+            -p 127.0.0.1:53:53/udp \
+            -p 127.0.0.1:53:53/tcp \
+            -v "$DNS_CONFIG_DIR/devbox.conf:/etc/devbox-dns.conf:ro" \
+            --entrypoint dnsmasq \
+            "$IMAGE" \
+            --keep-in-foreground --conf-file=/etc/devbox-dns.conf
+    fi
 }
 
 seed_default_ports() {
@@ -288,7 +383,7 @@ start_devbox_connections() {
 }
 
 list_devbox_container_names() {
-    docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true
+    docker ps --filter "name=^devbox-" --format '{{.Names}}' | filter_user_containers
 }
 
 discover_published_tcp_services() {
@@ -358,11 +453,21 @@ graceful_stop_container() {
 
 stop_traefik_if_idle() {
     local remaining
-    remaining=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
-    if [ -z "$remaining" ] && docker ps --format '{{.Names}}' | grep -qx devbox-traefik; then
-        docker stop devbox-traefik > /dev/null
-        docker rm devbox-traefik > /dev/null
-        echo "Stopped: devbox-traefik (no remaining containers)"
+    remaining=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | filter_user_containers)
+    if [ -z "$remaining" ] && docker ps --format '{{.Names}}' | grep -qx devbox_traefik; then
+        docker stop devbox_traefik > /dev/null
+        docker rm devbox_traefik > /dev/null
+        echo "Stopped: devbox_traefik (no remaining containers)"
+    fi
+}
+
+stop_dns_if_idle() {
+    local remaining
+    remaining=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | filter_user_containers)
+    if [ -z "$remaining" ] && docker ps --format '{{.Names}}' | grep -qx devbox_dns; then
+        docker stop devbox_dns > /dev/null
+        docker rm devbox_dns > /dev/null
+        echo "Stopped: devbox_dns (no remaining containers)"
     fi
 }
 
@@ -405,7 +510,7 @@ restart_exited_container() {
 
 list_running_containers() {
     local containers
-    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}\t{{.Status}}\t{{.RunningFor}}' | grep -v '^devbox-traefik\b' || true)
+    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}\t{{.Status}}\t{{.RunningFor}}' | filter_user_containers)
     if [ -z "$containers" ]; then
         echo "No running devbox containers."
     else
@@ -420,7 +525,7 @@ list_running_containers() {
 
     local exited
     exited=$(docker ps -a --filter "name=^devbox-" --filter "status=exited" \
-        --format '{{.Names}}\t{{.Status}}' | grep -v '^devbox-traefik\b' || true)
+        --format '{{.Names}}\t{{.Status}}' | filter_user_containers)
     if [ -n "$exited" ]; then
         echo ""
         echo "Exited (use 'devbox <name>' to restart):"
@@ -442,7 +547,7 @@ reload_firewall_in_containers() {
     local action="${1:-}"
     local domains="${2:-}"
     local containers
-    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
+    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | filter_user_containers)
     [ -z "$containers" ] && return 0
     while IFS= read -r container; do
         if docker exec -u root "$container" /usr/local/bin/devbox-firewall-reload "$action" "$domains"; then
@@ -459,7 +564,7 @@ reload_firewall_in_containers() {
 pick_container() {
     local prompt="$1" with_all="${2:-}"
     local running
-    running=$(docker ps -a --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
+    running=$(docker ps -a --filter "name=^devbox-" --format '{{.Names}}' | filter_user_containers)
 
     if [ -z "$running" ]; then
         echo "No devbox containers." >&2
@@ -727,6 +832,20 @@ if [ "$MODE" = "update" ]; then
                 exit 1
             fi
         fi
+        # Auto-rename shared-infra containers from dash to underscore separator.
+        # devbox-traefik → devbox_traefik, devbox-dns → devbox_dns. The new
+        # separator can never be produced by `devbox::sanitize`, eliminating
+        # the collision where a user project named `traefik` or `dns` would
+        # land on the shared container name. See ADR 0007.
+        if "$DEVBOX_DIR/scripts/migrate-shared-infra-naming.sh" --check; then
+            echo ""
+            echo -e "\033[1;36m==> Detected legacy shared-infra container names — migrating to underscore separator\033[0m"
+            echo "    (Traefik / dnsmasq configs are bind-mounted; legacy containers removed, recreated on next devbox)"
+            if ! "$DEVBOX_DIR/scripts/migrate-shared-infra-naming.sh" --auto; then
+                echo -e "\033[1;31m==> Shared-infra naming migration FAILED. Aborting update.\033[0m"
+                exit 1
+            fi
+        fi
         echo "Rebuilding image..."
         exec "$DEVBOX_DIR/build.sh" "$@"
     else
@@ -812,7 +931,7 @@ if [ "$MODE" = "port" ]; then
     grep -qxF "$PORT_NUM" "$ports_file" 2>/dev/null || echo "$PORT_NUM" >> "$ports_file"
 
     # Apply to all running containers
-    running=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
+    running=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | filter_user_containers)
     if [ -z "$running" ]; then
         echo "Port saved to default-ports.conf. No running containers."
         exit 0
@@ -1065,6 +1184,7 @@ if [ "$MODE" = "stop" ]; then
             fi
             rm -f "$TRAEFIK_CONFIG_DIR/${name}"*.yml 2>/dev/null
             stop_traefik_if_idle
+            stop_dns_if_idle
             exit 0
         fi
         echo "Container $name is not running." >&2
@@ -1072,7 +1192,7 @@ if [ "$MODE" = "stop" ]; then
     # No argument or container not found → interactive selection
     selected=$(pick_container "Stop container: " "with_all") || exit 1
     if [ "$selected" = "* Stop all" ]; then
-        docker ps -a --filter "name=^devbox-" --format '{{.Names}}' | { grep -v '^devbox-traefik$' || true; } | while IFS= read -r c; do
+        docker ps -a --filter "name=^devbox-" --format '{{.Names}}' | filter_user_containers | while IFS= read -r c; do
             proj="${c#devbox-}"
             graceful_stop_container "$c"
             docker rm "$c" > /dev/null
@@ -1085,6 +1205,7 @@ if [ "$MODE" = "stop" ]; then
             rm -f "$TRAEFIK_CONFIG_DIR/${c}"*.yml 2>/dev/null
         done
         stop_traefik_if_idle
+        stop_dns_if_idle
     else
         proj="${selected#devbox-}"
         graceful_stop_container "$selected"
@@ -1097,6 +1218,7 @@ if [ "$MODE" = "stop" ]; then
         fi
         rm -f "$TRAEFIK_CONFIG_DIR/${selected}"*.yml 2>/dev/null
         stop_traefik_if_idle
+        stop_dns_if_idle
     fi
     exit 0
 fi
@@ -1194,7 +1316,7 @@ fi
 # --- devbox blocked -----------------------------------------------------------
 
 if [ "$MODE" = "blocked" ]; then
-    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | grep -v '^devbox-traefik$' || true)
+    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | filter_user_containers)
     if [ -z "$containers" ]; then
         echo "No running devbox containers."
         exit 0
@@ -1443,6 +1565,7 @@ if [ -d "${1:-.}" ]; then
     # If container exists but is exited, restart it
     if docker ps -a --filter "name=^${CONTAINER_NAME}$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
         bootstrap_traefik
+        bootstrap_dns
         if restart_exited_container "$CONTAINER_NAME"; then
             attach_to_container "$CONTAINER_NAME"
             # exec → script ends here
@@ -1459,6 +1582,7 @@ else
         attach_to_container "$CONTAINER_NAME"
     elif docker ps -a --filter "name=^${CONTAINER_NAME}$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
         bootstrap_traefik
+        bootstrap_dns
         if restart_exited_container "$CONTAINER_NAME"; then
             attach_to_container "$CONTAINER_NAME"
         else
@@ -1509,9 +1633,10 @@ if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
     fi
 fi
 
-# --- Bootstrap Traefik & devproxy network -----------------------------------
+# --- Bootstrap Traefik, DNS resolver & devproxy network ---------------------
 
 bootstrap_traefik
+bootstrap_dns
 
 # --- Build docker arguments -------------------------------------------------
 

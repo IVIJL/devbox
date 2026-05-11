@@ -86,7 +86,7 @@ post-install verification fails.
 ## Decision
 
 Stand up a **self-hosted dnsmasq container** as part of the devbox shared
-infrastructure (alongside `devbox-traefik`), with a **fallback to an
+infrastructure (alongside `devbox_traefik`), with a **fallback to an
 external wildcard DNS provider** (`sslip.io`) when the local path is not
 possible. Both URL forms coexist in Traefik routing rules so a mode switch
 never requires regenerating routes.
@@ -94,14 +94,34 @@ never requires regenerating routes.
 ### Component layout
 
 ```
-HOST OS per-TLD DNS routing  ──►  devbox-dns (dnsmasq :53/127.0.0.1)
+HOST OS per-TLD DNS routing  ──►  devbox_dns (dnsmasq :53/127.0.0.1)
                                        │
                                        ▼ resolves *.test → 127.0.0.1
-HTTP client (browser / CLI)  ──►  devbox-traefik :80
+HTTP client (browser / CLI)  ──►  devbox_traefik :80
                                        │
                                        ▼ Host header match
                                   devbox-<project>
 ```
+
+### Shared-infra naming: underscore separator
+
+Shared infrastructure containers use an **underscore** separator
+(`devbox_traefik`, `devbox_dns`); user project containers use a
+**dash** separator (`devbox-<project>`).
+
+`devbox::sanitize` collapses every non-LDH character — including
+underscore — to a dash. The function cannot produce a token containing
+`_`. Therefore no user project, however its source folder is spelled,
+can ever sanitize to a name that collides with shared infra. The two
+namespaces are provably disjoint at the naming layer.
+
+This replaces an earlier convention where the resolver was named
+`devbox-dns`. A user folder named `dns/` sanitized to `devbox-dns`,
+identical to the shared resolver — `devbox` in that folder would
+attach to dnsmasq, and enumeration would permanently hide that user
+project. The legacy dash-separator names are migrated by
+`scripts/migrate-shared-infra-naming.sh`, auto-triggered on
+`devbox update`.
 
 ### TLD: `.test` (not `.localhost`)
 
@@ -203,9 +223,9 @@ address=/test/127.0.0.1
 open resolver; a misconfigured host resolver leaking `google.com` to us
 will fail visibly rather than silently exfiltrate via 8.8.8.8.
 
-### Lifecycle: shared with `devbox-traefik`
+### Lifecycle: shared with `devbox_traefik`
 
-`devbox-dns` starts when the first devbox project starts, stops when the
+`devbox_dns` starts when the first devbox project starts, stops when the
 last one stops. Symmetric to `bootstrap_traefik` / `stop_traefik_if_idle`.
 
 Rejected alternative: always-on dnsmasq. When no devbox is running, Traefik
@@ -258,7 +278,7 @@ stance for user-driven renames) applies here.
 container:
 
 - `ensure_dns_runtime_config()` — if `~/.config/devbox/dns/devbox.conf` is
-  missing but `devbox-dns` is running (or about to start), regenerate from
+  missing but `devbox_dns` is running (or about to start), regenerate from
   the baked-in template at `config/dns/devbox.conf` and SIGHUP the running
   container.
 - `ensure_dns_meta_config()` — if `~/.config/devbox/dns.conf` is missing

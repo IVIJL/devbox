@@ -4,10 +4,14 @@
 # Install: copy to a directory in $fpath (e.g. /usr/local/share/zsh/site-functions/)
 
 _devbox_containers() {
+    # Shared infra (`devbox_traefik`, `devbox_dns`) uses underscore separator
+    # and is naturally excluded by the dash-prefix filter above. The grep
+    # below filters legacy dash-separator names that may still be running
+    # before `devbox update` migrates them away (see ADR 0007).
     local -a containers
     containers=(${(f)"$(docker ps --filter 'name=^devbox-' \
         --format '{{.Names}}' 2>/dev/null \
-        | grep -v '^devbox-traefik$' | sed 's/^devbox-//')"})
+        | grep -vE '^devbox-(traefik|dns)$' | sed 's/^devbox-//')"})
     _describe 'running devbox containers' containers
 }
 

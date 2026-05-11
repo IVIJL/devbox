@@ -204,15 +204,75 @@ seed_allowed_domains() {
     allowlist::ensure_seeded "$ALLOWLIST_HOST_FILE" "$DEVBOX_DIR/config/default-allowlist.conf"
 }
 
-# Copy the baked-in dnsmasq config into the host config dir on first run so
-# the bind-mount target exists. Full self-healing (regenerate on drift,
-# SIGHUP on update) lands with Phase 4.
-seed_dns_runtime_config() {
-    mkdir -p "$DNS_CONFIG_DIR"
+# Keep ~/.config/devbox/dns/devbox.conf bit-for-bit identical to the
+# baked-in template at $DEVBOX_DIR/config/dns/devbox.conf. Two scenarios
+# are handled here, both transparent to the user:
+#
+#   1. Missing file        → seed from template (first run).
+#   2. Template drifted    → in-place rewrite + restart devbox_dns if it
+#                            is running, so dnsmasq picks up the new
+#                            config. SIGHUP is NOT enough — dnsmasq's
+#                            documented SIGHUP semantics explicitly skip
+#                            re-reading the config file.
+#
+# The rewrite path uses `cat > "$runtime"` (not `rm + cp`) so the file's
+# inode stays the same. Docker Desktop snapshots bind-mounted files
+# under /run/desktop/mnt/host/...; an unlink-then-create cycle invalidates
+# the snapshot, and the next `docker restart devbox_dns` then fails with
+# "mount src ... no such file or directory" — observed during the
+# listen-address fix rollout.
+#
+# Custom user edits to the runtime file are NOT preserved: this is
+# internal devbox plumbing and the template owns the canonical config.
+# Per-host dnsmasq tweaks should patch config/dns/devbox.conf in the
+# repo (which then ships through this mechanism to every install).
+ensure_dns_runtime_config() {
+    local template="$DEVBOX_DIR/config/dns/devbox.conf"
     local runtime="$DNS_CONFIG_DIR/devbox.conf"
+    mkdir -p "$DNS_CONFIG_DIR"
+
     if [ ! -f "$runtime" ]; then
-        cp "$DEVBOX_DIR/config/dns/devbox.conf" "$runtime"
+        cat "$template" > "$runtime"
+        return 0
     fi
+
+    if cmp -s "$template" "$runtime"; then
+        return 0
+    fi
+
+    echo "Refreshing devbox_dns config from updated template..."
+    cat "$template" > "$runtime"
+    if docker ps --format '{{.Names}}' | grep -qx devbox_dns; then
+        docker restart devbox_dns >/dev/null
+    fi
+}
+
+# Restore ~/.config/devbox/dns.conf when the meta config has gone missing
+# but a previous local-mode install left state behind. devbox_dns is only
+# ever created by bootstrap_dns in local mode (external mode skips the
+# container entirely), so its presence — running or stopped — is a safe
+# tell that the user was on local mode before the file vanished.
+#
+# Does NOT auto-invoke `devbox dns-install`: that path writes host
+# resolver files and prompts for sudo / UAC, neither of which belongs
+# mid-`devbox <project>` invocation. Active reinstall on missing meta
+# config is reserved for `devbox update` in Phase 5 of ADR 0007.
+ensure_dns_meta_config() {
+    local conf="$HOME/.config/devbox/dns.conf"
+    [ -f "$conf" ] && return 0
+    docker ps -a --filter "name=^devbox_dns$" --format '{{.ID}}' | grep -q . || return 0
+
+    mkdir -p "$(dirname "$conf")"
+    cat > "$conf" <<EOF
+# Restored after dns.conf went missing — devbox inferred local mode from
+# the existing devbox_dns container. Re-run 'devbox dns-install' if you
+# need host resolver setup or want a different mode.
+preferred=local
+active_domain=$DEVBOX_LOCAL_TLD
+external_provider=sslip.io
+EOF
+    devbox::reset_dns_cache
+    echo "Restored ~/.config/devbox/dns.conf (inferred local mode from devbox_dns container)."
 }
 
 # Start the devbox_dns dnsmasq container in local mode (active_domain=test).
@@ -229,6 +289,11 @@ seed_dns_runtime_config() {
 # registry. The user's own container creation later in this script still
 # fails-loud at its own image-inspect guard.
 bootstrap_dns() {
+    # Phase 4 self-heal: ensure_dns_meta_config runs first because it can
+    # flip the active mode (when dns.conf was missing and we infer local
+    # from container presence), which then affects the route_domain guard.
+    ensure_dns_meta_config
+
     [ "$(devbox::route_domain)" = "$DEVBOX_LOCAL_TLD" ] || return 0
 
     if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
@@ -238,7 +303,7 @@ bootstrap_dns() {
     fi
 
     docker network inspect devproxy >/dev/null 2>&1 || docker network create devproxy
-    seed_dns_runtime_config
+    ensure_dns_runtime_config
 
     if docker ps -a --filter "name=^devbox_dns$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
         echo "Restarting DNS resolver..."

@@ -169,6 +169,61 @@ filter_user_containers() {
     '
 }
 
+# Probe TCP listeners that would clash with our `-p 127.0.0.1:80:80`
+# publish for Traefik. The conflict set is narrow:
+#   - 127.0.0.1:80               direct overlap with our IPv4 bind.
+#   - 0.0.0.0:80 / *:80          IPv4 wildcard, also serves 127.0.0.1.
+#   - [::]:80                    IPv6 wildcard; with IPV6_V6ONLY=0 it also
+#                                claims the IPv4 wildcard. We can't see
+#                                the V6ONLY flag from a probe, so we
+#                                flag it conservatively — false-positive
+#                                aborts beat docker's nameless bind error.
+# Listeners on other addresses coexist with our bind and are ignored:
+#   - 127.0.0.2:80 (or any other 127.x alias)
+#   - [::1]:80                   pure IPv6 loopback, distinct address
+#                                family from 127.0.0.1.
+#   - any non-loopback interface address (192.168.x.x:80, etc.).
+#
+# When held, echoes a single descriptive line (`pid <N> (<comm>)`
+# when ss/lsof can see the owner; a "needs root to inspect" hint
+# otherwise) and returns 0. When free, prints nothing and returns 1.
+# Mirrors the predicate shape of _dns::port_53_held_by_other in
+# scripts/dns-install.sh.
+_devbox::port_80_held_by_other() {
+    local listeners=""
+    if command -v ss >/dev/null 2>&1; then
+        # ss -p surfaces `users:(("name",pid=N,fd=M))` when this process
+        # (or root) can read the owning task; column is empty otherwise.
+        listeners="$(ss -lntp 2>/dev/null \
+            | awk 'NR>1 && $4 ~ /(^127\.0\.0\.1|^0\.0\.0\.0|^\*|^\[::\]):80$/')"
+    elif command -v lsof >/dev/null 2>&1; then
+        # lsof NAME column always has the form `<addr>:<port> (LISTEN)`;
+        # match the conflict-set addresses explicitly so a service bound
+        # to e.g. 192.168.x.x:80 or [::1]:80 doesn't block startup. This
+        # matters most on macOS, where ss is absent and lsof is the path.
+        listeners="$(lsof -nP -iTCP:80 -sTCP:LISTEN 2>/dev/null \
+            | awk 'NR>1 && / (127\.0\.0\.1|0\.0\.0\.0|\*|\[::\]):80 \(LISTEN\)$/')"
+    else
+        # No probe tool available — we cannot prove a conflict, so let
+        # docker run surface the bind error in its own words.
+        return 1
+    fi
+    [ -n "$listeners" ] || return 1
+
+    local desc=""
+    if command -v ss >/dev/null 2>&1; then
+        desc="$(printf '%s\n' "$listeners" \
+            | grep -oE 'users:\(\("[^"]+",pid=[0-9]+' \
+            | sed -E 's/users:\(\("([^"]+)",pid=([0-9]+)/pid \2 (\1)/' \
+            | head -1)"
+    else
+        desc="$(printf '%s\n' "$listeners" | awk 'NR==1 {printf "pid %s (%s)", $2, $1}')"
+    fi
+    [ -z "$desc" ] && desc="(listener present; rerun with sudo to see PID)"
+    printf '%s\n' "$desc"
+    return 0
+}
+
 bootstrap_traefik() {
     docker network inspect devproxy >/dev/null 2>&1 || docker network create devproxy
 
@@ -184,6 +239,16 @@ bootstrap_traefik() {
     fi
 
     if ! docker ps --format '{{.Names}}' | grep -qx devbox_traefik; then
+        # Pre-flight: docker run -p 127.0.0.1:80:80 would fail with
+        # "bind: address already in use" but never names the offender.
+        # Probe first so we can fail loud with PID + comm — the user can
+        # stop the process or remap its port in a single step.
+        local owner
+        if owner="$(_devbox::port_80_held_by_other)"; then
+            echo -e "\033[1;31m==> Cannot start Traefik: 127.0.0.1:80 is occupied by ${owner}\033[0m" >&2
+            echo "    Stop that process (or remap its port) and re-run." >&2
+            exit 1
+        fi
         echo "Starting Traefik proxy..."
         docker run -d --name devbox_traefik --restart unless-stopped \
             --network devproxy \

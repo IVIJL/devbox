@@ -46,6 +46,9 @@ _devbox() {
                 'clip:Grab clipboard image for container use'
                 'ssh-config:Manage devbox SSH config'
                 'sync-skills:Sync host skills to all running containers'
+                'dns-install:Configure host resolver for *.test (per-OS)'
+                'dns-status:Show DNS mode, resolver state, verification'
+                'dns-uninstall:Remove host resolver config + dns.conf'
             )
             _describe 'devbox commands' commands
             ;;
@@ -88,6 +91,15 @@ _devbox() {
                         'edit:Edit devbox SSH config'
                     )
                     _describe 'ssh-config actions' actions
+                    ;;
+                dns-install)
+                    local -a flags
+                    flags=(
+                        '--auto:Try local, fall back to external on failure (default)'
+                        '--local:Force local mode; fail loud if setup fails'
+                        '--external:Skip resolver setup; persist external sslip.io mode'
+                    )
+                    _describe 'dns-install flags' flags
                     ;;
             esac
             ;;

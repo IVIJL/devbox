@@ -28,6 +28,10 @@ Usage:
   devbox update                    Update devbox (pull repo + rebuild image)
   devbox migrate                   Migrate data to new layout (interactive; auto-run by 'devbox update')
   devbox migrate-naming            Rename legacy non-LDH containers/volumes (auto-run by 'devbox update')
+  devbox dns-install [--local|--external]
+                                   Configure host resolver for *.test (per-OS)
+  devbox dns-status                Show DNS mode + resolver state + verification
+  devbox dns-uninstall             Remove host resolver config + dns.conf
   devbox uninstall                 Remove everything (containers, volumes, image)
   devbox prune [--all]             Remove old build cache (--all = everything)
   devbox claude-token              Generate/regenerate Claude Code token
@@ -672,6 +676,9 @@ case "${1:-}" in
     update)    MODE="update";    shift ;;
     migrate)   MODE="migrate";   shift ;;
     migrate-naming) MODE="migrate-naming"; shift ;;
+    dns-install)   MODE="dns-install";   shift ;;
+    dns-status)    MODE="dns-status";    shift ;;
+    dns-uninstall) MODE="dns-uninstall"; shift ;;
     uninstall) MODE="uninstall"; shift ;;
     prune)     MODE="prune";     shift; PRUNE_ALL=false
                [[ "${1:-}" == "--all" ]] && PRUNE_ALL=true
@@ -868,6 +875,20 @@ fi
 
 if [ "$MODE" = "migrate-naming" ]; then
     exec "$DEVBOX_DIR/scripts/migrate-naming-ldh.sh" "$@"
+fi
+
+# --- devbox dns-install / dns-status / dns-uninstall -------------------------
+
+if [ "$MODE" = "dns-install" ]; then
+    exec "$DEVBOX_DIR/scripts/dns-install.sh" install "$@"
+fi
+
+if [ "$MODE" = "dns-status" ]; then
+    exec "$DEVBOX_DIR/scripts/dns-install.sh" status "$@"
+fi
+
+if [ "$MODE" = "dns-uninstall" ]; then
+    exec "$DEVBOX_DIR/scripts/dns-install.sh" uninstall "$@"
 fi
 
 # --- devbox prune ------------------------------------------------------------

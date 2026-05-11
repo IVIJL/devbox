@@ -101,6 +101,14 @@ _devbox() {
                     )
                     _describe 'dns-install flags' flags
                     ;;
+                ports)
+                    local -a flags
+                    flags=(
+                        '--all:Include stopped containers and skip listening filter'
+                        '--external:Show sslip.io URL alongside the active URL'
+                    )
+                    _describe 'ports flags' flags
+                    ;;
             esac
             ;;
     esac

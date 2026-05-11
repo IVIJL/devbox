@@ -19,7 +19,9 @@ Usage:
   devbox stop [name] [--clean]     Stop container (--clean removes volumes)
   devbox remove [name]             Remove project data (volumes)
   devbox port <port>               Expose port via Traefik
-  devbox ports                     List active port routes
+  devbox ports [--all] [--external]
+                                   List active port routes (default: running
+                                   containers, only listening ports)
   devbox connect                   Pick source, target devboxes, and services
   devbox connect <target> <port>   Forward one TCP port to another devbox
                                    (use 10.0.2.2:<local-port> from inner Docker)
@@ -388,6 +390,39 @@ start_devbox_connections() {
 
 list_devbox_container_names() {
     docker ps --filter "name=^devbox-" --format '{{.Names}}' | filter_user_containers
+}
+
+# Probe LISTENING TCP ports inside a running container by reading
+# /proc/net/tcp[6] directly — no binary inside the container is required.
+# Prints ports newline-separated and sorted unique on stdout.
+#
+# Exit code is the signal to the caller:
+#   0  probe succeeded (output may be empty = genuinely no listeners)
+#   != probe failed   (docker exec hung/erroreded, container gone, no perms)
+#
+# Distinguishing the two matters so the `ports` command can hide routes only
+# when the probe affirmatively found nothing, and fall back to "show all
+# routes" if the probe itself was unreliable. Uses GNU `timeout` when
+# available; macOS default install lacks it, so on those hosts the call
+# runs unguarded — `docker exec` on a healthy container returns promptly,
+# and a true hang there is a separate problem worth surfacing anyway.
+list_listening_ports_in_container() {
+    local container="$1" raw rc=0
+    if command -v timeout >/dev/null 2>&1; then
+        raw=$(timeout 3 docker exec "$container" sh -c 'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null') || rc=$?
+    else
+        raw=$(docker exec "$container" sh -c 'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null') || rc=$?
+    fi
+    [ "$rc" -ne 0 ] && return "$rc"
+    printf '%s\n' "$raw" \
+        | awk 'BEGIN { for (i = 0; i < 256; i++) hex[sprintf("%02X", i)] = i }
+               $4 == "0A" {
+                 n = split($2, parts, ":")
+                 h = parts[n]
+                 port = hex[substr(h, 1, 2)] * 256 + hex[substr(h, 3, 2)]
+                 print port
+               }' \
+        | sort -un
 }
 
 discover_published_tcp_services() {
@@ -977,22 +1012,127 @@ fi
 # --- devbox ports ------------------------------------------------------------
 
 if [ "$MODE" = "ports" ]; then
+    PORTS_SHOW_ALL=false
+    PORTS_SHOW_EXTERNAL=false
+    for arg in "$@"; do
+        case "$arg" in
+            --all)      PORTS_SHOW_ALL=true ;;
+            --external) PORTS_SHOW_EXTERNAL=true ;;
+            -h|--help)
+                echo "Usage: devbox ports [--all] [--external]"
+                echo "  --all       Include stopped containers and skip the listening filter."
+                echo "  --external  Show the external sslip.io URL alongside the active URL."
+                exit 0
+                ;;
+            *) echo "Unknown flag: $arg" >&2; exit 2 ;;
+        esac
+    done
+
     if [ ! -d "$TRAEFIK_CONFIG_DIR" ] || [ -z "$(ls -A "$TRAEFIK_CONFIG_DIR" 2>/dev/null)" ]; then
         echo "No active port routes."
         exit 0
     fi
 
-    printf '%-55s %s\n' "URL" "TARGET"
+    # Bucket registered route filenames by container. Filename format is
+    # `<container>-<port>.yml` (see apply_port_routes); split off the
+    # trailing -<port>.
+    declare -A PORTS_BY_CONTAINER=()
     for f in "$TRAEFIK_CONFIG_DIR"/*.yml; do
         [ -f "$f" ] || continue
-        # Parse host rule and target URL from YAML
-        # shellcheck disable=SC2016
-        host=$(grep -oP 'Host\(`\K[^`]+' "$f" 2>/dev/null || true)
-        target=$(grep -oP 'url: "\K[^"]+' "$f" 2>/dev/null || true)
-        if [ -n "$host" ] && [ -n "$target" ]; then
-            printf '%-55s %s\n' "http://${host}" "$target"
-        fi
+        base="$(basename "$f" .yml)"
+        port="${base##*-}"
+        container="${base%-*}"
+        { [ -n "$container" ] && [ -n "$port" ]; } || continue
+        PORTS_BY_CONTAINER["$container"]+="$port "
     done
+
+    if [ "${#PORTS_BY_CONTAINER[@]}" -eq 0 ]; then
+        echo "No active port routes."
+        exit 0
+    fi
+
+    any_output=false
+    for container in $(printf '%s\n' "${!PORTS_BY_CONTAINER[@]}" | sort); do
+        running=false
+        if docker ps --filter "name=^${container}$" --format '{{.ID}}' | grep -q .; then
+            running=true
+        fi
+        if [ "$running" = false ] && [ "$PORTS_SHOW_ALL" = false ]; then
+            continue
+        fi
+
+        # shellcheck disable=SC2206  # intentional word-split: space-joined ports
+        routed_ports=(${PORTS_BY_CONTAINER[$container]})
+        mapfile -t routed_ports < <(printf '%s\n' "${routed_ports[@]}" | sort -un)
+
+        probe_failed=false
+        if [ "$running" = true ] && [ "$PORTS_SHOW_ALL" = false ]; then
+            if listening_output=$(list_listening_ports_in_container "$container"); then
+                if [ -n "$listening_output" ]; then
+                    mapfile -t listening_ports <<< "$listening_output"
+                    declare -A listen_set=()
+                    for p in "${listening_ports[@]}"; do listen_set["$p"]=1; done
+                    filtered=()
+                    for p in "${routed_ports[@]}"; do
+                        [ "${listen_set[$p]:-0}" = 1 ] && filtered+=("$p")
+                    done
+                    routed_ports=("${filtered[@]}")
+                    unset listen_set
+                else
+                    # Probe succeeded, container has zero LISTEN ports.
+                    # Hide the empty group so the default view stays honest
+                    # about "nothing reachable right now".
+                    routed_ports=()
+                fi
+            else
+                # Probe failed (docker exec hung/erroreded). Falling back
+                # to "show all registered routes" so we never silently
+                # suppress URLs the user might still reach — the header is
+                # annotated below so the listing's unfiltered status is
+                # visible.
+                probe_failed=true
+            fi
+        fi
+
+        [ "${#routed_ports[@]}" -eq 0 ] && continue
+
+        any_output=true
+        echo
+        if [ "$running" = false ]; then
+            echo "=== ${container} (not running) ==="
+        elif [ "$probe_failed" = true ]; then
+            echo "=== ${container} (probe failed — listening filter skipped) ==="
+        else
+            echo "=== ${container} ==="
+        fi
+
+        project="${container#devbox-}"
+        {
+            if [ "$PORTS_SHOW_EXTERNAL" = true ]; then
+                printf 'PORT\tURL\tEXTERNAL URL\n'
+            else
+                printf 'PORT\tURL\n'
+            fi
+            for p in "${routed_ports[@]}"; do
+                local_url="http://$(devbox::route_host_display "$project" "$p")"
+                if [ "$PORTS_SHOW_EXTERNAL" = true ]; then
+                    ext_url="http://${p}.${project}.127.0.0.1.$(devbox::external_provider)"
+                    printf '%s\t%s\t%s\n' "$p" "$local_url" "$ext_url"
+                else
+                    printf '%s\t%s\n' "$p" "$local_url"
+                fi
+            done
+        } | column -t -s "$(printf '\t')"
+    done
+
+    if [ "$any_output" = false ]; then
+        if [ "$PORTS_SHOW_ALL" = false ]; then
+            echo "No listening ports on running devbox containers."
+            echo "Use 'devbox ports --all' to list every registered route."
+        else
+            echo "No active port routes."
+        fi
+    fi
     exit 0
 fi
 

@@ -173,12 +173,46 @@ devbox port 3000                 # Expose port 3000 on all containers
 devbox ports                     # List active routes
 ```
 
-URL format: `http://<port>.<project>.127.0.0.1.traefik.me`
+Each route is published under two hostnames simultaneously, so both work from any browser at the same time:
 
-For example, running `devbox port 3000` in a project called `my-app` creates:
-`http://3000.my-app.127.0.0.1.traefik.me` → `devbox-my-app:3000`
+| Mode | URL for `devbox port 3000` in project `my-app` |
+|------|----------------------------------------------|
+| `local` (default) — `.test` resolved by a local dnsmasq container | `http://3000.my-app.test` |
+| `external` (fallback) — `.sslip.io` wildcard DNS | `http://3000.my-app.127.0.0.1.sslip.io` |
 
 Default ports (3000, 5173, 8080, etc.) are applied automatically on container start. The list is stored in `~/.config/devbox/default-ports.conf` and can be edited.
+
+### One-time host resolver setup for `.test`
+
+`.test` is an [RFC 2606](https://www.rfc-editor.org/rfc/rfc2606) reserved TLD; the host OS needs to be told to route `*.test` to `127.0.0.1`. `devbox dns-install` handles that for you per OS:
+
+```bash
+devbox dns-install               # auto: try local, fall back to external on conflict
+devbox dns-install --local       # force local; fail loud if setup fails
+devbox dns-install --external    # skip resolver setup, use sslip.io URLs only
+devbox dns-status                # show current mode + resolver state + verify
+devbox dns-uninstall             # remove resolver config + dns.conf
+```
+
+What `--auto` does per platform (all are idempotent; sudo / UAC prompts as needed):
+
+| Platform | Resolver setup |
+|----------|----------------|
+| macOS | writes `/etc/resolver/test` (per-TLD nameserver = `127.0.0.1`) |
+| Linux + systemd-resolved | drop-in `/etc/systemd/resolved.conf.d/devbox.conf` (`DNS=127.0.0.1`, `Domains=~test`) |
+| Linux + NetworkManager-dnsmasq | drop-in `/etc/NetworkManager/dnsmasq.d/devbox.conf` (`server=/test/127.0.0.1`) |
+| WSL2 | both of the above for the WSL2-side CLI, **plus** a Windows NRPT rule (`Add-DnsClientNrptRule -Namespace .test -NameServers 127.0.0.1`) via UAC-elevated PowerShell so the Windows browser resolves too |
+
+Mode preference is persisted in `~/.config/devbox/dns.conf`. Switching mode (`devbox dns-install --external`) only flips which URL `devbox port` and `devbox ports` print — Traefik keeps accepting both forms.
+
+### Troubleshooting
+
+- **Port 80 already in use** — `devbox` aborts with `pid <N> (<comm>)` of the offender before starting Traefik. Stop that process (or remap its port) and re-run.
+- **Port 53 already in use** — `dns-install --auto` falls back to `external` mode and tells you why. Stick with sslip.io URLs, or stop the conflicting resolver and re-run `dns-install --local`.
+- **Tailscale Magic DNS** — `accept-dns=true` takes over `/etc/resolv.conf` and bypasses `.test` routing. Either disable Magic DNS, add `.test` as a split-DNS exception, or fall back to `external` mode.
+- **Corporate VPN with DoH/strict DNS** — same shape as Tailscale; `external` mode skips the host resolver entirely and works through the VPN.
+- **`.test` doesn't resolve after install** — run `devbox dns-status` to see whether dnsmasq is up, whether the per-OS resolver drop-in is in place, and whether a probe `getent hosts devbox-probe.test` returns `127.0.0.1`.
+- **Coming from `traefik.me`** — `devbox update` auto-rewrites every dynamic route file under `~/.config/devbox/traefik/dynamic/` to the dual-`Host()` form and runs `dns-install` if `dns.conf` is missing. No manual edits needed; see ADR 0007 for the migration design.
 
 ## Multi-session
 

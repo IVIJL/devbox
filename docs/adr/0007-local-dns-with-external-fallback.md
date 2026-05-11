@@ -379,6 +379,9 @@ internal.
   firewall path (ADR 0001).
 - `scripts/migrate-naming-ldh.sh` — pattern for active migration hooked
   into `devbox update` (ADR 0005).
+- `scripts/migrate-traefik-me-routes.sh` — the active migration that
+  rewrites stale `traefik.me` dynamic configs to the dual-`Host()` form
+  on `devbox update`.
 - RFC 2606 — reserved TLDs including `.test`.
 - RFC 6761 — special-use TLDs (`.localhost`, etc.) and the reasons we
   do **not** use them here.

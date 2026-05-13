@@ -254,6 +254,23 @@ _devbox::traefik_has_https() {
         | grep -q -- '--entrypoints.websecure.address=:443'
 }
 
+# Effective URL scheme to advertise to the user — `https` only when both the
+# persisted `https_active` opt-in is on AND the running devbox_traefik was
+# actually started with the `websecure` entrypoint. Combining both checks
+# closes the degraded-HTTPS hole: bootstrap_traefik can downgrade to HTTP-only
+# when 127.0.0.1:443 is held at startup, and apply_port_routes then writes
+# `web` routers via the same _devbox::traefik_has_https gate — so displayed
+# URLs must follow the running mode, not the persisted wish, or every printed
+# `https://` URL would 404. Returns the bare scheme (no `://`) so URL shape
+# stays explicit at the call site.
+devbox::url_scheme() {
+    if devbox::https_active && _devbox::traefik_has_https; then
+        printf '%s' 'https'
+    else
+        printf '%s' 'http'
+    fi
+}
+
 bootstrap_traefik() {
     docker network inspect devproxy >/dev/null 2>&1 || docker network create devproxy
 
@@ -1127,10 +1144,12 @@ list_running_containers() {
         echo "No running devbox containers."
     else
         printf '%-25s %-50s %s\n' "NAME" "URL" "STATUS"
+        local scheme
+        scheme="$(devbox::url_scheme)"
         while IFS=$'\t' read -r name status running; do
             local project url
             project="${name#devbox-}"
-            url="http://$(devbox::route_host_display "$project" '<port>')"
+            url="${scheme}://$(devbox::route_host_display "$project" '<port>')"
             printf '%-25s %-50s %s\n' "$name" "$url" "$status"
         done <<< "$containers"
     fi
@@ -1650,10 +1669,11 @@ if [ "$MODE" = "port" ]; then
 
     # Print summary
     echo "Route added to all running containers:"
+    scheme="$(devbox::url_scheme)"
     while IFS= read -r container; do
         [ -z "$container" ] && continue
         local_project="${container#devbox-}"
-        echo "  http://$(devbox::route_host_display "$local_project" "$PORT_NUM") → ${container}:${PORT_NUM}"
+        echo "  ${scheme}://$(devbox::route_host_display "$local_project" "$PORT_NUM") → ${container}:${PORT_NUM}"
     done <<< "$running"
     exit 0
 fi
@@ -1701,6 +1721,7 @@ if [ "$MODE" = "ports" ]; then
     fi
 
     any_output=false
+    scheme="$(devbox::url_scheme)"
     for container in $(printf '%s\n' "${!PORTS_BY_CONTAINER[@]}" | sort); do
         running=false
         if docker ps --filter "name=^${container}$" --format '{{.ID}}' | grep -q .; then
@@ -1763,9 +1784,9 @@ if [ "$MODE" = "ports" ]; then
                 printf 'PORT\tURL\n'
             fi
             for p in "${routed_ports[@]}"; do
-                local_url="http://$(devbox::route_host_display "$project" "$p")"
+                local_url="${scheme}://$(devbox::route_host_display "$project" "$p")"
                 if [ "$PORTS_SHOW_EXTERNAL" = true ]; then
-                    ext_url="http://${p}.${project}.127.0.0.1.$(devbox::external_provider)"
+                    ext_url="${scheme}://${p}.${project}.127.0.0.1.$(devbox::external_provider)"
                     printf '%s\t%s\t%s\n' "$p" "$local_url" "$ext_url"
                 else
                     printf '%s\t%s\n' "$p" "$local_url"
@@ -2642,10 +2663,11 @@ apply_port_routes "$CONTAINER_NAME"
 ports_file="$HOME/.config/devbox/default-ports.conf"
 if [ -f "$ports_file" ] && [ -s "$ports_file" ]; then
     echo "Port routes:"
+    scheme="$(devbox::url_scheme)"
     while read -r port _rest; do
         port="${port%%#*}"
         [ -z "$port" ] && continue
-        echo "  http://$(devbox::route_host_display "$PROJECT_NAME" "$port") → ${CONTAINER_NAME}:${port}"
+        echo "  ${scheme}://$(devbox::route_host_display "$PROJECT_NAME" "$port") → ${CONTAINER_NAME}:${port}"
     done < "$ports_file"
 else
     echo "  Set port: devbox port <port>"

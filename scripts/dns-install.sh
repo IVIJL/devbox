@@ -27,6 +27,8 @@ DEVBOX_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$DEVBOX_DIR/lib/naming.sh"
 # shellcheck source-path=SCRIPTDIR source=../lib/mkcert.sh disable=SC1091
 source "$DEVBOX_DIR/lib/mkcert.sh"
+# shellcheck source-path=SCRIPTDIR source=../lib/https.sh disable=SC1091
+source "$DEVBOX_DIR/lib/https.sh"
 
 DNS_CONF_FILE="${DEVBOX_DNS_CONF:-$HOME/.config/devbox/dns.conf}"
 DEFAULT_EXTERNAL_DOMAIN="127.0.0.1.sslip.io"
@@ -409,9 +411,51 @@ _dns::install_ca() {
         return 0
     fi
     _ok "Root CA installed at $caroot."
+    _dns::record_ca_install
     if [ "$(_dns::detect_platform)" = "wsl2" ]; then
         _info "WSL2: Windows-side browser trust will be installed in a later devbox release."
     fi
+}
+
+# Persist the CA install metadata to ~/.config/devbox/https.conf so later
+# phases — Traefik bootstrap (4), cert lifecycle (3), dns-status (8) — can
+# detect CA churn and report install state without re-running mkcert. We do
+# NOT flip `active=true` here: that decision belongs to the user-visible
+# Phase 6 upgrade prompt. Phase 1's job is only to capture provenance.
+#
+# Best-effort: failures to read fingerprint/version warn and continue. A
+# missing https.conf write would block the entire dns-install command for
+# what is, at this stage, purely diagnostic state.
+_dns::record_ca_install() {
+    local fingerprint version installed_at platform_tag
+    if ! fingerprint="$(_mkcert::ca_fingerprint 2>/dev/null)" || [ -z "$fingerprint" ]; then
+        _warn "Could not read rootCA fingerprint; https.conf CA metadata will be incomplete."
+        fingerprint=""
+    fi
+    if ! version="$(_mkcert::version 2>/dev/null)" || [ -z "$version" ]; then
+        version=""
+    fi
+    installed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    platform_tag="$(_dns::ca_platform_tag)"
+
+    devbox::write_https_field ca_fingerprint  "$fingerprint"  || _warn "Failed writing ca_fingerprint to https.conf."
+    devbox::write_https_field mkcert_version  "$version"      || _warn "Failed writing mkcert_version to https.conf."
+    devbox::write_https_field ca_installed_at "$installed_at" || _warn "Failed writing ca_installed_at to https.conf."
+    if [ -n "$platform_tag" ]; then
+        devbox::add_ca_installed_platform "$platform_tag" || _warn "Failed updating ca_installed_platforms in https.conf."
+    fi
+}
+
+# Map _dns::detect_platform output to the lib/https.sh trust-store taxonomy
+# (linux | macos | windows). WSL2 maps to `linux` because phase 1's mkcert
+# -install only writes the WSL2-distro's Linux trust store; the Windows-side
+# certutil pass that earns the `windows` tag lands in phase 6.
+_dns::ca_platform_tag() {
+    case "$(_dns::detect_platform)" in
+        macos)                        printf 'macos' ;;
+        linux-resolved|linux-nm|wsl2) printf 'linux' ;;
+        *)                            printf '' ;;
+    esac
 }
 
 # --- Status ------------------------------------------------------------------

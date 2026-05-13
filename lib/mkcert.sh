@@ -118,6 +118,22 @@ _mkcert::caroot() {
     "$bin" -CAROOT 2>/dev/null
 }
 
+# Portable SHA-256 of a file: GNU coreutils ships `sha256sum`, macOS ships
+# `shasum -a 256`. Both emit `<hash><space><filename>` so a single awk
+# extracts the hash field. Returns 1 if neither tool is available or the
+# file cannot be read.
+_mkcert::_sha256_file() {
+    local path="$1"
+    [ -n "$path" ] && [ -f "$path" ] || return 1
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$path" 2>/dev/null | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$path" 2>/dev/null | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
 # Print the SHA-256 fingerprint of the local mkcert root CA (rootCA.pem),
 # or fail if it has not been generated yet. Used to detect CA churn — a
 # changed fingerprint invalidates every issued leaf cert.
@@ -125,7 +141,7 @@ _mkcert::ca_fingerprint() {
     local caroot
     caroot="$(_mkcert::caroot)" || return 1
     [ -n "$caroot" ] && [ -f "$caroot/rootCA.pem" ] || return 1
-    sha256sum "$caroot/rootCA.pem" 2>/dev/null | awk '{print $1}'
+    _mkcert::_sha256_file "$caroot/rootCA.pem"
 }
 
 # Install the mkcert local root CA into the host's native trust store.

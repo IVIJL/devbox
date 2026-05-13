@@ -29,6 +29,8 @@ source "$DEVBOX_DIR/lib/naming.sh"
 source "$DEVBOX_DIR/lib/mkcert.sh"
 # shellcheck source-path=SCRIPTDIR source=../lib/https.sh disable=SC1091
 source "$DEVBOX_DIR/lib/https.sh"
+# shellcheck source-path=SCRIPTDIR source=../lib/cert.sh disable=SC1091
+source "$DEVBOX_DIR/lib/cert.sh"
 
 DNS_CONF_FILE="${DEVBOX_DNS_CONF:-$HOME/.config/devbox/dns.conf}"
 DEFAULT_EXTERNAL_DOMAIN="127.0.0.1.sslip.io"
@@ -913,6 +915,78 @@ _dns::status() {
     else
         echo "Verification: skipped (external mode active)."
     fi
+
+    _dns::status_https
+}
+
+# Append the HTTPS section to `_dns::status` output: high-level state from
+# https.conf plus a project-cert inventory (count + nearest expiry parsed
+# from meta files). Best-effort: a cert meta with an unreadable `expires_at`
+# still counts toward the project total, it just sits out of the nearest-
+# expiry computation. Empty fields are surfaced as `(not installed)` /
+# `(none)` rather than blanks so an uninitialised state reads cleanly.
+_dns::status_https() {
+    local active="false" optout="false"
+    devbox::https_active && active="true"
+    devbox::https_optout && optout="true"
+
+    local fingerprint platforms
+    fingerprint="$(devbox::ca_fingerprint)"
+    platforms="$(devbox::ca_installed_platforms)"
+
+    local ca_display="(not installed)"
+    [ -n "$fingerprint" ] && ca_display="sha256:${fingerprint}"
+
+    local trust_display="(none)"
+    [ -n "$platforms" ] && trust_display="$platforms"
+
+    local count=0 nearest_epoch=""
+    if [ -d "$DEVBOX_CERTS_DIR" ]; then
+        local meta_path
+        for meta_path in "$DEVBOX_CERTS_DIR"/*.meta; do
+            [ -f "$meta_path" ] || continue
+            count=$((count + 1))
+            local m_issued_at m_expires_at m_ca_fingerprint
+            local m_mkcert_version m_external_provider m_sans
+            _cert::read_meta "$meta_path" m
+            # Only m_expires_at participates in the aggregation; the other
+            # fields are read for the side-effect (they leak as locals from
+            # the eval inside _cert::read_meta) — silence the unused warning.
+            : "${m_issued_at-}" "${m_ca_fingerprint-}" "${m_mkcert_version-}" \
+                "${m_external_provider-}" "${m_sans-}"
+            if [ -n "$m_expires_at" ] && [ "$m_expires_at" -gt 0 ] 2>/dev/null; then
+                if [ -z "$nearest_epoch" ] || [ "$m_expires_at" -lt "$nearest_epoch" ]; then
+                    nearest_epoch="$m_expires_at"
+                fi
+            fi
+        done
+    fi
+
+    local certs_display="$count"
+    if [ "$count" -gt 0 ] && [ -n "$nearest_epoch" ]; then
+        # GNU date understands `-d "@<epoch>"`; BSD date (macOS) needs
+        # `-r <epoch>`. Try both so dns-status reads correctly on either
+        # host. If neither lands a date, fall back to the bare count —
+        # we never want a missing tool to produce a noisy traceback in
+        # the middle of a status command.
+        local nearest_date now days
+        nearest_date="$(date -u -d "@$nearest_epoch" +%Y-%m-%d 2>/dev/null \
+                       || date -u -r "$nearest_epoch" +%Y-%m-%d 2>/dev/null \
+                       || true)"
+        now="$(date +%s)"
+        days=$(( (nearest_epoch - now) / 86400 ))
+        if [ -n "$nearest_date" ]; then
+            certs_display="$count (nearest expiry: $nearest_date, in $days days)"
+        fi
+    fi
+
+    echo
+    echo "HTTPS state:"
+    printf '  %-15s %s\n' "active:"        "$active"
+    printf '  %-15s %s\n' "CA:"            "$ca_display"
+    printf '  %-15s %s\n' "trust stores:"  "$trust_display"
+    printf '  %-15s %s\n' "project certs:" "$certs_display"
+    printf '  %-15s %s\n' "optout:"        "$optout"
 }
 
 # --- Uninstall ---------------------------------------------------------------

@@ -48,11 +48,17 @@ usage() {
 Usage: dns-install.sh [install] [--local | --external | --auto]
        dns-install.sh status
        dns-install.sh uninstall
+       dns-install.sh --enable-https
+       dns-install.sh --disable-https
 
 Actions:
-  install      Configure host resolver so *.test → 127.0.0.1 (default).
-  status       Show platform, active mode, resolver state, verification.
-  uninstall    Remove resolver config (per OS) and dns.conf.
+  install         Configure host resolver so *.test → 127.0.0.1 (default).
+  status          Show platform, active mode, resolver state, verification.
+  uninstall       Remove resolver config (per OS) and dns.conf.
+  --enable-https  Install CA into host trust stores (WSL2: triggers UAC for
+                  the Windows side once) and flip https.conf active=true.
+  --disable-https Set https.conf active=false (CA stays installed; restore
+                  HTTP-only on next 'devbox <project>').
 
 Mode flags (install only):
   --auto       Try local; fall back to external on conflict/failure (default).
@@ -399,22 +405,37 @@ _dns::install() {
 # Scope per ADR 0008 Phase 1: Linux/macOS-native trust stores only. On WSL2
 # this configures the Linux-distro side only; Windows browser trust lands
 # in Phase 6.
+#
+# Returns 0 only when the CA was actually installed (or was already installed
+# and `mkcert -install` was a no-op). Returns 1 on missing binary or any
+# `mkcert -install` failure — including the user cancelling sudo / Touch ID,
+# which Phase 6's `_dns::enable_https` reads to refuse flipping `active=true`
+# against an untrusted root. The `dns-install` action keeps swallowing this
+# rc (HTTPS CA is best-effort for plain DNS install), so the stricter return
+# only tightens the enable-https path.
 _dns::install_ca() {
     if ! _mkcert::resolve_bin >/dev/null 2>&1; then
         _warn "No usable mkcert >= $DEVBOX_MKCERT_MIN_VERSION found — HTTPS CA install skipped. Re-run install.sh, or upgrade mkcert via your package manager."
-        return 0
+        return 1
     fi
     _info "Installing mkcert root CA (sudo / Touch ID may prompt)..."
     local caroot
     if ! caroot="$(seed_local_ca)"; then
         _warn "mkcert -install failed; HTTPS will not be available until this is resolved."
-        return 0
+        return 1
     fi
     _ok "Root CA installed at $caroot."
     _dns::record_ca_install
     if [ "$(_dns::detect_platform)" = "wsl2" ]; then
         _info "WSL2: Windows-side browser trust will be installed in a later devbox release."
     fi
+    # Explicit success return. The function's contract is "rc=0 on a fully
+    # successful install"; without this, the rc would silently fold in
+    # whatever the final `if` evaluates to, which today happens to land
+    # on 0 (bash returns 0 from an `if` whose test fails and has no else),
+    # but adding any statement after this block — or flipping the test —
+    # would silently break the gate in `_dns::enable_https`.
+    return 0
 }
 
 # Persist the CA install metadata to ~/.config/devbox/https.conf so later
@@ -456,6 +477,215 @@ _dns::ca_platform_tag() {
         linux-resolved|linux-nm|wsl2) printf 'linux' ;;
         *)                            printf '' ;;
     esac
+}
+
+# --- HTTPS enable / disable (Phase 6) ----------------------------------------
+
+# Install the mkcert root CA into the Windows trust store from inside a WSL2
+# distro. One elevated PowerShell child handles both the Windows Root store
+# (`certutil.exe -addstore -f Root`) and the Firefox enterprise-roots policy
+# (`policies.json` with `Certificates.ImportEnterpriseRoots=true`), so the
+# user only sees a single UAC prompt across both browsers' trust paths.
+#
+# The Firefox `policies.json` is merged, not overwritten: an existing
+# org-managed policy keeps every other key it already had. We add the
+# Certificates branch (or set `ImportEnterpriseRoots=true` inside an existing
+# one) and leave the rest intact — per the Phase 6 risk-register entry.
+#
+# Returns 0 on success (Windows Root store accepted the cert; Firefox merge
+# is best-effort and does not gate success). Returns 1 on certutil failure
+# OR if the user declined UAC.
+_dns::install_windows_ca() {
+    if ! command -v powershell.exe >/dev/null 2>&1; then
+        _warn "powershell.exe not found — cannot install CA into Windows trust store."
+        return 1
+    fi
+    if ! command -v iconv >/dev/null 2>&1 || ! command -v base64 >/dev/null 2>&1; then
+        _warn "iconv / base64 missing — cannot encode PowerShell command for Windows CA install."
+        return 1
+    fi
+    if ! command -v wslpath >/dev/null 2>&1; then
+        _warn "wslpath missing — cannot translate WSL2 path to Windows path for CA copy."
+        return 1
+    fi
+
+    local caroot
+    if ! caroot="$(_mkcert::caroot)" || [ -z "$caroot" ] || [ ! -f "$caroot/rootCA.pem" ]; then
+        _warn "mkcert CAROOT or rootCA.pem missing — run 'devbox dns-install' first."
+        return 1
+    fi
+
+    # Stage rootCA.pem into Windows %TEMP%. Elevated certutil only needs read
+    # access; placing it under the calling user's TEMP keeps cleanup trivial
+    # and side-steps writability quirks of C:\Windows\Temp on locked-down
+    # corporate machines.
+    local win_temp_raw win_temp_linux
+    win_temp_raw="$(cmd.exe /c 'echo %TEMP%' 2>/dev/null | tr -d '\r\n')"
+    if [ -z "$win_temp_raw" ]; then
+        _warn "Could not read Windows %TEMP% via cmd.exe — cannot stage CA file."
+        return 1
+    fi
+    if ! win_temp_linux="$(wslpath -u "$win_temp_raw" 2>/dev/null)" \
+        || [ -z "$win_temp_linux" ] || [ ! -d "$win_temp_linux" ]; then
+        _warn "Windows %TEMP% ($win_temp_raw) is not reachable from WSL2 — cannot stage CA."
+        return 1
+    fi
+    local staged_linux="$win_temp_linux/devbox-rootCA.pem"
+    if ! cp "$caroot/rootCA.pem" "$staged_linux"; then
+        _warn "Failed to copy rootCA.pem to $staged_linux."
+        return 1
+    fi
+    local staged_win
+    staged_win="$(wslpath -w "$staged_linux" 2>/dev/null)"
+    if [ -z "$staged_win" ]; then
+        _warn "wslpath failed to compute Windows path for $staged_linux."
+        rm -f "$staged_linux"
+        return 1
+    fi
+
+    # Inner script runs elevated. Single-quoted PowerShell literals carry the
+    # path verbatim, so we only need to make sure $staged_win contains no
+    # single quotes — Windows TEMP paths never do.
+    local inner
+    inner="$(cat <<PS_INNER
+\$ErrorActionPreference = 'Stop'
+try {
+    & certutil.exe -addstore -f Root '${staged_win}' | Out-Null
+    if (\$LASTEXITCODE -ne 0) { exit 2 }
+} catch {
+    exit 2
+}
+try {
+    \$ffDir = 'C:\\Program Files\\Mozilla Firefox'
+    if (Test-Path \$ffDir) {
+        \$distDir = Join-Path \$ffDir 'distribution'
+        New-Item -Force -ItemType Directory -Path \$distDir | Out-Null
+        \$pjson = Join-Path \$distDir 'policies.json'
+        \$existing = \$null
+        if (Test-Path \$pjson) {
+            try { \$existing = Get-Content \$pjson -Raw -Encoding UTF8 | ConvertFrom-Json } catch { \$existing = \$null }
+        }
+        if (\$null -eq \$existing) { \$existing = New-Object PSObject }
+        if (-not (\$existing.PSObject.Properties.Match('policies').Count)) {
+            \$existing | Add-Member -NotePropertyName policies -NotePropertyValue (New-Object PSObject) -Force
+        }
+        if (-not (\$existing.policies.PSObject.Properties.Match('Certificates').Count)) {
+            \$existing.policies | Add-Member -NotePropertyName Certificates -NotePropertyValue (New-Object PSObject) -Force
+        }
+        if (\$existing.policies.Certificates.PSObject.Properties.Match('ImportEnterpriseRoots').Count) {
+            \$existing.policies.Certificates.ImportEnterpriseRoots = \$true
+        } else {
+            \$existing.policies.Certificates | Add-Member -NotePropertyName ImportEnterpriseRoots -NotePropertyValue \$true -Force
+        }
+        (\$existing | ConvertTo-Json -Depth 10) | Set-Content -Path \$pjson -Encoding UTF8
+    }
+} catch {
+    # Firefox policy merge is best-effort.
+}
+exit 0
+PS_INNER
+)"
+
+    local encoded_inner
+    encoded_inner="$(printf '%s' "$inner" | iconv -t UTF-16LE | base64 -w0)"
+
+    # Outer wrapper does the Start-Process -Verb RunAs (the UAC trigger) and
+    # propagates the elevated child's exit code so this function can see
+    # whether certutil actually succeeded. `-PassThru` is the only way to
+    # observe ExitCode; without it Start-Process returns nothing.
+    local outer
+    outer="try { \$p = Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList '-NoProfile','-EncodedCommand','${encoded_inner}'; exit \$p.ExitCode } catch { exit 1 }"
+    local encoded_outer
+    encoded_outer="$(printf '%s' "$outer" | iconv -t UTF-16LE | base64 -w0)"
+
+    _info "Installing root CA into Windows trust store (UAC will prompt)..."
+    local rc=0
+    powershell.exe -NoProfile -EncodedCommand "$encoded_outer" >/dev/null 2>&1 || rc=$?
+    rm -f "$staged_linux"
+    if [ "$rc" -ne 0 ]; then
+        _warn "Windows CA install failed or UAC declined (exit $rc) — browsers on Windows will not trust devbox certs."
+        return 1
+    fi
+    # Explicit success return — same rationale as _dns::install_ca:
+    # the function's contract is rc=0 on success, and we don't want the
+    # final `if [ "$rc" -ne 0 ]` test (which evaluates to false when
+    # rc=0) to silently determine the function's return code.
+    return 0
+}
+
+# Orchestrate the full HTTPS enable flow:
+#   1. Make sure mkcert -install has run on the host's native trust store
+#      (Linux NSS, macOS Keychain, or WSL2-distro NSS — phase 1's path).
+#   2. On WSL2, additionally install the CA into the Windows side (certutil
+#      + Firefox policy) — the only step that fires UAC.
+#   3. Flip https.conf `active=true` + `optout=false` and tag the platforms.
+#
+# Any failure short-circuits to optout=true and leaves active=false. A user
+# who declines UAC ends up in a clean HTTP-only state and won't be prompted
+# again on the next `devbox update` (because `optout=true` skips the prompt).
+_dns::enable_https() {
+    _info "Enabling HTTPS for devbox..."
+
+    if ! _mkcert::resolve_bin >/dev/null 2>&1; then
+        _warn "No usable mkcert >= $DEVBOX_MKCERT_MIN_VERSION found — cannot enable HTTPS. Run install.sh first."
+        devbox::write_https_field optout true || true
+        return 1
+    fi
+
+    # _dns::install_ca is idempotent: a second `mkcert -install` on a host
+    # whose trust store already has our CA is a no-op. Calling it here lets
+    # `--enable-https` work even when the user never ran `dns-install install`
+    # (a clean install path that skipped the DNS step). A failed CA install —
+    # most commonly the user cancelling sudo / Touch ID on Linux or macOS —
+    # MUST block flipping `active=true`: every advertised `https://...` URL
+    # would otherwise serve a cert signed by a root the host does not trust.
+    if ! _dns::install_ca; then
+        devbox::write_https_field optout true || true
+        return 1
+    fi
+
+    local platform
+    platform="$(_dns::detect_platform)"
+    if [ "$platform" = "wsl2" ]; then
+        if ! _dns::install_windows_ca; then
+            devbox::write_https_field optout true || true
+            return 1
+        fi
+        devbox::add_ca_installed_platform windows \
+            || _warn "Failed updating ca_installed_platforms with 'windows'."
+    fi
+
+    if ! devbox::write_https_field active true; then
+        _warn "Failed flipping https.conf active=true."
+        return 1
+    fi
+    if ! devbox::write_https_field optout false; then
+        _warn "Failed clearing https.conf optout flag."
+    fi
+    _ok "HTTPS enabled. Per-project leaf certs land on the next 'devbox <project>'."
+}
+
+# Counterpart to enable: flip active=false in https.conf. The CA stays in
+# the trust stores — uninstall is the place that pulls it. We deliberately
+# do NOT touch `optout` here: `--disable-https` is "for now"; `optout` is
+# the long-lived "do not ask me again" signal owned by the Phase 6 update
+# prompt.
+#
+# This function is intentionally pure — it touches only https.conf and
+# does NOT recreate Traefik or rewrite route YAMLs. Container + route
+# orchestration lives in docker-run.sh's `_devbox::run_https_downgrade`,
+# which calls this function (with `_DEVBOX_HTTPS_FLIP_ONLY=1`) after the
+# orchestration has been entered. A direct `scripts/dns-install.sh
+# --disable-https` invocation is re-exec'd through the docker-run.sh
+# wrapper by the main dispatcher below, so the half-disabled state
+# (active=false in config but Traefik still HTTPS, route YAMLs still
+# websecure) cannot leak out to the user regardless of entry point.
+_dns::disable_https() {
+    if ! devbox::write_https_field active false; then
+        _fail "Failed setting https.conf active=false."
+        return 1
+    fi
+    _ok "HTTPS marked inactive in https.conf."
 }
 
 # --- Status ------------------------------------------------------------------
@@ -600,12 +830,14 @@ main() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
             install|status|uninstall) action="$1" ;;
-            --local)     mode_pref="local" ;;
-            --external)  mode_pref="external" ;;
-            --auto)      mode_pref="auto" ;;
-            --status)    action="status" ;;
-            --uninstall) action="uninstall" ;;
-            -h|--help)   usage; exit 0 ;;
+            --local)          mode_pref="local" ;;
+            --external)       mode_pref="external" ;;
+            --auto)           mode_pref="auto" ;;
+            --status)         action="status" ;;
+            --uninstall)      action="uninstall" ;;
+            --enable-https)   action="enable-https" ;;
+            --disable-https)  action="disable-https" ;;
+            -h|--help)        usage; exit 0 ;;
             *) _fail "Unknown argument: $1"; usage >&2; exit 2 ;;
         esac
         shift
@@ -615,10 +847,39 @@ main() {
     case "$action" in
         install)
             _dns::install "$mode_pref" || rc=$?
-            _dns::install_ca
+            # CA install is intentionally best-effort for `dns-install` —
+            # DNS resolver setup can succeed on a host where mkcert is missing
+            # or where the user cancels sudo / Touch ID. Tightening
+            # _dns::install_ca to return 1 (so --enable-https can refuse to
+            # flip active=true on a failed trust install) means set -e would
+            # otherwise kill the script here before print_warnings runs and
+            # turn a non-fatal CA hiccup into an apparent dns-install failure.
+            _dns::install_ca || true
             ;;
-        status)    _dns::status               || rc=$? ;;
-        uninstall) _dns::uninstall            || rc=$? ;;
+        status)         _dns::status        || rc=$? ;;
+        uninstall)      _dns::uninstall     || rc=$? ;;
+        enable-https|disable-https)
+            # `--enable-https` and `--disable-https` only flip https.conf
+            # state and (for enable) install the CA — they deliberately
+            # do NOT touch Traefik or route YAMLs. The full lifecycle is
+            # owned by `_devbox::run_https_upgrade` / `_devbox::run_https_downgrade`
+            # in docker-run.sh, which the `devbox dns-install --enable-https`
+            # wrapper invokes. A direct call to this script with the same
+            # flag would otherwise leave the system in a half-flipped state
+            # (config says one thing, route YAMLs + Traefik say the other),
+            # so when invoked outside the wrapper we re-exec through it
+            # and let the orchestration drive the full sequence. The
+            # wrapper calls us back with `_DEVBOX_HTTPS_FLIP_ONLY=1` set,
+            # which breaks the otherwise-infinite recursion and signals
+            # us to do the bare state flip the orchestration is delegating.
+            if [ "${_DEVBOX_HTTPS_FLIP_ONLY:-0}" != "1" ]; then
+                exec "$DEVBOX_DIR/docker-run.sh" dns-install "--$action"
+            fi
+            case "$action" in
+                enable-https)  _dns::enable_https  || rc=$? ;;
+                disable-https) _dns::disable_https || rc=$? ;;
+            esac
+            ;;
     esac
     [ "$action" != "status" ] && print_warnings
     return "$rc"

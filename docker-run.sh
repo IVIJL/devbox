@@ -609,6 +609,264 @@ YAML
     done < "$ports_file"
 }
 
+# --- HTTPS lifecycle orchestration (ADR 0008 Phase 6) ------------------------
+
+# Helper used by both upgrade and downgrade paths: emit the unique list of
+# per-project containers that currently have at least one `<container>-<port>.yml`
+# under $TRAEFIK_CONFIG_DIR. Stdin is unused; output one container name per
+# line. Empty when the dir is missing or contains no per-project files.
+_devbox::list_routed_containers() {
+    [ -d "$TRAEFIK_CONFIG_DIR" ] || return 0
+    local f base suffix
+    {
+        for f in "$TRAEFIK_CONFIG_DIR"/devbox-*-*.yml; do
+            [ -f "$f" ] || continue
+            base="$(basename "$f" .yml)"
+            # Only per-project route files have a numeric port as their
+            # final dash-segment. <project>-tls.yml fragments emitted by
+            # _cert::write_tls_yml (and any future non-route dynamic
+            # config) end on a non-numeric suffix — stripping the last
+            # dash group would otherwise yield a bogus container name for
+            # any project whose own sanitized name starts with `devbox-`
+            # (e.g. project `devbox-foo` has both `devbox-devbox-foo-3000.yml`
+            # AND `devbox-foo-tls.yml` under this dir).
+            suffix="${base##*-}"
+            case "$suffix" in
+                ''|*[!0-9]*) continue ;;
+            esac
+            printf '%s\n' "${base%-*}"
+        done
+    } | sort -u
+}
+
+# Restore every `<name>.yml` from its `<name>.yml.pre-https-backup` sibling
+# under $TRAEFIK_CONFIG_DIR. Used by the HTTPS upgrade rollback path when
+# the post-bootstrap verification detects that Traefik came up HTTP-only
+# despite migration already having rewritten the YAMLs. Iterating every
+# backup file is safe even if some are leftovers from an earlier successful
+# upgrade: those routes' .yml is currently websecure, and restoring the
+# backup brings it back to its original HTTP form — which matches the
+# `active=false` state the caller is rolling back to.
+#
+# Prints the number of files restored. Returns 0; missing backups or copy
+# failures are reported on stderr but never bubble up — the caller has
+# already committed to a rollback and there is nothing useful to abort to.
+_devbox::restore_https_route_backups() {
+    [ -d "$TRAEFIK_CONFIG_DIR" ] || return 0
+    local b target restored=0
+    for b in "$TRAEFIK_CONFIG_DIR"/*.pre-https-backup; do
+        [ -f "$b" ] || continue
+        target="${b%.pre-https-backup}"
+        if cp "$b" "$target" 2>/dev/null; then
+            restored=$((restored + 1))
+        else
+            echo "WARN: could not restore $target from $b" >&2
+        fi
+    done
+    [ "$restored" -gt 0 ] \
+        && echo "    Restored $restored route file(s) to HTTP from .pre-https-backup."
+    return 0
+}
+
+# Full HTTPS upgrade orchestration. The two entry points that call it
+# (`devbox update`'s prompt and `devbox dns-install --enable-https`) must
+# go through the same path, otherwise the standalone command would only
+# flip `active=true` and leave the running Traefik + every existing route
+# file pointing at the wrong entrypoint — the regression Codex flagged in
+# Phase 6 review round 3.
+#
+# Returns 0 on full success. Returns 1 on any failure, with `active=false`
+# rolled back so the system ends in a coherent HTTP-only state. https.conf
+# is intentionally left untouched on a 443-busy pre-flight bail: that is a
+# transient blocker, not a user decision, so the next `devbox update` still
+# offers the prompt.
+_devbox::run_https_upgrade() {
+    local owner443="" skip_port_check=0
+    # Idempotency carve-out: if our own HTTPS-mode devbox_traefik is
+    # already running, it is the listener on 127.0.0.1:443 and probing
+    # for an "other" owner would spuriously flag ourselves and block a
+    # re-enable. The orchestration below tears down and recreates that
+    # container anyway, so a real external squatter would still surface
+    # via bootstrap_traefik's own pre-flight + the post-recreate HTTPS
+    # verification, which together drive the rollback path.
+    if docker ps --filter "name=^devbox_traefik$" --format '{{.ID}}' | grep -q . \
+        && _devbox::traefik_has_https; then
+        skip_port_check=1
+    fi
+    if [ "$skip_port_check" -eq 0 ] && owner443="$(_devbox::port_held_by_other 443)"; then
+        echo -e "\033[1;33m==> Cannot enable HTTPS now: 127.0.0.1:443 is occupied by ${owner443}.\033[0m"
+        echo "    Free port 443, then rerun 'devbox dns-install --enable-https' (or 'devbox update')."
+        echo "    https.conf is left untouched."
+        return 1
+    fi
+    # `_DEVBOX_HTTPS_FLIP_ONLY=1` tells dns-install.sh that the wrapper
+    # is driving the full lifecycle: it should do the bare state flip
+    # (CA install + https.conf active=true) and skip the re-exec into
+    # this orchestration that direct script invocations get routed
+    # through.
+    if ! _DEVBOX_HTTPS_FLIP_ONLY=1 "$DEVBOX_DIR/scripts/dns-install.sh" --enable-https; then
+        echo -e "\033[1;31m==> HTTPS enable failed. Devbox stays HTTP-only; rerun 'devbox dns-install --enable-https' to retry.\033[0m"
+        return 1
+    fi
+    # Drop the in-process cache so the migrator and the Traefik recreate
+    # below both see `active=true` from the freshly-written https.conf
+    # instead of the stale `false` we loaded when this command started.
+    devbox::reset_https_cache
+    if "$DEVBOX_DIR/scripts/migrate-routes-to-https.sh" --auto; then
+        # Static Traefik flags (entrypoints, redirect) are baked in at
+        # `docker run` time, so a live restart would keep the old HTTP-only
+        # command line. Tear down and re-bootstrap right here — leaving
+        # the recreate to the next `devbox <project>` would blackhole every
+        # already-running project until the user touches one of them again.
+        local recreated_traefik=0
+        if docker ps -a --filter "name=^devbox_traefik$" --format '{{.ID}}' | grep -q .; then
+            echo "Recreating devbox_traefik with HTTPS entrypoints..."
+            docker stop devbox_traefik >/dev/null 2>&1 || true
+            docker rm devbox_traefik >/dev/null 2>&1 || true
+            # Subshell-wrap so bootstrap_traefik's own `exit 1` (fires when
+            # 127.0.0.1:80 is grabbed in the race window) cannot tear down
+            # the whole devbox process before we get to roll the upgrade
+            # back. A docker-run failure in the function's final docker
+            # invocation propagates the same way: the subshell exits with
+            # the failing rc and `! ( ... )` catches it.
+            if ! ( bootstrap_traefik ); then
+                echo -e "\033[1;31m==> bootstrap_traefik failed during HTTPS recreate (likely a port :80/:443 race or docker run error).\033[0m" >&2
+                echo "    Rolling back to HTTP — route files restored from backup, https.conf active=false." >&2
+                _devbox::restore_https_route_backups
+                devbox::write_https_field active false || true
+                devbox::reset_https_cache
+                return 1
+            fi
+            recreated_traefik=1
+        fi
+        # TOCTOU defence: a process could have grabbed 127.0.0.1:443 between
+        # the pre-flight probe at the top of this function and the
+        # bootstrap_traefik call above. bootstrap_traefik handles that by
+        # downgrading the recreated container to HTTP-only and warning, but
+        # it returns success — so without this check we would print
+        # "HTTPS enabled" while every websecure route file points at an
+        # entrypoint the container does not have. Verify the running
+        # container really is HTTPS-capable; if not, roll the whole upgrade
+        # back to a coherent HTTP-only state.
+        #
+        # Only meaningful when we actually recreated Traefik. On a clean
+        # install where no devbox_traefik has ever existed,
+        # `_devbox::traefik_has_https` necessarily returns false even
+        # though https.conf is correct — the next `devbox <project>` will
+        # be the one that bootstraps Traefik with HTTPS from that state.
+        # Rolling back in that case would block the entire opt-in flow
+        # before any project ever starts.
+        if [ "$recreated_traefik" -eq 1 ] && ! _devbox::traefik_has_https; then
+            echo -e "\033[1;31m==> Traefik came up HTTP-only despite the upgrade (port 443 was lost between pre-flight and recreate).\033[0m" >&2
+            echo "    Rolling back to HTTP — route files restored from backup, https.conf active=false." >&2
+            _devbox::restore_https_route_backups
+            devbox::write_https_field active false || true
+            devbox::reset_https_cache
+            return 1
+        fi
+        echo ""
+        echo -e "\033[1;32mHTTPS enabled. New URL format:\033[0m"
+        echo "    https://<port>.<project>.${DEVBOX_LOCAL_TLD}"
+        echo "    https://<port>.<project>.127.0.0.1.$(devbox::external_provider)"
+        echo "    HTTP requests on :80 are 301-redirected to HTTPS."
+        return 0
+    fi
+    # Partial migration. The migrator has already restored every file it
+    # successfully rewrote from .pre-https-backup, so on-disk route YAMLs
+    # are coherent HTTP again. All we need to do here is roll `active`
+    # back: apply_port_routes will then stop emitting the websecure
+    # template on future invocations, and the existing HTTP-only Traefik
+    # keeps serving the (now HTTP-only) routes without a restart. The
+    # user fixes the underlying issue (typically cert generation),
+    # optionally inspects *.pre-https-backup for the would-be HTTPS body,
+    # and reruns 'devbox dns-install --enable-https'.
+    echo -e "\033[1;31m==> Route migration failed — aborting HTTPS upgrade.\033[0m"
+    echo "    Route files have been restored to HTTP; *.pre-https-backup files in"
+    echo "    $TRAEFIK_CONFIG_DIR are kept for inspection."
+    echo "    Fix the cert / permission issue, then rerun 'devbox dns-install --enable-https'."
+    echo "    https.conf rolled back to active=false."
+    devbox::write_https_field active false || true
+    devbox::reset_https_cache
+    return 1
+}
+
+# Full HTTPS downgrade orchestration: rewrite every per-project route YAML
+# back to the HTTP `web` template, tear down the HTTPS-mode Traefik, and
+# recreate it HTTP-only. Used by `devbox dns-install --disable-https`.
+#
+# Order matters: a naive "stop HTTPS Traefik, rewrite YAMLs, bootstrap HTTP"
+# sequence creates a brief window where the HTTPS Traefik is gone but new
+# YAMLs are not yet written, so requests get connection-refused. That's
+# unavoidable because the static Traefik command line is fixed at create
+# time; the alternative is bounded to that ~1s gap. We pick:
+#
+#   1. dns-install --disable-https              (flip active=false)
+#   2. docker stop+rm devbox_traefik (if HTTPS) (so apply_port_routes branches HTTP)
+#   3. apply_port_routes for every routed container (rewrite YAMLs)
+#   4. bootstrap_traefik                        (recreate HTTP-only)
+#
+# Step 2 must come before step 3 because `_devbox::traefik_has_https` keys
+# off `docker inspect`, not on `active` in https.conf — leaving the HTTPS
+# container in place would have apply_port_routes keep emitting websecure.
+_devbox::run_https_downgrade() {
+    # Sentinel: see _devbox::run_https_upgrade for the rationale. Tells
+    # dns-install.sh to do the bare https.conf flip instead of recursing
+    # back through this orchestration via 'devbox dns-install ...'.
+    if ! _DEVBOX_HTTPS_FLIP_ONLY=1 "$DEVBOX_DIR/scripts/dns-install.sh" --disable-https; then
+        echo -e "\033[1;31m==> HTTPS disable failed (https.conf write error). Aborting.\033[0m" >&2
+        return 1
+    fi
+    devbox::reset_https_cache
+
+    local had_https_traefik=0
+    if docker inspect devbox_traefik 2>/dev/null \
+        | grep -q -- '--entrypoints.websecure.address=:443'; then
+        had_https_traefik=1
+        echo "Removing HTTPS-mode devbox_traefik..."
+        docker stop devbox_traefik >/dev/null 2>&1 || true
+        docker rm devbox_traefik >/dev/null 2>&1 || true
+    fi
+
+    # Rewrite every per-project route YAML via the live apply_port_routes
+    # template. Now that the HTTPS Traefik is gone, `_devbox::traefik_has_https`
+    # returns false, so apply_port_routes emits the `web` branch for every
+    # container. Files for ports that are no longer listed in
+    # default-ports.conf are not touched here — same behavior as
+    # `devbox port`'s reroute pass.
+    local rewritten=0 container
+    while IFS= read -r container; do
+        [ -z "$container" ] && continue
+        apply_port_routes "$container"
+        rewritten=$((rewritten + 1))
+    done < <(_devbox::list_routed_containers)
+
+    # Recreate Traefik HTTP-only. bootstrap_traefik handles the "no
+    # container exists" branch by running a fresh `docker run` with the
+    # HTTP-only command line (because active=false now). When no Traefik
+    # was running before (had_https_traefik=0), the recreate is still
+    # cheap and converges the system to the expected state.
+    #
+    # Subshell-wrap so a port-:80 grab in the race window (which makes
+    # bootstrap_traefik `exit 1`) does not abort the whole script after
+    # we have already removed the old HTTPS Traefik. We cannot un-remove
+    # what we already tore down, but degrading to a clean "config and
+    # routes are HTTP-only, Traefik down" state with a loud message
+    # leaves the user one `devbox <project>` away from recovery instead
+    # of a script that died mid-orchestration.
+    if [ "$had_https_traefik" -eq 1 ]; then
+        if ! ( bootstrap_traefik ); then
+            echo -e "\033[1;31m==> bootstrap_traefik failed during HTTP-only recreate (likely a port :80 race or docker run error).\033[0m" >&2
+            echo "    https.conf and route files are coherent HTTP-only, but devbox_traefik is down." >&2
+            echo "    Free port 80 and run 'devbox <project>' to bring Traefik back up." >&2
+            return 1
+        fi
+    fi
+
+    echo ""
+    echo -e "\033[1;32mHTTPS disabled. URLs reverted to http://. Rewrote routes for ${rewritten} container(s).\033[0m"
+    return 0
+}
+
 connection_config_file() {
     local source_project="$1"
     printf '%s/%s.tsv' "$CONNECT_CONFIG_DIR" "$source_project"
@@ -1191,6 +1449,49 @@ if [ "$MODE" = "update" ]; then
                 exit 1
             fi
         fi
+        # HTTPS upgrade prompt (ADR 0008 Phase 6). Offered exactly once per
+        # install: a user who declines flips `optout=true` in https.conf and
+        # the prompt never fires again. A user who accepts ends up with
+        # `active=true`, all running projects' routes rewritten to websecure,
+        # and `devbox_traefik` recreated with the HTTPS entrypoints — every
+        # state change is gated on a single UAC (Windows trust install).
+        #
+        # We only prompt on an interactive TTY: non-interactive `devbox update`
+        # (e.g. from a CI cron) leaves https.conf untouched so a later
+        # interactive update still gets the chance to ask.
+        if ! devbox::https_active \
+            && ! devbox::https_optout \
+            && [ -t 0 ] && [ -t 1 ]; then
+            echo ""
+            echo -e "\033[1;36m==> Devbox can now serve every project over HTTPS with a locally-trusted cert.\033[0m"
+            echo "    Enabling this:"
+            echo "      - installs a mkcert-managed root CA into your host trust stores"
+            echo "        (Linux/macOS native, plus Windows on WSL2 — fires UAC once)"
+            echo "      - re-emits every existing route file with the websecure entrypoint"
+            echo "      - recreates devbox_traefik with the HTTPS listener on :443"
+            echo "    Declining keeps devbox HTTP-only; you won't be asked again on subsequent updates."
+            echo "    (Run 'devbox dns-install --enable-https' later to opt in.)"
+            echo ""
+            ans=""
+            read -r -p "Run HTTPS upgrade now? [Y/n] " ans || ans=""
+            case "$ans" in
+                ""|y|Y|yes|YES)
+                    # Single source of truth for the upgrade sequence —
+                    # see _devbox::run_https_upgrade. Both this prompt and
+                    # the standalone `devbox dns-install --enable-https`
+                    # command call it, so the user lands in the same
+                    # consistent state regardless of how the upgrade got
+                    # triggered.
+                    _devbox::run_https_upgrade || true
+                    ;;
+                *)
+                    echo "Skipping HTTPS upgrade. Run 'devbox dns-install --enable-https' later if you change your mind."
+                    if ! devbox::write_https_field optout true; then
+                        echo -e "\033[1;33mWARN: failed persisting opt-out to https.conf; next update may ask again.\033[0m"
+                    fi
+                    ;;
+            esac
+        fi
         echo "Rebuilding image..."
         exec "$DEVBOX_DIR/build.sh" "$@"
     else
@@ -1218,6 +1519,22 @@ fi
 # --- devbox dns-install / dns-status / dns-uninstall -------------------------
 
 if [ "$MODE" = "dns-install" ]; then
+    # Special-case the HTTPS state changes — they need Traefik + route
+    # file orchestration that lives in docker-run.sh (bootstrap_traefik,
+    # apply_port_routes). Routing through the orchestration helpers makes
+    # the standalone `devbox dns-install --enable-https` end in the same
+    # consistent state as the `devbox update` prompt path. The default DNS
+    # resolver setup still execs through unchanged.
+    case " $* " in
+        *' --enable-https '*)
+            _devbox::run_https_upgrade
+            exit $?
+            ;;
+        *' --disable-https '*)
+            _devbox::run_https_downgrade
+            exit $?
+            ;;
+    esac
     exec "$DEVBOX_DIR/scripts/dns-install.sh" install "$@"
 fi
 

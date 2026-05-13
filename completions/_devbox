@@ -98,8 +98,18 @@ _devbox() {
                         '--auto:Try local, fall back to external on failure (default)'
                         '--local:Force local mode; fail loud if setup fails'
                         '--external:Skip resolver setup; persist external sslip.io mode'
+                        '--enable-https:Install mkcert CA + flip https.conf active=true'
+                        '--disable-https:Flip https.conf active=false (CA stays installed)'
+                        '--purge-ca:Remove mkcert CA from trust stores + delete https.conf'
                     )
                     _describe 'dns-install flags' flags
+                    ;;
+                uninstall)
+                    local -a flags
+                    flags=(
+                        '--purge-ca:Also strip mkcert CA from native + Windows trust stores'
+                    )
+                    _describe 'uninstall flags' flags
                     ;;
                 ports)
                     local -a flags

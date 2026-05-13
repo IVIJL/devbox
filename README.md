@@ -111,7 +111,7 @@ Run `devbox --help` for the full list. Summary:
 | `devbox claude-token` | Generate/regenerate Claude Code OAuth token |
 | `devbox update` | Pull latest devbox repo and rebuild image |
 | `devbox prune` | Remove Docker build cache and dangling images (reclaim disk space) |
-| `devbox uninstall` | Remove all containers, volumes, and image |
+| `devbox uninstall [--purge-ca]` | Remove all containers, volumes, image; `--purge-ca` also strips the mkcert root CA from native + Windows trust stores |
 
 ## Build
 
@@ -180,6 +180,8 @@ Each route is published under two hostnames simultaneously, so both work from an
 | `local` (default) — `.test` resolved by a local dnsmasq container | `http://3000.my-app.test` |
 | `external` (fallback) — `.sslip.io` wildcard DNS | `http://3000.my-app.127.0.0.1.sslip.io` |
 
+URLs flip to `https://` after `devbox dns-install --enable-https` (see [HTTPS](#https-mkcert-signed-leaf-certs) below). Both hostnames serve the same cert; HTTP requests on `:80` are 301-redirected to HTTPS.
+
 Default ports (3000, 5173, 8080, etc.) are applied automatically on container start. The list is stored in `~/.config/devbox/default-ports.conf` and can be edited.
 
 ### One-time host resolver setup for `.test`
@@ -204,6 +206,38 @@ What `--auto` does per platform (all are idempotent; sudo / UAC prompts as neede
 | WSL2 | both of the above for the WSL2-side CLI, **plus** a Windows NRPT rule (`Add-DnsClientNrptRule -Namespace .test -NameServers 127.0.0.1`) via UAC-elevated PowerShell so the Windows browser resolves too |
 
 Mode preference is persisted in `~/.config/devbox/dns.conf`. Switching mode (`devbox dns-install --external`) only flips which URL `devbox port` and `devbox ports` print — Traefik keeps accepting both forms.
+
+### HTTPS (mkcert-signed leaf certs)
+
+Opt-in HTTPS for every project, signed by a per-host [mkcert](https://github.com/FiloSottile/mkcert) root CA installed once into the OS + browser trust stores. One UAC / sudo / Touch ID prompt per machine for the entire lifetime; zero prompts per project (leaf certs are signed locally). See [ADR 0008](docs/adr/0008-https-via-mkcert-graceful-degradation.md).
+
+```bash
+devbox dns-install --enable-https    # install CA, flip https.conf active=true, migrate live routes
+devbox dns-install --disable-https   # revert to HTTP-only (CA stays installed)
+devbox dns-install --purge-ca        # remove CA from all trust stores + delete https.conf
+devbox dns-status                    # includes HTTPS section: active, CA fingerprint, cert inventory
+```
+
+What `--enable-https` does:
+
+1. Runs `mkcert -install` on the native trust store (Linux NSS / macOS Keychain / WSL2-distro NSS).
+2. **WSL2 only:** installs the CA into the Windows `LocalMachine\Root` store via UAC-elevated `certutil.exe`, and merges `ImportEnterpriseRoots=true` into Firefox's `policies.json` if Firefox is installed (org-managed policies are preserved).
+3. Flips `~/.config/devbox/https.conf` `active=true`.
+4. Rewrites every running project's Traefik route YAML from `web` → `websecure` (each original is backed up as `<name>.yml.pre-https-backup`).
+5. Recreates `devbox_traefik` with `--entrypoints.websecure.address=:443` + permanent 301 from `:80` → `:443`.
+
+Per-project leaf certs land under `~/.config/devbox/certs/<project>.{pem,key,meta}` on the first `devbox <project>` call after enabling. Certs auto-regenerate when: meta is missing, expiry is within 10 days, the root CA fingerprint changed (e.g. user ran `mkcert -uninstall` manually), or the SAN set drifted (DNS mode / external provider change).
+
+If `devbox update` finds no `https.conf` it offers a one-shot upgrade prompt. Decline with `n` and devbox persists `optout=true`; subsequent updates will not ask again until you explicitly run `devbox dns-install --enable-https`.
+
+#### Troubleshooting HTTPS
+
+- **Port 443 already in use at `--enable-https` time** — devbox refuses to flip `active=true` and prints the offending PID/comm. Free the port (or remap the conflicting process) and rerun. `https.conf` is left untouched so `devbox update` keeps offering the prompt.
+- **Port 443 grabbed between sessions** — `bootstrap_traefik` downgrades the next Traefik start to HTTP-only and warns. URLs continue to advertise `http://` (`devbox::url_scheme` keys off the running Traefik, not the persisted opt-in). Stop the conflicting process and `devbox stop && devbox` to recover.
+- **UAC declined on WSL2** — `--enable-https` persists `optout=true` and stays HTTP-only. Rerun the command to retry (UAC fires again).
+- **Manual `mkcert -uninstall`** — the CA fingerprint stored in each cert's `.meta` no longer matches the freshly-seeded CA. `ensure_project_cert` detects the drift on the next `devbox <project>` and regenerates every leaf. Run `--enable-https` again to re-install the new CA.
+- **`devbox dns-status` HTTPS section** — shows `active`, `optout`, CA fingerprint (`sha256:...`), trust-store platforms (`linux,windows,macos`), and the project-cert inventory with the nearest expiry date.
+- **Removing the CA on uninstall** — `devbox uninstall --purge-ca` (or interactive `y` at the `Remove local CA from system trust stores? [y/N]` prompt) runs `mkcert -uninstall` natively, removes the CA from the Windows Root store + Firefox policy on WSL2, deletes `https.conf`, and removes the mkcert CAROOT directory. Default `n` keeps the CA in place because it may be shared with non-devbox mkcert setups.
 
 ### Troubleshooting
 

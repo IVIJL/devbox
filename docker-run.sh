@@ -123,6 +123,17 @@ source "$DEVBOX_DIR/lib/naming.sh"
 # shellcheck source=lib/picker.sh
 source "$DEVBOX_DIR/lib/picker.sh"
 
+# HTTPS state + cert lifecycle modules. Sourced unconditionally — every entry
+# point that touches cert files gates on `devbox::https_active`, which is
+# false until the user opts in via dns-install --enable-https (Phase 6). See
+# lib/https.sh, lib/mkcert.sh, lib/cert.sh and docs/adr/0008.
+# shellcheck source=lib/https.sh
+source "$DEVBOX_DIR/lib/https.sh"
+# shellcheck source=lib/mkcert.sh
+source "$DEVBOX_DIR/lib/mkcert.sh"
+# shellcheck source=lib/cert.sh
+source "$DEVBOX_DIR/lib/cert.sh"
+
 # Migrate from old ~/.devbox to ~/.config/devbox
 if [ -d "$HOME/.devbox" ] && [ ! -d "$HOME/.config/devbox" ]; then
     echo "Migrating config: ~/.devbox → ~/.config/devbox"
@@ -415,9 +426,22 @@ PORTS
     grep -qxF "8090" "$ports_file" 2>/dev/null || echo "8090" >> "$ports_file"
 }
 
+# Phase 3 hook: when HTTPS is active, refresh the per-project leaf cert and
+# Traefik TLS file-provider config before route files are written. Until
+# Phase 4 flips https_active on, this is a noop. Failures inside the cert
+# pipeline are non-fatal — devbox keeps serving HTTP-only routes — and the
+# cert lib emits its own colored WARN lines so no failure goes silent.
+ensure_https_for_container() {
+    local container="$1"
+    devbox::https_active || return 0
+    local project="${container#devbox-}"
+    ensure_project_cert "$project" || true
+}
+
 apply_port_routes() {
     local container="$1"
     local project="${container#devbox-}"
+    ensure_https_for_container "$container"
     local ports_file="$HOME/.config/devbox/default-ports.conf"
     [ -f "$ports_file" ] || return 0
 

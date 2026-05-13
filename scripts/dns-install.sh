@@ -48,6 +48,7 @@ usage() {
 Usage: dns-install.sh [install] [--local | --external | --auto]
        dns-install.sh status
        dns-install.sh uninstall
+       dns-install.sh purge-ca
        dns-install.sh --enable-https
        dns-install.sh --disable-https
 
@@ -55,6 +56,10 @@ Actions:
   install         Configure host resolver so *.test → 127.0.0.1 (default).
   status          Show platform, active mode, resolver state, verification.
   uninstall       Remove resolver config (per OS) and dns.conf.
+  purge-ca        Remove mkcert root CA from native trust stores (WSL2: also
+                  Windows certutil Root store + Firefox policies.json merge),
+                  delete https.conf, and remove the mkcert CAROOT directory.
+                  Fires a UAC prompt on WSL2 / sudo on Linux native.
   --enable-https  Install CA into host trust stores (WSL2: triggers UAC for
                   the Windows side once) and flip https.conf active=true.
   --disable-https Set https.conf active=false (CA stays installed; restore
@@ -479,6 +484,184 @@ _dns::ca_platform_tag() {
     esac
 }
 
+# --- CA purge (Phase 7) ------------------------------------------------------
+
+# Remove the mkcert root CA from the native trust store via `mkcert -uninstall`.
+# Inverse of `_dns::install_ca` / `seed_local_ca`. Best-effort: a missing
+# binary or a sudo / Touch ID decline returns 1 but never aborts the
+# enclosing purge — `_dns::purge_ca` keeps going so https.conf + the CAROOT
+# directory are still cleaned, and the user can re-run with sudo cached.
+_dns::purge_ca_native() {
+    if ! _mkcert::resolve_bin >/dev/null 2>&1; then
+        _warn "mkcert binary unavailable — skipping native trust-store uninstall."
+        return 1
+    fi
+    local bin
+    bin="$(_mkcert::resolve_bin)"
+    _info "Running 'mkcert -uninstall' (sudo / Touch ID may prompt)..."
+    if ! "$bin" -uninstall >&2; then
+        _warn "mkcert -uninstall failed — native trust store may still contain a devbox CA."
+        return 1
+    fi
+    return 0
+}
+
+# Inverse of `_dns::install_windows_ca` for the WSL2 path. One elevated
+# PowerShell child handles both:
+#   1. Windows LocalMachine\Root store: find every cert whose Subject matches
+#      `mkcert development CA *` and remove it via `certutil.exe -delstore
+#      Root <thumbprint>`. We look the thumbprint up on the Windows side
+#      rather than passing https.conf's fingerprint in because certutil
+#      keys off the cert's SHA-1 thumbprint while https.conf stores the
+#      SHA-256 of rootCA.pem; the two are not interchangeable and there is
+#      no portable WSL2-side tool that emits a SHA-1 of the in-store cert.
+#   2. Firefox policies.json: merge-aware removal — drop ONLY the
+#      ImportEnterpriseRoots key we set. Per Phase 6 risk register, an
+#      org-managed `Certificates` branch with other keys (e.g. `Install`)
+#      stays intact; we only collapse the branch (and then the file) when
+#      it becomes empty as a result of our removal. This guarantees devbox
+#      uninstall never wipes a corporate Firefox policy.
+#
+# Returns 0 when the elevated child exits cleanly. Non-zero on UAC decline,
+# missing tooling, or any certutil failure.
+_dns::purge_ca_windows() {
+    if ! command -v powershell.exe >/dev/null 2>&1; then
+        _warn "powershell.exe not found — cannot remove CA from Windows trust store."
+        return 1
+    fi
+    if ! command -v iconv >/dev/null 2>&1 || ! command -v base64 >/dev/null 2>&1; then
+        _warn "iconv / base64 missing — cannot encode PowerShell command for Windows CA purge."
+        return 1
+    fi
+
+    local inner
+    inner="$(cat <<'PS_INNER'
+$ErrorActionPreference = 'Continue'
+$hadFailure = $false
+try {
+    $certs = Get-ChildItem -Path Cert:\LocalMachine\Root -ErrorAction SilentlyContinue |
+        Where-Object { $_.Subject -like '*mkcert development CA*' }
+    foreach ($c in @($certs)) {
+        & certutil.exe -delstore Root $c.Thumbprint | Out-Null
+        if ($LASTEXITCODE -ne 0) { $hadFailure = $true }
+    }
+} catch {
+    $hadFailure = $true
+}
+try {
+    $pjson = 'C:\Program Files\Mozilla Firefox\distribution\policies.json'
+    if (Test-Path $pjson) {
+        $existing = $null
+        try { $existing = Get-Content $pjson -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $existing = $null }
+        if ($null -ne $existing -and $existing.policies -and $existing.policies.PSObject.Properties.Match('Certificates').Count) {
+            if ($existing.policies.Certificates.PSObject.Properties.Match('ImportEnterpriseRoots').Count) {
+                $existing.policies.Certificates.PSObject.Properties.Remove('ImportEnterpriseRoots')
+            }
+            if (($existing.policies.Certificates.PSObject.Properties | Measure-Object).Count -eq 0) {
+                $existing.policies.PSObject.Properties.Remove('Certificates')
+            }
+            if (($existing.policies.PSObject.Properties | Measure-Object).Count -eq 0) {
+                Remove-Item -Path $pjson -Force
+            } else {
+                ($existing | ConvertTo-Json -Depth 10) | Set-Content -Path $pjson -Encoding UTF8
+            }
+        }
+    }
+} catch {
+    # Firefox policy merge is best-effort.
+}
+if ($hadFailure) { exit 2 }
+exit 0
+PS_INNER
+)"
+
+    local encoded_inner
+    encoded_inner="$(printf '%s' "$inner" | iconv -t UTF-16LE | base64 -w0)"
+
+    # Outer wrapper does the Start-Process -Verb RunAs (UAC trigger) and
+    # propagates the elevated child's exit code. Same shape as
+    # `_dns::install_windows_ca` — `-PassThru` is the only way to observe
+    # ExitCode through Start-Process.
+    local outer
+    outer="try { \$p = Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList '-NoProfile','-EncodedCommand','${encoded_inner}'; exit \$p.ExitCode } catch { exit 1 }"
+    local encoded_outer
+    encoded_outer="$(printf '%s' "$outer" | iconv -t UTF-16LE | base64 -w0)"
+
+    _info "Removing root CA from Windows trust store (UAC will prompt)..."
+    local rc=0
+    powershell.exe -NoProfile -EncodedCommand "$encoded_outer" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        _warn "Windows CA removal failed or UAC declined (exit $rc) — browsers may still trust devbox certs until manual cleanup."
+        return 1
+    fi
+    return 0
+}
+
+# Orchestrate the full CA purge. Inverse of `_dns::enable_https`'s install
+# pass. Each sub-step is independently best-effort: a failure in one does
+# not block the next, because partial cleanup is strictly better than
+# leaving every artifact behind. We do, however, preserve order:
+#
+#   1. mkcert -uninstall on the host's native trust store (uses CAROOT to
+#      identify which CA to remove — must run BEFORE we delete CAROOT).
+#   2. (WSL2 only) Windows-side certutil + Firefox policy merge — uses the
+#      cert Subject to find what to delete, so it is independent of CAROOT.
+#   3. Delete ~/.config/devbox/https.conf — drops the cached fingerprint
+#      and active flag, so the next `--enable-https` re-records everything
+#      from a fresh `mkcert -install`.
+#   4. Delete the mkcert CAROOT directory (rootCA.pem + rootCA-key.pem).
+#      This is the paranoid step — opt-out via DEVBOX_PURGE_MKCERT_DIR=0
+#      for users who share mkcert with non-devbox projects. Default is
+#      "yes, nuke it" because the user just asked for `--purge-ca`.
+_dns::purge_ca() {
+    local platform
+    platform="$(_dns::detect_platform)"
+    _info "Purging mkcert root CA (platform: $platform)..."
+
+    local rc=0
+    case "$platform" in
+        macos|linux-resolved|linux-nm)
+            _dns::purge_ca_native || rc=$?
+            ;;
+        wsl2)
+            # Linux-side first (uses CAROOT), then Windows-side (UAC).
+            _dns::purge_ca_native  || rc=$?
+            _dns::purge_ca_windows || rc=$?
+            ;;
+        *)
+            _warn "Unsupported platform — cannot purge CA programmatically."
+            rc=1
+            ;;
+    esac
+
+    # Capture CAROOT BEFORE removing https.conf — the path itself comes
+    # from `mkcert -CAROOT`, not from https.conf, but doing the capture
+    # first keeps the ordering intuitive: "compute, then delete".
+    local caroot=""
+    caroot="$(_mkcert::caroot 2>/dev/null || true)"
+
+    local https_conf="${DEVBOX_HTTPS_CONF:-$HOME/.config/devbox/https.conf}"
+    if [ -f "$https_conf" ]; then
+        rm -f "$https_conf"
+        echo "Removed $https_conf"
+    fi
+    devbox::reset_https_cache
+
+    if [ "${DEVBOX_PURGE_MKCERT_DIR:-1}" = "1" ]; then
+        if [ -n "$caroot" ] && [ -d "$caroot" ]; then
+            rm -rf "$caroot"
+            echo "Removed $caroot"
+        fi
+    fi
+
+    if [ "$rc" -eq 0 ]; then
+        _ok "CA purge complete."
+    else
+        _warn "CA purge finished with errors — review warnings above."
+    fi
+    return "$rc"
+}
+
 # --- HTTPS enable / disable (Phase 6) ----------------------------------------
 
 # Install the mkcert root CA into the Windows trust store from inside a WSL2
@@ -829,12 +1012,13 @@ main() {
     local mode_pref="auto"
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            install|status|uninstall) action="$1" ;;
+            install|status|uninstall|purge-ca) action="$1" ;;
             --local)          mode_pref="local" ;;
             --external)       mode_pref="external" ;;
             --auto)           mode_pref="auto" ;;
             --status)         action="status" ;;
             --uninstall)      action="uninstall" ;;
+            --purge-ca)       action="purge-ca" ;;
             --enable-https)   action="enable-https" ;;
             --disable-https)  action="disable-https" ;;
             -h|--help)        usage; exit 0 ;;
@@ -858,6 +1042,7 @@ main() {
             ;;
         status)         _dns::status        || rc=$? ;;
         uninstall)      _dns::uninstall     || rc=$? ;;
+        purge-ca)       _dns::purge_ca      || rc=$? ;;
         enable-https|disable-https)
             # `--enable-https` and `--disable-https` only flip https.conf
             # state and (for enable) install the CA — they deliberately

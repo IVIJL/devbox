@@ -17,6 +17,9 @@ Usage:
   ./build.sh --progress=plain      Show full build log
   ./build.sh --clean               Full reset (volumes + cache) + rebuild
   ./build.sh --uninstall           Full reset without rebuild
+  ./build.sh --uninstall --purge-ca
+                                   Full reset AND remove mkcert root CA from
+                                   system trust stores (WSL2 fires one UAC).
 
 All other flags pass through to docker build.
 Set DEVBOX_SUDO_PASSWORD env var for non-interactive builds.
@@ -31,11 +34,15 @@ esac
 
 CLEAN=false
 UNINSTALL=false
+# 'auto' = prompt interactively (default n) or skip in non-interactive.
+# 'yes'  = --purge-ca explicit; no prompt, fire UAC / sudo.
+PURGE_CA=auto
 DOCKER_ARGS=()
 for arg in "$@"; do
     case "$arg" in
         --clean)     CLEAN=true ;;
         --uninstall) UNINSTALL=true ;;
+        --purge-ca)  PURGE_CA=yes ;;
         *)           DOCKER_ARGS+=("$arg") ;;
     esac
 done
@@ -108,6 +115,48 @@ if [ "$UNINSTALL" = true ]; then
         echo ""
         echo "Removing host DNS resolver configuration..."
         "$SCRIPT_PARENT/scripts/dns-install.sh" uninstall || true
+    fi
+
+    # CA purge is opt-in: mkcert is sometimes shared with non-devbox projects,
+    # so we never strip the root CA from the user's trust stores without an
+    # explicit signal. The trust-store removal fires a UAC prompt on WSL2 +
+    # a sudo / Touch ID prompt on Linux / macOS, which is also why we keep
+    # it strictly behind interactive confirmation when --purge-ca was not
+    # passed: a surprise UAC popup during `devbox uninstall` would feel
+    # broken even though it is correct cleanup.
+    should_purge_ca=false
+    case "$PURGE_CA" in
+        yes)
+            should_purge_ca=true
+            ;;
+        auto)
+            # Only offer when there is something to purge — a missing
+            # https.conf means the user never enabled HTTPS on this host,
+            # so the question would be confusing.
+            if [ -f "$HOME/.config/devbox/https.conf" ]; then
+                if [ -t 0 ]; then
+                    echo ""
+                    echo "Remove mkcert root CA from system trust stores?"
+                    echo "  This affects ALL mkcert-issued certs on this host, not just devbox."
+                    echo "  Fires a UAC prompt on WSL2 (Windows side) or sudo / Touch ID on Linux / macOS."
+                    printf "Purge CA? [y/N] "
+                    read -r answer
+                    case "$answer" in
+                        y|Y) should_purge_ca=true ;;
+                    esac
+                else
+                    echo ""
+                    echo "Skipped CA purge (non-interactive). Re-run with --purge-ca to remove the mkcert root CA."
+                fi
+            fi
+            ;;
+    esac
+
+    if [ "$should_purge_ca" = true ] \
+        && [ -x "$SCRIPT_PARENT/scripts/dns-install.sh" ]; then
+        echo ""
+        echo "Purging mkcert root CA from trust stores..."
+        "$SCRIPT_PARENT/scripts/dns-install.sh" purge-ca || true
     fi
 
     full_reset

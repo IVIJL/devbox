@@ -34,7 +34,9 @@ Usage:
                                    Configure host resolver for *.test (per-OS)
   devbox dns-status                Show DNS mode + resolver state + verification
   devbox dns-uninstall             Remove host resolver config + dns.conf
-  devbox uninstall                 Remove everything (containers, volumes, image)
+  devbox uninstall [--purge-ca]    Remove everything (containers, volumes, image).
+                                   --purge-ca also strips the mkcert root CA
+                                   from system trust stores (UAC on WSL2).
   devbox prune [--all]             Remove old build cache (--all = everything)
   devbox claude-token              Generate/regenerate Claude Code token
   devbox allow [domain]            List or add allowed firewall domain
@@ -607,6 +609,30 @@ http:
 YAML
         fi
     done < "$ports_file"
+}
+
+# Remove per-project HTTPS artifacts (leaf cert + key + meta + Traefik TLS
+# fragment). Companion to the existing `rm -f $TRAEFIK_CONFIG_DIR/<container>*.yml`
+# route-file cleanup in the stop path: that glob catches the per-port route
+# files (matching the `<container>-<port>.yml` naming in apply_port_routes)
+# but leaves the cert files under $DEVBOX_CERTS_DIR and the project-scoped
+# `<project>-tls.yml` fragment behind because both lack the `devbox-` prefix
+# the glob keys off. Without this helper, a `devbox stop` would orphan the
+# TLS YAML — and on the next `devbox <project>` Traefik's file watcher
+# would still load it, advertising a cert for a project that no longer has
+# routes. Silent (2>/dev/null) so a freshly-stopped project that never had
+# HTTPS active doesn't generate spurious WARNs.
+#
+# Usage: _devbox::remove_project_https_artifacts <project>
+_devbox::remove_project_https_artifacts() {
+    local project="$1"
+    [ -n "$project" ] || return 0
+    rm -f \
+        "$DEVBOX_CERTS_DIR/${project}.pem" \
+        "$DEVBOX_CERTS_DIR/${project}.key" \
+        "$DEVBOX_CERTS_DIR/${project}.meta" \
+        "$DEVBOX_CERT_TLS_DIR/${project}-tls.yml" \
+        2>/dev/null || true
 }
 
 # --- HTTPS lifecycle orchestration (ADR 0008 Phase 6) ------------------------
@@ -1503,7 +1529,10 @@ fi
 # --- devbox uninstall --------------------------------------------------------
 
 if [ "$MODE" = "uninstall" ]; then
-    exec "$DEVBOX_DIR/build.sh" --uninstall
+    # Forward any flags (currently just --purge-ca) through to build.sh,
+    # which owns the actual uninstall lifecycle (full_reset + dns-install
+    # uninstall + optional CA purge + image / network / config cleanup).
+    exec "$DEVBOX_DIR/build.sh" --uninstall "$@"
 fi
 
 # --- devbox migrate ----------------------------------------------------------
@@ -1964,6 +1993,7 @@ if [ "$MODE" = "stop" ]; then
                 echo "Stopped:$name"
             fi
             rm -f "$TRAEFIK_CONFIG_DIR/${name}"*.yml 2>/dev/null
+            _devbox::remove_project_https_artifacts "$DEVBOX_PROJECT_NAME"
             stop_traefik_if_idle
             stop_dns_if_idle
             exit 0
@@ -1984,6 +2014,7 @@ if [ "$MODE" = "stop" ]; then
                 echo "Stopped:$c"
             fi
             rm -f "$TRAEFIK_CONFIG_DIR/${c}"*.yml 2>/dev/null
+            _devbox::remove_project_https_artifacts "$proj"
         done
         stop_traefik_if_idle
         stop_dns_if_idle
@@ -1998,6 +2029,7 @@ if [ "$MODE" = "stop" ]; then
             echo "Stopped: $selected"
         fi
         rm -f "$TRAEFIK_CONFIG_DIR/${selected}"*.yml 2>/dev/null
+        _devbox::remove_project_https_artifacts "$proj"
         stop_traefik_if_idle
         stop_dns_if_idle
     fi

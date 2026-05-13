@@ -171,13 +171,17 @@ Consequences:
 - Mode switches (`devbox dns-install --external`) do **not** require
   regenerating dynamic config files. They only change which URL form
   `devbox port` / `devbox ports` displays.
-- A colleague on a video call can paste the sslip.io form and have it
-  work for them without our resolver configured.
 - If the local dnsmasq dies (container crash, port 53 stolen by a Pi-hole
   install), the sslip.io URL still works as a manual fallback — the user
   can copy-paste the alternate hostname from `devbox dns-status` and keep
   going. dnsmasq downtime degrades the *default* URL but not connectivity
   to running services.
+
+Note: Traefik binds `127.0.0.1:80`, so both URL forms are reachable only
+from the same machine. The fallback exists for **local** users whose DNS
+path to `.test` is unavailable — not for remote sharing. Remote sharing of
+a running dev service is out of scope here; tools like ngrok, cloudflared,
+or Tailscale Funnel are the right primitive for that.
 
 The cost is one extra hostname per route in `~/.config/devbox/traefik/dynamic/*.yml`.
 Traefik handles `||` natively; no rule explosion.

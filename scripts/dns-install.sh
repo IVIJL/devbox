@@ -25,6 +25,8 @@ DEVBOX_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # shellcheck source-path=SCRIPTDIR source=../lib/naming.sh disable=SC1091
 source "$DEVBOX_DIR/lib/naming.sh"
+# shellcheck source-path=SCRIPTDIR source=../lib/mkcert.sh disable=SC1091
+source "$DEVBOX_DIR/lib/mkcert.sh"
 
 DNS_CONF_FILE="${DEVBOX_DNS_CONF:-$HOME/.config/devbox/dns.conf}"
 DEFAULT_EXTERNAL_DOMAIN="127.0.0.1.sslip.io"
@@ -384,6 +386,34 @@ _dns::install() {
     _ok "Local mode persisted. Resolver files are in place; dnsmasq will be started by the next 'devbox <project>'."
 }
 
+# --- CA install (HTTPS Phase 1) ----------------------------------------------
+
+# Install the mkcert root CA into the host's native trust store. Runs after
+# the DNS resolver setup so the user's one sudo/Touch ID prompt for HTTPS
+# bootstrap shares a session with the DNS sudo prompts. Non-fatal: a missing
+# binary or `mkcert -install` failure ends with a warning and lets DNS
+# install report success on its own.
+#
+# Scope per ADR 0008 Phase 1: Linux/macOS-native trust stores only. On WSL2
+# this configures the Linux-distro side only; Windows browser trust lands
+# in Phase 6.
+_dns::install_ca() {
+    if ! _mkcert::resolve_bin >/dev/null 2>&1; then
+        _warn "No usable mkcert >= $DEVBOX_MKCERT_MIN_VERSION found — HTTPS CA install skipped. Re-run install.sh, or upgrade mkcert via your package manager."
+        return 0
+    fi
+    _info "Installing mkcert root CA (sudo / Touch ID may prompt)..."
+    local caroot
+    if ! caroot="$(seed_local_ca)"; then
+        _warn "mkcert -install failed; HTTPS will not be available until this is resolved."
+        return 0
+    fi
+    _ok "Root CA installed at $caroot."
+    if [ "$(_dns::detect_platform)" = "wsl2" ]; then
+        _info "WSL2: Windows-side browser trust will be installed in a later devbox release."
+    fi
+}
+
 # --- Status ------------------------------------------------------------------
 
 _dns::status() {
@@ -539,7 +569,10 @@ main() {
 
     local rc=0
     case "$action" in
-        install)   _dns::install "$mode_pref" || rc=$? ;;
+        install)
+            _dns::install "$mode_pref" || rc=$?
+            _dns::install_ca
+            ;;
         status)    _dns::status               || rc=$? ;;
         uninstall) _dns::uninstall            || rc=$? ;;
     esac

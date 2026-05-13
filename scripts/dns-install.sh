@@ -421,9 +421,27 @@ _dns::install() {
 # rc (HTTPS CA is best-effort for plain DNS install), so the stricter return
 # only tightens the enable-https path.
 _dns::install_ca() {
+    # Auto-provision mkcert when missing. Users who installed devbox before
+    # HTTPS Phase 1 shipped have no $HOME/.local/bin/mkcert — and `devbox
+    # update` (their only update path) does a `git pull` + image rebuild
+    # but never re-runs install.sh, so the binary never lands. Without
+    # this hook the HTTPS upgrade prompt at the end of `devbox update`
+    # would fail with "Run install.sh first", which is misleading: full
+    # install.sh would also try to clone the repo + reset the /usr/local
+    # symlink, both destructive for users on a custom devbox path.
+    # scripts/install-mkcert.sh is the side-effect-scoped provisioner that
+    # does ONLY the mkcert step.
     if ! _mkcert::resolve_bin >/dev/null 2>&1; then
-        _warn "No usable mkcert >= $DEVBOX_MKCERT_MIN_VERSION found — HTTPS CA install skipped. Re-run install.sh, or upgrade mkcert via your package manager."
-        return 1
+        _info "No usable mkcert >= $DEVBOX_MKCERT_MIN_VERSION on PATH — provisioning the pinned version now..."
+        if ! "$DEVBOX_DIR/scripts/install-mkcert.sh" --with-nss >/dev/null; then
+            _warn "Failed to auto-install mkcert; HTTPS will not be available until this is resolved."
+            return 1
+        fi
+        devbox::reset_mkcert_cache
+        if ! _mkcert::resolve_bin >/dev/null 2>&1; then
+            _warn "mkcert auto-install completed but no usable binary on PATH afterwards; HTTPS will not be available."
+            return 1
+        fi
     fi
     _info "Installing mkcert root CA (sudo / Touch ID may prompt)..."
     local caroot

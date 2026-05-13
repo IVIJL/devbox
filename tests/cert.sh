@@ -263,9 +263,16 @@ fi
 # --- End-to-end with real mkcert (skipped when binary is missing) ------------
 
 # Drop the function stubs so the real binary's CAROOT + fingerprint are
-# used. Reset the cache too — _DEVBOX_MKCERT_BIN may carry over from
+# used. `unset -f` removes the override outright (bash does NOT restore
+# the previously-sourced original), so we re-source lib/mkcert.sh and
+# lib/cert.sh afterwards to bring the genuine implementations back. The
+# cache reset is needed too — _DEVBOX_MKCERT_BIN may carry over from
 # earlier resolve_bin calls in this test that found no usable binary.
 unset -f _mkcert::ca_fingerprint _mkcert::version _cert::extract_expires_epoch
+# shellcheck source-path=SCRIPTDIR source=../lib/mkcert.sh disable=SC1091
+source "$DEVBOX_DIR/lib/mkcert.sh"
+# shellcheck source-path=SCRIPTDIR source=../lib/cert.sh disable=SC1091
+source "$DEVBOX_DIR/lib/cert.sh"
 devbox::reset_mkcert_cache
 
 if _mkcert::resolve_bin >/dev/null 2>&1; then

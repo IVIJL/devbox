@@ -20,10 +20,12 @@ DEVBOX_REPO="https://github.com/IVIJL/devbox.git"
 DEVBOX_DIR="${HOME}/.local/share/devbox"
 SYMLINK_PATH="/usr/local/bin/devbox"
 
-# mkcert version pinned in lockstep with lib/mkcert.sh's
-# DEVBOX_MKCERT_MIN_VERSION. Bump both together when the upstream releases.
+# mkcert version printed in the install summary. The authoritative pin lives
+# in scripts/install-mkcert.sh (which also holds the SHA-256 table); this
+# constant is display-only. A drift here would just print a stale version
+# string — the version gate at runtime is owned by lib/mkcert.sh's
+# _mkcert::probe and stays correct regardless.
 MKCERT_VERSION="1.4.4"
-MKCERT_BIN_PATH="${HOME}/.local/bin/mkcert"
 
 AUTO_YES=false
 OS=""
@@ -362,161 +364,41 @@ install_keychain() {
 }
 
 # --- mkcert ------------------------------------------------------------------
-# mkcert backs the HTTPS-by-default rollout (ADR 0008). Phase 1 only fetches
-# the binary; the CA is installed later by `devbox dns-install`. Sourced lib
-# is the single runtime source of MKCERT_BIN; install.sh just lays the file
-# down at the path lib/mkcert.sh probes for.
-
-# SHA-256 hashes for upstream binaries (computed against
-# https://github.com/FiloSottile/mkcert/releases/download/v1.4.4/).
-# Bump MKCERT_VERSION and this table together.
-_mkcert_sha256() {
-    case "$1" in
-        linux-amd64)  echo 6d31c65b03972c6dc4a14ab429f2928300518b26503f58723e532d1b0a3bbb52 ;;
-        linux-arm64)  echo b98f2cc69fd9147fe4d405d859c57504571adec0d3611c3eefd04107c7ac00d0 ;;
-        linux-arm)    echo 2f22ff62dfc13357e147e027117724e7ce1ff810e30d2b061b05b668ecb4f1d7 ;;
-        darwin-amd64) echo a32dfab51f1845d51e810db8e47dcf0e6b51ae3422426514bf5a2b8302e97d4e ;;
-        darwin-arm64) echo c8af0df44bce04359794dad8ea28d750437411d632748049d08644ffb66a60c6 ;;
-        *)            return 1 ;;
-    esac
-}
-
-_mkcert_platform() {
-    local os arch
-    case "$(uname -s)" in
-        Linux)  os="linux" ;;
-        Darwin) os="darwin" ;;
-        *) return 1 ;;
-    esac
-    case "$(uname -m)" in
-        x86_64|amd64)   arch="amd64" ;;
-        aarch64|arm64)  arch="arm64" ;;
-        armv7l|armv6l)  arch="arm" ;;
-        *) return 1 ;;
-    esac
-    printf '%s-%s\n' "$os" "$arch"
-}
+# mkcert backs the HTTPS-by-default rollout (ADR 0008). The actual fetch +
+# SHA-256 verify + binary placement lives in scripts/install-mkcert.sh so the
+# HTTPS upgrade orchestration (`_dns::install_ca` and `_devbox::run_https_upgrade`)
+# can call the same provisioner without dragging in install.sh's repo-clone
+# and symlink-replace side effects — see install-mkcert.sh's header for why
+# that split exists. install.sh keeps `install_mkcert` as a thin wrapper so
+# the summary still tracks INSTALLED/SKIPPED for the user.
 
 install_mkcert() {
     info "Checking mkcert..."
 
-    # Reuse the lib's version gate so install.sh and lib/mkcert.sh agree on
-    # what "usable" means — otherwise a stale system mkcert (old brew, old
-    # distro package) would be accepted here but rejected later by dns-install,
-    # leaving HTTPS bootstrap silently disabled.
-    # shellcheck source-path=SCRIPTDIR source=lib/mkcert.sh disable=SC1091
-    source "$DEVBOX_DIR/lib/mkcert.sh"
-
-    local existing="" candidate
-    for candidate in "$(command -v mkcert 2>/dev/null || true)" "$MKCERT_BIN_PATH"; do
-        [ -z "$candidate" ] && continue
-        if _mkcert::probe "$candidate"; then
-            existing="$candidate"
-            break
-        fi
-    done
-
-    if [ -n "$existing" ]; then
-        SKIPPED+=("mkcert ($("$existing" -version 2>/dev/null | head -n1), $existing)")
+    local provisioner="$DEVBOX_DIR/scripts/install-mkcert.sh"
+    if [ ! -x "$provisioner" ]; then
+        warn "scripts/install-mkcert.sh missing or non-executable; skipping mkcert."
+        SKIPPED+=("mkcert (provisioner script missing)")
         return
     fi
 
-    # No fresh binary anywhere. Tell the user we're replacing something stale
-    # so the upgrade isn't surprising.
-    if has mkcert; then
-        warn "Existing mkcert $(mkcert -version 2>/dev/null | head -n1) at $(command -v mkcert) is older than required v$MKCERT_VERSION — installing pinned version (lib/mkcert.sh will prefer the fresh binary at runtime)."
-    elif [ -x "$MKCERT_BIN_PATH" ]; then
-        warn "Existing mkcert at $MKCERT_BIN_PATH is older than required v$MKCERT_VERSION — replacing with pinned version."
-    fi
+    # `--with-nss` lets the provisioner install libnss3-tools (or equivalent)
+    # on Linux when certutil is absent — without it `mkcert -install` warns
+    # and silently skips Firefox/Chrome trust. macOS uses the Keychain so
+    # the flag is a no-op there; the provisioner short-circuits before any
+    # sudo prompt.
+    local extra_args=()
+    [ "$OS" = "linux" ] && extra_args+=("--with-nss")
 
-    # macOS: brew is canonical. When a stale formula is installed, use
-    # `brew upgrade` (a plain `brew install` on an already-installed
-    # outdated formula prints a warning instead of upgrading on recent
-    # Homebrew, depending on flags).
-    if [ "$OS" = "macos" ] && has brew; then
-        local brew_cmd="install"
-        if brew list mkcert >/dev/null 2>&1; then
-            brew_cmd="upgrade"
-        fi
-        msg "Running brew $brew_cmd mkcert..."
-        if brew "$brew_cmd" mkcert; then
-            INSTALLED+=("mkcert (via brew $brew_cmd)")
-            install_mkcert_nss_tools
-            return
-        fi
-        warn "brew $brew_cmd mkcert failed; falling back to GitHub release."
-    fi
-
-    local platform
-    if ! platform="$(_mkcert_platform)"; then
-        warn "mkcert: unsupported platform ($(uname -s)/$(uname -m))."
-        SKIPPED+=("mkcert (unsupported platform)")
-        return
-    fi
-
-    local expected
-    if ! expected="$(_mkcert_sha256 "$platform")"; then
-        warn "mkcert: no SHA-256 pinned for $platform."
-        SKIPPED+=("mkcert ($platform — no pinned hash)")
-        return
-    fi
-
-    local url="https://github.com/FiloSottile/mkcert/releases/download/v${MKCERT_VERSION}/mkcert-v${MKCERT_VERSION}-${platform}"
-    local tmp
-    tmp="$(mktemp)"
-    msg "Downloading mkcert v${MKCERT_VERSION} ($platform)..."
-    if ! curl --proto '=https' --tlsv1.2 -fsSL -o "$tmp" "$url"; then
-        rm -f "$tmp"
-        warn "mkcert: download failed from $url."
-        SKIPPED+=("mkcert (download failed)")
-        return
-    fi
-
-    local actual
-    actual="$(sha256sum "$tmp" | awk '{print $1}')"
-    if [ "$actual" != "$expected" ]; then
-        rm -f "$tmp"
-        warn "mkcert: SHA-256 mismatch (expected $expected, got $actual)."
-        SKIPPED+=("mkcert (SHA-256 mismatch)")
-        return
-    fi
-
-    mkdir -p "$(dirname "$MKCERT_BIN_PATH")"
-    mv "$tmp" "$MKCERT_BIN_PATH"
-    chmod 0755 "$MKCERT_BIN_PATH"
-    INSTALLED+=("mkcert v${MKCERT_VERSION} -> $MKCERT_BIN_PATH")
-
-    install_mkcert_nss_tools
-}
-
-# Without certutil mkcert -install logs a warning and skips Firefox/Chrome's
-# NSS database. Installing NSS tools proactively keeps the eventual UAC-less
-# CA install on Linux complete on the first try.
-install_mkcert_nss_tools() {
-    if [ "$OS" != "linux" ]; then
-        return
-    fi
-    if has certutil; then
-        SKIPPED+=("NSS tools (certutil already present)")
-        return
-    fi
-    local nss_pkg=""
-    case "$PM" in
-        apt-get) nss_pkg="libnss3-tools" ;;
-        dnf)     nss_pkg="nss-tools" ;;
-        pacman)  nss_pkg="nss" ;;
-        zypper)  nss_pkg="mozilla-nss-tools" ;;
-        apk)     nss_pkg="nss-tools" ;;
-    esac
-    if [ -z "$nss_pkg" ]; then
-        warn "NSS tools: no known package for $PM; Firefox/Chrome trust will be incomplete."
-        return
-    fi
-    msg "Installing NSS tools ($nss_pkg) for browser trust store support..."
-    if pkg_install "$nss_pkg"; then
-        INSTALLED+=("$nss_pkg")
+    # Capture the resolved binary path so the summary line is precise.
+    # The provisioner prints exactly one stdout line (the binary path) on
+    # success; diagnostics land on stderr and pass straight through to the
+    # terminal so the user sees download progress live.
+    local resolved=""
+    if resolved="$("$provisioner" "${extra_args[@]}")"; then
+        INSTALLED+=("mkcert ($resolved)")
     else
-        warn "Could not install $nss_pkg; Firefox/Chrome trust will be incomplete."
+        SKIPPED+=("mkcert (install failed; see warnings above)")
     fi
 }
 

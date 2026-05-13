@@ -180,40 +180,45 @@ filter_user_containers() {
     '
 }
 
-# Probe TCP listeners that would clash with our `-p 127.0.0.1:80:80`
+# Probe TCP listeners that would clash with our `-p 127.0.0.1:<port>:<port>`
 # publish for Traefik. The conflict set is narrow:
-#   - 127.0.0.1:80               direct overlap with our IPv4 bind.
-#   - 0.0.0.0:80 / *:80          IPv4 wildcard, also serves 127.0.0.1.
-#   - [::]:80                    IPv6 wildcard; with IPV6_V6ONLY=0 it also
+#   - 127.0.0.1:<port>           direct overlap with our IPv4 bind.
+#   - 0.0.0.0:<port> / *:<port>  IPv4 wildcard, also serves 127.0.0.1.
+#   - [::]:<port>                IPv6 wildcard; with IPV6_V6ONLY=0 it also
 #                                claims the IPv4 wildcard. We can't see
 #                                the V6ONLY flag from a probe, so we
 #                                flag it conservatively — false-positive
 #                                aborts beat docker's nameless bind error.
 # Listeners on other addresses coexist with our bind and are ignored:
-#   - 127.0.0.2:80 (or any other 127.x alias)
-#   - [::1]:80                   pure IPv6 loopback, distinct address
+#   - 127.0.0.2:<port> (or any other 127.x alias)
+#   - [::1]:<port>               pure IPv6 loopback, distinct address
 #                                family from 127.0.0.1.
-#   - any non-loopback interface address (192.168.x.x:80, etc.).
+#   - any non-loopback interface address (192.168.x.x:<port>, etc.).
 #
 # When held, echoes a single descriptive line (`pid <N> (<comm>)`
 # when ss/lsof can see the owner; a "needs root to inspect" hint
 # otherwise) and returns 0. When free, prints nothing and returns 1.
 # Mirrors the predicate shape of _dns::port_53_held_by_other in
 # scripts/dns-install.sh.
-_devbox::port_80_held_by_other() {
+#
+# Usage: _devbox::port_held_by_other <port>
+_devbox::port_held_by_other() {
+    local port="$1"
     local listeners=""
     if command -v ss >/dev/null 2>&1; then
         # ss -p surfaces `users:(("name",pid=N,fd=M))` when this process
         # (or root) can read the owning task; column is empty otherwise.
+        # awk's dynamic-regex form double-escapes backslashes: `\\.` in the
+        # literal collapses to `\.` for the regex engine.
         listeners="$(ss -lntp 2>/dev/null \
-            | awk 'NR>1 && $4 ~ /(^127\.0\.0\.1|^0\.0\.0\.0|^\*|^\[::\]):80$/')"
+            | awk -v port="$port" 'NR>1 && $4 ~ "(^127\\.0\\.0\\.1|^0\\.0\\.0\\.0|^\\*|^\\[::\\]):"port"$"')"
     elif command -v lsof >/dev/null 2>&1; then
         # lsof NAME column always has the form `<addr>:<port> (LISTEN)`;
         # match the conflict-set addresses explicitly so a service bound
-        # to e.g. 192.168.x.x:80 or [::1]:80 doesn't block startup. This
-        # matters most on macOS, where ss is absent and lsof is the path.
-        listeners="$(lsof -nP -iTCP:80 -sTCP:LISTEN 2>/dev/null \
-            | awk 'NR>1 && / (127\.0\.0\.1|0\.0\.0\.0|\*|\[::\]):80 \(LISTEN\)$/')"
+        # to e.g. 192.168.x.x:<port> or [::1]:<port> doesn't block startup.
+        # This matters most on macOS, where ss is absent and lsof is the path.
+        listeners="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null \
+            | awk -v port="$port" 'NR>1 && $0 ~ " (127\\.0\\.0\\.1|0\\.0\\.0\\.0|\\*|\\[::\\]):"port" \\(LISTEN\\)$"')"
     else
         # No probe tool available — we cannot prove a conflict, so let
         # docker run surface the bind error in its own words.
@@ -235,6 +240,18 @@ _devbox::port_80_held_by_other() {
     return 0
 }
 
+# Tell whether the existing devbox_traefik container was started in HTTPS
+# mode. We look for the websecure entrypoint flag in `docker inspect` because
+# the container's `docker run` args are the single source of truth: bind
+# mounts and port publishes are fixed at create time, so the flag's presence
+# in `.Config.Cmd` cleanly distinguishes a HTTP-only container from an
+# HTTPS-capable one regardless of run/exited state.
+# Returns 0 (HTTPS) when the flag is set, 1 (HTTP-only or no container).
+_devbox::traefik_has_https() {
+    docker inspect devbox_traefik 2>/dev/null \
+        | grep -q -- '--entrypoints.websecure.address=:443'
+}
+
 bootstrap_traefik() {
     docker network inspect devproxy >/dev/null 2>&1 || docker network create devproxy
 
@@ -242,7 +259,31 @@ bootstrap_traefik() {
     seed_allowed_domains
     seed_default_ports
 
-    # If traefik exists but is exited, restart it
+    # Reconcile a degraded HTTPS start. When `https_active` is on but the
+    # existing devbox_traefik was created HTTP-only (a previous run hit a
+    # transient 127.0.0.1:443 squatter and downgraded), recreate it as soon
+    # as port 443 is free again — otherwise the WARN's promise that "freeing
+    # 443 and re-running enables HTTPS" would silently fail forever, because
+    # neither the restart-if-exited branch nor the run-if-missing branch
+    # below ever touches a present container. We only flip the HTTP → HTTPS
+    # direction; HTTPS → HTTP belongs to Phase 6's active migration once the
+    # user explicitly opts out via dns-install --disable-https.
+    if docker ps -a --filter "name=^devbox_traefik$" --format '{{.ID}}' | grep -q .; then
+        if devbox::https_active \
+            && ! _devbox::traefik_has_https \
+            && ! _devbox::port_held_by_other 443 >/dev/null; then
+            echo "Recreating Traefik to enable HTTPS (127.0.0.1:443 is now free)..."
+            docker stop devbox_traefik >/dev/null 2>&1 || true
+            docker rm devbox_traefik >/dev/null
+        fi
+    fi
+
+    # If traefik exists but is exited, restart it. The container's docker run
+    # args are baked in at create time, so a flip in `https_active` since the
+    # previous start is not picked up here — that path is owned by Phase 6's
+    # active migration (stop + remove + start). The reconcile block above
+    # already handles the one Phase-4 case where the persistent intent is
+    # HTTPS but the running container is HTTP-only.
     if docker ps -a --filter "name=^devbox_traefik$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
         echo "Restarting Traefik proxy..."
         docker start devbox_traefik
@@ -255,24 +296,77 @@ bootstrap_traefik() {
         # Probe first so we can fail loud with PID + comm — the user can
         # stop the process or remap its port in a single step.
         local owner
-        if owner="$(_devbox::port_80_held_by_other)"; then
+        if owner="$(_devbox::port_held_by_other 80)"; then
             echo -e "\033[1;31m==> Cannot start Traefik: 127.0.0.1:80 is occupied by ${owner}\033[0m" >&2
             echo "    Stop that process (or remap its port) and re-run." >&2
             exit 1
         fi
+
+        # Resolve the effective HTTPS mode for this `docker run`. We branch
+        # off `devbox::https_active` (the persisted opt-in) but downgrade to
+        # off when 127.0.0.1:443 is already taken: serving HTTP-only is
+        # strictly better than aborting the whole devbox start. The persisted
+        # https.conf is left alone — a transient port-443 squatter must not
+        # silently flip the user's preference.
+        local https_mode="off"
+        if devbox::https_active; then
+            local owner443
+            if owner443="$(_devbox::port_held_by_other 443)"; then
+                echo -e "\033[1;33mWARN: HTTPS disabled for this Traefik start — 127.0.0.1:443 is occupied by ${owner443}.\033[0m" >&2
+                echo "      Free port 443 and re-run to enable HTTPS; HTTP-only routing continues meanwhile." >&2
+            else
+                https_mode="on"
+            fi
+        fi
+
         echo "Starting Traefik proxy..."
+
+        # Build the publish, mount, and Traefik flag sets as arrays so the
+        # HTTPS branch is a single additive block instead of duplicated
+        # docker-run invocations.
+        local -a publish_args=(
+            -p 127.0.0.1:80:80
+        )
+        local -a mount_args=(
+            -v /var/run/docker.sock:/var/run/docker.sock:ro
+            -v "$TRAEFIK_CONFIG_DIR:/etc/traefik/dynamic:ro"
+        )
+        local -a traefik_args=(
+            --providers.docker=true
+            --providers.docker.exposedbydefault=false
+            --providers.docker.network=devproxy
+            --providers.file.directory=/etc/traefik/dynamic
+            --providers.file.watch=true
+            --entrypoints.web.address=:80
+        )
+
+        if [ "$https_mode" = "on" ]; then
+            # Ensure the certs dir exists before docker bind-mounts it,
+            # otherwise the daemon would create it as root-owned and
+            # subsequent host-side cert writes by ensure_project_cert
+            # (running as the user) would fail.
+            mkdir -p "$DEVBOX_CERTS_DIR"
+            publish_args+=(-p 127.0.0.1:443:443)
+            mount_args+=(-v "$DEVBOX_CERTS_DIR:$DEVBOX_CERT_CONTAINER_PATH:ro")
+            # Permanent 301 from web → websecure happens at the entrypoint
+            # level, before any router rule evaluates, so every HTTP request
+            # to any host gets redirected. The websecure entrypoint serves
+            # the per-project leaf certs picked up via the file provider's
+            # <project>-tls.yml fragments written by _cert::write_tls_yml.
+            traefik_args+=(
+                --entrypoints.websecure.address=:443
+                --entrypoints.web.http.redirections.entrypoint.to=websecure
+                --entrypoints.web.http.redirections.entrypoint.scheme=https
+                --entrypoints.web.http.redirections.entrypoint.permanent=true
+            )
+        fi
+
         docker run -d --name devbox_traefik --restart unless-stopped \
             --network devproxy \
-            -p 127.0.0.1:80:80 \
-            -v /var/run/docker.sock:/var/run/docker.sock:ro \
-            -v "$TRAEFIK_CONFIG_DIR:/etc/traefik/dynamic:ro" \
+            "${publish_args[@]}" \
+            "${mount_args[@]}" \
             traefik:v3 \
-            --providers.docker=true \
-            --providers.docker.exposedbydefault=false \
-            --providers.docker.network=devproxy \
-            --providers.file.directory=/etc/traefik/dynamic \
-            --providers.file.watch=true \
-            --entrypoints.web.address=:80
+            "${traefik_args[@]}"
     fi
 }
 

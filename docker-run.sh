@@ -539,6 +539,23 @@ apply_port_routes() {
     local ports_file="$HOME/.config/devbox/default-ports.conf"
     [ -f "$ports_file" ] || return 0
 
+    # Decide the entrypoint flavor once per call based on the *running*
+    # Traefik, not the persisted opt-in. When `https_active=true` but
+    # 127.0.0.1:443 was held at bootstrap, bootstrap_traefik silently
+    # downgrades the container to HTTP-only — pointing routers at a
+    # non-existent `websecure` entrypoint would then 404 every port.
+    # Every apply_port_routes call site (main flow, restart_exited_container,
+    # `devbox port`) runs after bootstrap_traefik has materialised the
+    # Traefik container in its effective mode, so the inspect result is
+    # authoritative. The persisted flag still drives ensure_https_for_container
+    # above so per-project certs keep getting refreshed in the background:
+    # the moment port 443 frees and bootstrap_traefik recreates Traefik
+    # with `websecure`, the next apply_port_routes pass flips the YAML.
+    local websecure_mode="false"
+    if _devbox::traefik_has_https; then
+        websecure_mode="true"
+    fi
+
     while read -r port _rest; do
         port="${port%%#*}"
         [ -z "$port" ] && continue
@@ -551,7 +568,30 @@ apply_port_routes() {
         local config_file="${TRAEFIK_CONFIG_DIR}/${container}-${port}.yml"
         local router_name="${container}-${port}"
 
-        cat > "$config_file" <<YAML
+        # `tls: {}` makes Traefik pick the matching cert out of the
+        # per-project <project>-tls.yml fragment written by
+        # _cert::write_tls_yml (via ensure_https_for_container above). The
+        # entrypoint-level web→websecure redirect set by bootstrap_traefik
+        # means we don't list `web` here at all when HTTPS is on — every
+        # HTTP hit is upgraded before any router rule runs.
+        if [ "$websecure_mode" = "true" ]; then
+            cat > "$config_file" <<YAML
+http:
+  routers:
+    ${router_name}:
+      rule: "${host_rule}"
+      entryPoints:
+        - websecure
+      tls: {}
+      service: ${router_name}
+  services:
+    ${router_name}:
+      loadBalancer:
+        servers:
+          - url: "http://${container}:${port}"
+YAML
+        else
+            cat > "$config_file" <<YAML
 http:
   routers:
     ${router_name}:
@@ -565,6 +605,7 @@ http:
         servers:
           - url: "http://${container}:${port}"
 YAML
+        fi
     done < "$ports_file"
 }
 

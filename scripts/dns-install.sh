@@ -695,9 +695,17 @@ _dns::purge_ca() {
 # Certificates branch (or set `ImportEnterpriseRoots=true` inside an existing
 # one) and leave the rest intact — per the Phase 6 risk-register entry.
 #
-# Returns 0 on success (Windows Root store accepted the cert; Firefox merge
-# is best-effort and does not gate success). Returns 1 on certutil failure
-# OR if the user declined UAC.
+# Return codes:
+#   0  Success (Windows Root store accepted the cert; Firefox merge is
+#      best-effort and does not gate success).
+#   2  User declined UAC. Surfaced as a distinct rc so `_dns::enable_https`
+#      can persist `optout=true` for this single explicit-decline case
+#      while transient failures (rc=1) still let the next `devbox update`
+#      offer the prompt again.
+#   1  Any other failure: missing powershell.exe / wslpath / iconv / base64,
+#      unreachable Windows %TEMP%, certutil rejection (corporate policy
+#      block), Start-Process error, staging copy failure, etc. — all
+#      treated as transient/setup conditions by the caller.
 _dns::install_windows_ca() {
     if ! command -v powershell.exe >/dev/null 2>&1; then
         _warn "powershell.exe not found — cannot install CA into Windows trust store."
@@ -796,8 +804,25 @@ PS_INNER
     # propagates the elevated child's exit code so this function can see
     # whether certutil actually succeeded. `-PassThru` is the only way to
     # observe ExitCode; without it Start-Process returns nothing.
+    #
+    # We special-case the UAC-cancel signal: Start-Process throws
+    # System.ComponentModel.Win32Exception with NativeErrorCode 1223
+    # ("ERROR_CANCELLED" — the operation was canceled by the user) when
+    # the user clicks "No" on the UAC dialog. Surfacing that as a
+    # distinct exit code (3 from PowerShell, mapped to rc=2 in this
+    # function) lets the caller treat it as an explicit user decline
+    # and persist `optout=true`, while every other Start-Process error
+    # path (missing exe, COM init failure, etc.) folds into rc=1 and
+    # leaves optout untouched so the next update offers the prompt
+    # again.
+    #
+    # `-ErrorAction Stop` is load-bearing: by default Start-Process emits
+    # the UAC-cancel as a NON-terminating error, which leaves the typed
+    # `catch [Win32Exception]` block dormant and exits the try-block
+    # without ever hitting our exit 3. Forcing terminating-error mode
+    # routes the cancel through the catch as documented.
     local outer
-    outer="try { \$p = Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList '-NoProfile','-EncodedCommand','${encoded_inner}'; exit \$p.ExitCode } catch { exit 1 }"
+    outer="try { \$p = Start-Process powershell -Verb RunAs -Wait -PassThru -ErrorAction Stop -ArgumentList '-NoProfile','-EncodedCommand','${encoded_inner}'; exit \$p.ExitCode } catch [System.ComponentModel.Win32Exception] { if (\$_.Exception.NativeErrorCode -eq 1223) { exit 3 } exit 1 } catch { exit 1 }"
     local encoded_outer
     encoded_outer="$(printf '%s' "$outer" | iconv -t UTF-16LE | base64 -w0)"
 
@@ -805,53 +830,67 @@ PS_INNER
     local rc=0
     powershell.exe -NoProfile -EncodedCommand "$encoded_outer" >/dev/null 2>&1 || rc=$?
     rm -f "$staged_linux"
-    if [ "$rc" -ne 0 ]; then
-        _warn "Windows CA install failed or UAC declined (exit $rc) — browsers on Windows will not trust devbox certs."
-        return 1
-    fi
-    # Explicit success return — same rationale as _dns::install_ca:
-    # the function's contract is rc=0 on success, and we don't want the
-    # final `if [ "$rc" -ne 0 ]` test (which evaluates to false when
-    # rc=0) to silently determine the function's return code.
-    return 0
+    case "$rc" in
+        0)  return 0 ;;
+        3)
+            _warn "Windows CA install canceled at UAC prompt — devbox will record opt-out and stop asking on future updates."
+            return 2
+            ;;
+        *)
+            _warn "Windows CA install failed (exit $rc) — browsers on Windows will not trust devbox certs. Next 'devbox update' will retry."
+            return 1
+            ;;
+    esac
 }
 
 # Orchestrate the full HTTPS enable flow:
 #   1. Make sure mkcert -install has run on the host's native trust store
 #      (Linux NSS, macOS Keychain, or WSL2-distro NSS — phase 1's path).
+#      _dns::install_ca auto-provisions the mkcert binary itself when the
+#      pinned version isn't on disk yet, so users who installed devbox
+#      before HTTPS Phase 1 shipped don't have to re-run install.sh.
 #   2. On WSL2, additionally install the CA into the Windows side (certutil
 #      + Firefox policy) — the only step that fires UAC.
 #   3. Flip https.conf `active=true` + `optout=false` and tag the platforms.
 #
-# Any failure short-circuits to optout=true and leaves active=false. A user
-# who declines UAC ends up in a clean HTTP-only state and won't be prompted
-# again on the next `devbox update` (because `optout=true` skips the prompt).
+# Failure handling distinguishes TRANSIENT issues from EXPLICIT USER DECLINE:
+#   - Transient (download error, native sudo decline, hash mismatch, etc.):
+#     return 1 and leave `optout` untouched so the next `devbox update`
+#     still offers the prompt. The previous "always set optout=true on
+#     any failure" behavior wedged users into HTTP-only the moment a
+#     missing mkcert tripped the gate — they would never see the prompt
+#     again even after the underlying problem was fixed.
+#   - Explicit decline (WSL2 Windows UAC cancel): set `optout=true` per
+#     ADR 0008 § risk table. UAC is the only step where a user can
+#     unambiguously say "no, I do not want HTTPS"; everything else is
+#     plumbing that may succeed on a retry.
 _dns::enable_https() {
     _info "Enabling HTTPS for devbox..."
 
-    if ! _mkcert::resolve_bin >/dev/null 2>&1; then
-        _warn "No usable mkcert >= $DEVBOX_MKCERT_MIN_VERSION found — cannot enable HTTPS. Run install.sh first."
-        devbox::write_https_field optout true || true
-        return 1
-    fi
-
-    # _dns::install_ca is idempotent: a second `mkcert -install` on a host
-    # whose trust store already has our CA is a no-op. Calling it here lets
-    # `--enable-https` work even when the user never ran `dns-install install`
-    # (a clean install path that skipped the DNS step). A failed CA install —
-    # most commonly the user cancelling sudo / Touch ID on Linux or macOS —
-    # MUST block flipping `active=true`: every advertised `https://...` URL
-    # would otherwise serve a cert signed by a root the host does not trust.
+    # _dns::install_ca is idempotent and self-provisioning: it auto-downloads
+    # the pinned mkcert when missing (via scripts/install-mkcert.sh) and a
+    # second `mkcert -install` on a host whose trust store already has our
+    # CA is a no-op. A failed CA install MUST block flipping `active=true`:
+    # every advertised `https://...` URL would otherwise serve a cert
+    # signed by a root the host does not trust.
     if ! _dns::install_ca; then
-        devbox::write_https_field optout true || true
         return 1
     fi
 
     local platform
     platform="$(_dns::detect_platform)"
     if [ "$platform" = "wsl2" ]; then
-        if ! _dns::install_windows_ca; then
-            devbox::write_https_field optout true || true
+        _dns::install_windows_ca
+        local wca_rc=$?
+        if [ "$wca_rc" -ne 0 ]; then
+            # rc=2 is the dedicated UAC-cancel signal — the only branch
+            # where the user has unambiguously said "no, do not enable
+            # HTTPS". Every other non-zero rc is environmental (missing
+            # tooling, certutil rejection, COM init failure), so we leave
+            # `optout` untouched and let the next `devbox update` retry.
+            if [ "$wca_rc" -eq 2 ]; then
+                devbox::write_https_field optout true || true
+            fi
             return 1
         fi
         devbox::add_ca_installed_platform windows \

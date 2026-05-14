@@ -758,29 +758,30 @@ _devbox::run_https_upgrade() {
     if "$DEVBOX_DIR/scripts/migrate-routes-to-https.sh" --auto; then
         # Static Traefik flags (entrypoints, redirect) are baked in at
         # `docker run` time, so a live restart would keep the old HTTP-only
-        # command line. Tear down and re-bootstrap right here — leaving
-        # the recreate to the next `devbox <project>` would blackhole every
-        # already-running project until the user touches one of them again.
-        local recreated_traefik=0
+        # command line. Tear down (when present) and bootstrap right here —
+        # leaving it to the next `devbox <project>` would blackhole every
+        # already-running project until the user touches one of them again,
+        # and on a clean install would leave `devbox ports` reporting HTTP
+        # URLs immediately after a green "HTTPS enabled" message because
+        # `devbox::url_scheme` keys off a live HTTPS Traefik, not https.conf.
         if docker ps -a --filter "name=^devbox_traefik$" --format '{{.ID}}' | grep -q .; then
             echo "Recreating devbox_traefik with HTTPS entrypoints..."
             docker stop devbox_traefik >/dev/null 2>&1 || true
             docker rm devbox_traefik >/dev/null 2>&1 || true
-            # Subshell-wrap so bootstrap_traefik's own `exit 1` (fires when
-            # 127.0.0.1:80 is grabbed in the race window) cannot tear down
-            # the whole devbox process before we get to roll the upgrade
-            # back. A docker-run failure in the function's final docker
-            # invocation propagates the same way: the subshell exits with
-            # the failing rc and `! ( ... )` catches it.
-            if ! ( bootstrap_traefik ); then
-                echo -e "\033[1;31m==> bootstrap_traefik failed during HTTPS recreate (likely a port :80/:443 race or docker run error).\033[0m" >&2
-                echo "    Rolling back to HTTP — route files restored from backup, https.conf active=false." >&2
-                _devbox::restore_https_route_backups
-                devbox::write_https_field active false || true
-                devbox::reset_https_cache
-                return 1
-            fi
-            recreated_traefik=1
+        fi
+        # Subshell-wrap so bootstrap_traefik's own `exit 1` (fires when
+        # 127.0.0.1:80 is grabbed in the race window) cannot tear down
+        # the whole devbox process before we get to roll the upgrade
+        # back. A docker-run failure in the function's final docker
+        # invocation propagates the same way: the subshell exits with
+        # the failing rc and `! ( ... )` catches it.
+        if ! ( bootstrap_traefik ); then
+            echo -e "\033[1;31m==> bootstrap_traefik failed during HTTPS upgrade (likely a port :80/:443 race or docker run error).\033[0m" >&2
+            echo "    Rolling back to HTTP — route files restored from backup, https.conf active=false." >&2
+            _devbox::restore_https_route_backups
+            devbox::write_https_field active false || true
+            devbox::reset_https_cache
+            return 1
         fi
         # TOCTOU defence: a process could have grabbed 127.0.0.1:443 between
         # the pre-flight probe at the top of this function and the
@@ -790,17 +791,11 @@ _devbox::run_https_upgrade() {
         # "HTTPS enabled" while every websecure route file points at an
         # entrypoint the container does not have. Verify the running
         # container really is HTTPS-capable; if not, roll the whole upgrade
-        # back to a coherent HTTP-only state.
-        #
-        # Only meaningful when we actually recreated Traefik. On a clean
-        # install where no devbox_traefik has ever existed,
-        # `_devbox::traefik_has_https` necessarily returns false even
-        # though https.conf is correct — the next `devbox <project>` will
-        # be the one that bootstraps Traefik with HTTPS from that state.
-        # Rolling back in that case would block the entire opt-in flow
-        # before any project ever starts.
-        if [ "$recreated_traefik" -eq 1 ] && ! _devbox::traefik_has_https; then
-            echo -e "\033[1;31m==> Traefik came up HTTP-only despite the upgrade (port 443 was lost between pre-flight and recreate).\033[0m" >&2
+        # back to a coherent HTTP-only state. Runs unconditionally now that
+        # we always bootstrap above: a fresh-install Traefik can lose :443
+        # to the same race as a recreated one.
+        if ! _devbox::traefik_has_https; then
+            echo -e "\033[1;31m==> Traefik came up HTTP-only despite the upgrade (port 443 was lost between pre-flight and bootstrap).\033[0m" >&2
             echo "    Rolling back to HTTP — route files restored from backup, https.conf active=false." >&2
             _devbox::restore_https_route_backups
             devbox::write_https_field active false || true

@@ -444,8 +444,10 @@ ensure_dns_runtime_config() {
 #
 # Does NOT auto-invoke `devbox dns-install`: that path writes host
 # resolver files and prompts for sudo / UAC, neither of which belongs
-# mid-`devbox <project>` invocation. Active reinstall on missing meta
-# config is reserved for `devbox update` in Phase 5 of ADR 0007.
+# mid-`devbox <project>` invocation. Active repair of a missing host
+# resolver drop-in lives in the `devbox update` flow instead, where the
+# user has already opted into an interactive session — see
+# `_devbox::resolver_drop_in_missing` and its call site.
 ensure_dns_meta_config() {
     local conf="$HOME/.config/devbox/dns.conf"
     [ -f "$conf" ] && return 0
@@ -462,6 +464,78 @@ external_provider=sslip.io
 EOF
     devbox::reset_dns_cache
     echo "Restored ~/.config/devbox/dns.conf (inferred local mode from devbox_dns container)."
+}
+
+# Soft-broken state detector for the host DNS resolver: dns.conf is present
+# (so the user already ran `devbox dns-install` at some point) but the
+# per-platform resolver drop-in is gone — wiped by an OS upgrade, a system
+# reinstall, or a stray `dns-install uninstall`. In this state the resolver
+# container still runs and external (sslip.io) URLs still work, but the
+# browser cannot resolve `*.test`, and `bootstrap_dns`'s self-heal can't
+# repair it without prompting for sudo mid-`devbox <project>`. The fix lives
+# in the `devbox update` flow, which is already interactive.
+#
+# Returns 0 when self-heal is needed, 1 otherwise. The predicate keys off
+# *the live runtime* rather than `_dns::detect_platform`: we check for the
+# drop-in path that the *currently running* host resolver would consume.
+# That diverges from `_dns::detect_platform` for one case — WSL2 distros
+# without systemd-resolved active. There `_dns::install_wsl2` deliberately
+# only installs the Windows NRPT rule (NRPT-only is a supported partial
+# setup) and never creates `/etc/systemd/resolved.conf.d/devbox.conf`, so
+# mirroring the platform string would loop us into an idempotent repair
+# that re-fires the UAC prompt every update without ever satisfying the
+# check. Probing NRPT itself costs a PowerShell round-trip per invocation;
+# we leave that verification to `devbox dns-status`.
+_devbox::resolver_drop_in_missing() {
+    [ -f "$HOME/.config/devbox/dns.conf" ] || return 1
+    # External-mode users intentionally have no host drop-in (sslip.io URLs
+    # resolve without one). Skip them, or we'd force-flip them to local
+    # below: `dns-install --auto` defaults to local-first.
+    [ "$(devbox::route_domain)" = "$DEVBOX_LOCAL_TLD" ] || return 1
+    local uname_s
+    uname_s="$(uname -s 2>/dev/null || echo Unknown)"
+    case "$uname_s" in
+        Darwin)
+            [ ! -f "/etc/resolver/$DEVBOX_LOCAL_TLD" ]
+            return $?
+            ;;
+        Linux) ;;
+        *) return 1 ;;
+    esac
+    if command -v systemctl >/dev/null 2>&1 \
+        && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        [ ! -f "/etc/systemd/resolved.conf.d/devbox.conf" ]
+        return $?
+    fi
+    if grep -hE '^[[:space:]]*dns[[:space:]]*=' \
+        /etc/NetworkManager/NetworkManager.conf \
+        /etc/NetworkManager/conf.d/*.conf 2>/dev/null \
+        | grep -q dnsmasq; then
+        [ ! -f "/etc/NetworkManager/dnsmasq.d/devbox.conf" ]
+        return $?
+    fi
+    return 1
+}
+
+# Detect-and-repair entry point used by the `devbox update` flow. Two call
+# sites: once outside the DEVBOX_UPDATE_PULLED gate (so the "already up to
+# date" path also self-heals between updates) and once after the
+# shared-infra naming migration (so a legacy `devbox-dns` container holding
+# port 53 doesn't make the first attempt fail; the migration removes it,
+# then this retry succeeds). Both calls are idempotent — once the drop-in
+# is in place, the predicate returns false and nothing further runs.
+#
+# `--local` (not `--auto`) so a port-53 conflict or sudo failure surfaces as
+# an error instead of silently rewriting dns.conf to external mode. The
+# predicate already gated on the user being in local mode; honour that on
+# failure too.
+_devbox::self_heal_resolver_drop_in() {
+    _devbox::resolver_drop_in_missing || return 0
+    echo ""
+    echo -e "\033[1;36m==> dns.conf present but host resolver drop-in missing — re-running dns-install to repair\033[0m"
+    if ! "$DEVBOX_DIR/scripts/dns-install.sh" install --local; then
+        echo -e "\033[1;33mWARN: dns-install reported errors; *.${DEVBOX_LOCAL_TLD} URLs may not resolve. Existing dns.conf left unchanged — run 'devbox dns-status' to diagnose.\033[0m" >&2
+    fi
 }
 
 # Start the devbox_dns dnsmasq container in local mode (active_domain=test).
@@ -1403,6 +1477,13 @@ if [ "$MODE" = "update" ]; then
         printf '\033[1;33m==> Claude Code token not configured. Run "devbox claude-token" to avoid daily re-login. \033[0m\n'
     fi
 
+    # Resolver drop-in self-heal — handles the "already up to date" path
+    # where no migrations run. The PULLED-gated block below runs a second
+    # invocation after shared-infra naming migration to catch the legacy
+    # `devbox-dns` (dash) container case where port 53 is busy until that
+    # migration tears it down.
+    _devbox::self_heal_resolver_drop_in
+
     if [ "${DEVBOX_UPDATE_PULLED:-}" = "1" ]; then
         # Install or refresh zsh completion file (no .zshrc modifications here)
         _completion_src="$DEVBOX_DIR/completions/_devbox"
@@ -1475,6 +1556,12 @@ if [ "$MODE" = "update" ]; then
                 exit 1
             fi
         fi
+        # Retry resolver drop-in self-heal: the first call (above the gate)
+        # may have hit a port-53 conflict because a legacy `devbox-dns`
+        # (dash) container was still bound. The shared-infra migration just
+        # above tears that down, so we're free to try again. No-op when the
+        # first call already succeeded or when no legacy container existed.
+        _devbox::self_heal_resolver_drop_in
         # Auto-rewrite Traefik dynamic configs that still reference the dead
         # traefik.me wildcard DNS into the new dual-`Host()` rule covering
         # both `.test` (local mode) and `.127.0.0.1.sslip.io` (external mode).

@@ -19,6 +19,21 @@ set -euo pipefail
 #                 the container fresh against the renamed volumes.
 #   - traefik:    delete dynamic config files keyed by the old container name;
 #                 they regenerate on next start.
+#   - certs:      delete leaf cert + key + meta and the per-project TLS YAML
+#                 fragment keyed by the legacy raw name. The next
+#                 `ensure_project_cert` call against the sanitized name issues
+#                 a fresh leaf with correct SANs; leaving the legacy leaf in
+#                 place would have Traefik serve a cert whose CN/SAN list
+#                 still carries the underscore.
+#
+# Discovery scans containers, volumes, AND traefik/cert artifacts on disk.
+# Scanning artifacts catches "ghost projects" — a project whose container
+# and volumes were removed outside `devbox stop` (manual `docker rm`,
+# `docker system prune`, image rebuild) but whose route YAMLs and cert
+# files survive under ~/.config/devbox/. Without that, `migrate-traefik-me-
+# routes` and `migrate-routes-to-https` would later rewrite those files
+# preserving the legacy raw name and the HTTPS phase would issue certs
+# with underscored SANs the user can never satisfy.
 #
 # See ADR 0005 (sanitize end-to-end) and its 2026-05-06 amendment.
 
@@ -29,6 +44,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/naming.sh"
 
 TRAEFIK_CONFIG_DIR="$HOME/.config/devbox/traefik/dynamic"
+DEVBOX_CERTS_DIR="$HOME/.config/devbox/certs"
 
 AUTO=false
 CHECK_ONLY=false
@@ -40,8 +56,18 @@ for arg in "$@"; do
 done
 
 # Discover raw project names that need migration. A project needs migration
-# if any of its devbox- objects (container or per-project volume) carries
-# chars that LDH-sanitize would now change.
+# if any of its devbox artifacts — container, per-project volume, Traefik
+# route YAML, TLS fragment, or leaf cert — carries chars that LDH-sanitize
+# would now change.
+#
+# Scanning on-disk artifacts (not just docker objects) is what catches
+# "ghost projects": a project whose container + volumes were removed
+# outside `devbox stop` (manual docker rm, system prune, crashed cleanup)
+# but whose route YAMLs and cert files survive under ~/.config/devbox/.
+# Without that, downstream migrations (traefik-me, routes-to-https) would
+# rewrite the surviving files preserving the legacy raw name, and the
+# HTTPS phase would issue a leaf cert with underscored SANs that no
+# sanitized URL can match.
 #
 # Degenerate raws (empty, or sanitize-to-empty like "_" or ".") are skipped:
 # they have no valid LDH target name to migrate to. Such resources are
@@ -88,6 +114,78 @@ discover_projects() {
         [ "$raw" = "$sanitized" ] && continue
         seen+=("$raw")
     done < <(docker volume ls --format '{{.Name}}' 2>/dev/null || true)
+
+    # Traefik route YAMLs (devbox-<raw>-<port>.yml) and their pre-HTTPS
+    # backups (devbox-<raw>-<port>.yml.pre-https-backup). The trailing
+    # segment must be all digits — same contract as `devbox ports` uses
+    # to bucket files by container (docker-run.sh:1712-1714) — so a
+    # future non-route filename in the same dir does not produce a junk
+    # raw. nullglob keeps a missing dir or no-match glob from yielding
+    # the literal pattern string.
+    if [ -d "$TRAEFIK_CONFIG_DIR" ]; then
+        shopt -s nullglob
+        local rf base port_seg
+        for rf in "$TRAEFIK_CONFIG_DIR"/devbox-*.yml \
+                  "$TRAEFIK_CONFIG_DIR"/devbox-*.yml.pre-https-backup; do
+            base="$(basename "$rf")"
+            base="${base%.pre-https-backup}"
+            base="${base%.yml}"
+            port_seg="${base##*-}"
+            case "$port_seg" in
+                ''|*[!0-9]*) continue ;;
+            esac
+            local raw="${base#devbox-}"
+            raw="${raw%-*}"
+            [ -z "$raw" ] && continue
+            [ "$raw" = "traefik" ] && continue
+            local sanitized
+            sanitized="$(devbox::sanitize "$raw")"
+            [ -z "$sanitized" ] && continue
+            [ "$raw" = "$sanitized" ] && continue
+            seen+=("$raw")
+        done
+
+        # Per-project TLS fragments (<raw>-tls.yml). Written verbatim by
+        # `_cert::write_tls_yml` from the project name, so a legacy raw
+        # like `devbox-foo_bar` produces `devbox-foo_bar-tls.yml`. The
+        # `*-tls.yml` glob is the only signal we need: nothing else in
+        # this dir matches that suffix (route YAMLs end in `-<port>.yml`,
+        # caught by the trailing-digit gate above), so every match here
+        # is a real TLS fragment regardless of any `devbox-` prefix.
+        local tf
+        for tf in "$TRAEFIK_CONFIG_DIR"/*-tls.yml; do
+            base="$(basename "$tf" -tls.yml)"
+            [ -z "$base" ] && continue
+            local sanitized
+            sanitized="$(devbox::sanitize "$base")"
+            [ -z "$sanitized" ] && continue
+            [ "$base" = "$sanitized" ] && continue
+            seen+=("$base")
+        done
+        shopt -u nullglob
+    fi
+
+    # Per-project leaf certs (<raw>.pem | .key | .meta). Three globs
+    # because a partial cert (e.g. .meta left after a failed .pem write)
+    # is still a legacy artifact that should be cleaned. sort -u at the
+    # bottom dedupes the same raw appearing across multiple extensions.
+    if [ -d "$DEVBOX_CERTS_DIR" ]; then
+        shopt -s nullglob
+        local cf base
+        for cf in "$DEVBOX_CERTS_DIR"/*.pem \
+                  "$DEVBOX_CERTS_DIR"/*.key \
+                  "$DEVBOX_CERTS_DIR"/*.meta; do
+            base="$(basename "$cf")"
+            base="${base%.*}"
+            [ -z "$base" ] && continue
+            local sanitized
+            sanitized="$(devbox::sanitize "$base")"
+            [ -z "$sanitized" ] && continue
+            [ "$base" = "$sanitized" ] && continue
+            seen+=("$base")
+        done
+        shopt -u nullglob
+    fi
 
     # Guard against `printf '%s\n'` with zero args emitting a single blank
     # line — that would round-trip through mapfile as a 1-element array of
@@ -208,12 +306,41 @@ for raw in "${projects[@]}"; do
     if [ -d "$TRAEFIK_CONFIG_DIR" ]; then
         # Match the layout written by apply_port_routes:
         #   ${TRAEFIK_CONFIG_DIR}/${container}-${port}.yml
+        # Plus the migrate-routes-to-https sibling backup:
+        #   ${TRAEFIK_CONFIG_DIR}/${container}-${port}.yml.pre-https-backup
+        # And the per-project TLS fragment written by _cert::write_tls_yml:
+        #   ${TRAEFIK_CONFIG_DIR}/${raw}-tls.yml
         shopt -s nullglob
-        stale_cfgs=("$TRAEFIK_CONFIG_DIR/${old_container}-"*.yml)
+        stale_cfgs=(
+            "$TRAEFIK_CONFIG_DIR/${old_container}-"*.yml
+            "$TRAEFIK_CONFIG_DIR/${old_container}-"*.yml.pre-https-backup
+            "$TRAEFIK_CONFIG_DIR/${raw}-tls.yml"
+        )
         shopt -u nullglob
         if [ ${#stale_cfgs[@]} -gt 0 ]; then
             rm -f -- "${stale_cfgs[@]}"
             echo "  Removed ${#stale_cfgs[@]} stale traefik config(s)"
+        fi
+    fi
+
+    # Leaf cert + key + meta keyed by the legacy raw name. Leaving them in
+    # place would have Traefik (via the still-on-disk <sanitized>-tls.yml
+    # written on the next ensure_project_cert run) load a cert whose SANs
+    # are <raw>.test / <raw>.127.0.0.1.<provider> — every advertised
+    # https://<sanitized>.test URL would then trip a SAN mismatch in the
+    # browser. The fresh leaf for the sanitized name will be generated by
+    # the next `devbox <project>` -> apply_port_routes -> ensure_project_cert.
+    if [ -d "$DEVBOX_CERTS_DIR" ]; then
+        shopt -s nullglob
+        stale_certs=(
+            "$DEVBOX_CERTS_DIR/${raw}.pem"
+            "$DEVBOX_CERTS_DIR/${raw}.key"
+            "$DEVBOX_CERTS_DIR/${raw}.meta"
+        )
+        shopt -u nullglob
+        if [ ${#stale_certs[@]} -gt 0 ]; then
+            rm -f -- "${stale_certs[@]}"
+            echo "  Removed ${#stale_certs[@]} stale cert file(s)"
         fi
     fi
 done

@@ -703,16 +703,13 @@ YAML
 }
 
 # Remove per-project HTTPS artifacts (leaf cert + key + meta + Traefik TLS
-# fragment). Companion to the existing `rm -f $TRAEFIK_CONFIG_DIR/<container>*.yml`
-# route-file cleanup in the stop path: that glob catches the per-port route
-# files (matching the `<container>-<port>.yml` naming in apply_port_routes)
-# but leaves the cert files under $DEVBOX_CERTS_DIR and the project-scoped
-# `<project>-tls.yml` fragment behind because both lack the `devbox-` prefix
-# the glob keys off. Without this helper, a `devbox stop` would orphan the
-# TLS YAML — and on the next `devbox <project>` Traefik's file watcher
-# would still load it, advertising a cert for a project that no longer has
-# routes. Silent (2>/dev/null) so a freshly-stopped project that never had
-# HTTPS active doesn't generate spurious WARNs.
+# fragment). Used by `devbox remove` and by `devbox stop --clean`, alongside
+# the per-port route-file cleanup (`rm -f $TRAEFIK_CONFIG_DIR/devbox-<project>-*.yml`).
+# A plain `devbox stop` deliberately leaves both the routes and these
+# artifacts in place — the project's identity (cert + routes) is tied to
+# the project lifecycle, not the container lifecycle, per ADR 0008. Silent
+# (2>/dev/null) so a remove on a project that never had HTTPS active
+# doesn't generate spurious WARNs.
 #
 # Usage: _devbox::remove_project_https_artifacts <project>
 _devbox::remove_project_https_artifacts() {
@@ -724,6 +721,51 @@ _devbox::remove_project_https_artifacts() {
         "$DEVBOX_CERTS_DIR/${project}.meta" \
         "$DEVBOX_CERT_TLS_DIR/${project}-tls.yml" \
         2>/dev/null || true
+}
+
+# Remove per-port Traefik route YAMLs for a project, plus any sibling
+# `.pre-https-backup` files left by scripts/migrate-routes-to-https.sh.
+# Companion to _devbox::remove_project_https_artifacts — the three
+# together represent the full Traefik footprint of a project. Live route
+# files are named `devbox-<project>-<port>.yml` by apply_port_routes;
+# backups add a `.pre-https-backup` suffix on top. Both must go: leftover
+# backups would be resurrected by _devbox::restore_https_route_backups
+# during a later HTTPS rollback, recreating routes for a project whose
+# data was already removed.
+#
+# A naive `devbox-<project>-*.yml*` glob is unsafe twice over: it would
+# catch route files of any project whose sanitized name starts with
+# `<project>-` (e.g. removing `foo` would eat `devbox-foo-bar-8080.yml`
+# for the unrelated project `foo-bar`), and it would also catch any
+# non-route YAML that happens to share the prefix. Walk the glob
+# explicitly, strip both possible suffixes to get the bare
+# `devbox-<project>-<port>` shape, require the final dash segment to be
+# a numeric port (mirroring the guard in _devbox::list_routed_containers),
+# and then require the pre-port prefix to equal `devbox-<project>` so
+# prefix-collision projects survive untouched. The `<project>-tls.yml`
+# cert fragment lacks the `devbox-` prefix and is owned by the cert
+# helper above.
+#
+# Usage: _devbox::remove_project_route_yamls <project>
+_devbox::remove_project_route_yamls() {
+    local project="$1"
+    [ -n "$project" ] || return 0
+    [ -d "$TRAEFIK_CONFIG_DIR" ] || return 0
+    local f base suffix prefix
+    for f in "$TRAEFIK_CONFIG_DIR/devbox-${project}-"*.yml \
+             "$TRAEFIK_CONFIG_DIR/devbox-${project}-"*.yml.pre-https-backup; do
+        [ -f "$f" ] || continue
+        base="$(basename "$f")"
+        base="${base%.pre-https-backup}"
+        base="${base%.yml}"
+        suffix="${base##*-}"
+        case "$suffix" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        prefix="${base%-*}"
+        [ "$prefix" = "devbox-${project}" ] || continue
+        rm -f "$f" 2>/dev/null || true
+    done
 }
 
 # --- HTTPS lifecycle orchestration (ADR 0008 Phase 6) ------------------------
@@ -2091,12 +2133,12 @@ if [ "$MODE" = "stop" ]; then
             docker rm "$name" > /dev/null
             if [ "$CLEAN_VOLUMES" = true ]; then
                 remove_project_volumes "$DEVBOX_PROJECT_NAME"
+                _devbox::remove_project_route_yamls "$DEVBOX_PROJECT_NAME"
+                _devbox::remove_project_https_artifacts "$DEVBOX_PROJECT_NAME"
                 echo "Stopped + data removed:$name"
             else
                 echo "Stopped:$name"
             fi
-            rm -f "$TRAEFIK_CONFIG_DIR/${name}"*.yml 2>/dev/null
-            _devbox::remove_project_https_artifacts "$DEVBOX_PROJECT_NAME"
             stop_traefik_if_idle
             stop_dns_if_idle
             exit 0
@@ -2112,12 +2154,12 @@ if [ "$MODE" = "stop" ]; then
             docker rm "$c" > /dev/null
             if [ "$CLEAN_VOLUMES" = true ]; then
                 remove_project_volumes "$proj"
+                _devbox::remove_project_route_yamls "$proj"
+                _devbox::remove_project_https_artifacts "$proj"
                 echo "Stopped + data removed:$c"
             else
                 echo "Stopped:$c"
             fi
-            rm -f "$TRAEFIK_CONFIG_DIR/${c}"*.yml 2>/dev/null
-            _devbox::remove_project_https_artifacts "$proj"
         done
         stop_traefik_if_idle
         stop_dns_if_idle
@@ -2127,12 +2169,12 @@ if [ "$MODE" = "stop" ]; then
         docker rm "$selected" > /dev/null
         if [ "$CLEAN_VOLUMES" = true ]; then
             remove_project_volumes "$proj"
+            _devbox::remove_project_route_yamls "$proj"
+            _devbox::remove_project_https_artifacts "$proj"
             echo "Stopped + data removed: $selected"
         else
             echo "Stopped: $selected"
         fi
-        rm -f "$TRAEFIK_CONFIG_DIR/${selected}"*.yml 2>/dev/null
-        _devbox::remove_project_https_artifacts "$proj"
         stop_traefik_if_idle
         stop_dns_if_idle
     fi
@@ -2158,6 +2200,8 @@ if [ "$MODE" = "remove" ]; then
                 found=true
             fi
         done
+        _devbox::remove_project_route_yamls "$proj"
+        _devbox::remove_project_https_artifacts "$proj"
         if [ "$found" = false ]; then
             echo "  No volumes for project $proj." >&2
             return 1

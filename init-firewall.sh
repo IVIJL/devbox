@@ -9,6 +9,17 @@ IFS=$'\n\t'
 # shellcheck source=lib/allowlist.sh
 source /usr/local/share/devbox/lib/allowlist.sh
 
+# Closeout for an allow-for window that survived a container restart
+# (ADR 0009 Phase 5). Runs BEFORE flushing — the helper only reads the
+# sentinel and the persisted dnsmasq queries log, never touches the
+# firewall (init-firewall is about to wipe it anyway). Best-effort: a
+# missing sentinel is the common case and exits silently; any internal
+# failure inside the helper must not block firewall setup, hence the
+# `|| true` belt-and-braces.
+if [ -x /usr/local/bin/closeout-allow-for-on-restart ]; then
+    /usr/local/bin/closeout-allow-for-on-restart || true
+fi
+
 # 1. Extract Docker DNS info BEFORE any flushing
 DOCKER_DNS_RULES=$(iptables-save -t nat | grep "127\.0\.0\.11" || true)
 

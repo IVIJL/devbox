@@ -333,6 +333,7 @@ COPY scripts/setup-nvim-data.sh /usr/local/bin/
 COPY scripts/start-allow-for-window.sh /usr/local/bin/start-allow-for-window
 COPY scripts/teardown-allow-for-window.sh /usr/local/bin/teardown-allow-for-window
 COPY scripts/show-allow-for-status.sh /usr/local/bin/show-allow-for-status
+COPY scripts/closeout-allow-for-on-restart.sh /usr/local/bin/closeout-allow-for-on-restart
 
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/n /usr/local/bin/nx /usr/local/bin/start-rootless-docker.sh \
@@ -340,7 +341,8 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/setup-claude.sh /usr/local/bin/setup-nvim-data.sh \
     /usr/local/bin/start-allow-for-window \
     /usr/local/bin/teardown-allow-for-window \
-    /usr/local/bin/show-allow-for-status
+    /usr/local/bin/show-allow-for-status \
+    /usr/local/bin/closeout-allow-for-on-restart
 
 # Sudo with password — prevents AI agents from modifying firewall rules
 # Password is injected via --mount=type=secret (never stored in image layers/metadata)

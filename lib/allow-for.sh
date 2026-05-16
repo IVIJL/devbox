@@ -180,3 +180,137 @@ allow_for::format_remaining() {
     s=$((diff % 60))
     printf '%dm %02ds\n' "$m" "$s"
 }
+
+# --- Harvest closeout (shared between teardown daemon and restart closeout) --
+# Reads the sentinel, aggregates non-allowlist domains from the dnsmasq
+# queries log, writes the harvest log to the bind-mounted host log dir, and
+# drops a pending JSON for the host-side notification delivery script.
+#
+# Pure data path: never touches the firewall, never removes the sentinel.
+# Caller decides whether to undo iptables/ipset/dnsmasq state and when to
+# delete the sentinel. Two distinct call sites exercise this:
+#
+#   teardown-allow-for-window do_teardown — running daemon path. Caller
+#   tears down firewall + removes sentinel after this helper returns.
+#
+#   closeout-allow-for-on-restart — boot path invoked from init-firewall
+#   before any flushing. No firewall to undo (init-firewall is about to
+#   wipe everything); caller just removes the sentinel after this returns.
+#
+# Args:
+#   $1   reason — written into harvest log header and pending JSON.
+#                 One of: expired, stopped, interrupted.
+#
+# Output:
+#   stdout — one summary line: `Allow-for window closed for <container>
+#            (reason=<reason>, N domains captured) — <log_path>`.
+#   files  — harvest log at $ALLOW_FOR_LOG_DIR/<container>-<ts_safe>.log,
+#            pending JSON at $ALLOW_FOR_PENDING_DIR/.pending-... (when
+#            host-state dirs exist).
+#
+# Returns 0 unconditionally — best-effort by design. Missing sentinel fields
+# render as "unknown" in the header; an empty harvest is normal output.
+allow_for::write_harvest_closeout() {
+    local reason="$1"
+    local started_at expires_at container log_start_byte
+    started_at=$(allow_for::get_field started_at || echo "unknown")
+    expires_at=$(allow_for::get_field expires_at || echo "unknown")
+    container=$(allow_for::get_field container || echo "unknown")
+    log_start_byte=$(allow_for::get_field log_start_byte || echo 0)
+
+    # Filename-safe variant of started_at: strip colons that confuse
+    # Windows tooling when File Explorer opens the file via \\wsl$\... .
+    # Drop the timezone offset's sign-prefix `+`/`-` collision with the
+    # date separator by replacing colons only — `2026-05-16T07-30-15+0200`
+    # stays unambiguous.
+    local ts_safe="${started_at//:/-}"
+    local log_path="${ALLOW_FOR_LOG_DIR}/${container}-${ts_safe}.log"
+
+    mkdir -p "$ALLOW_FOR_LOG_DIR" 2>/dev/null || true
+
+    # Harvest aggregation runs against the post-restart byte offset
+    # captured at window open. An empty result is normal — the user may
+    # have closed the window before anything outside the allowlist was
+    # queried. On the restart closeout path the dnsmasq log may not exist
+    # at all (fresh container fs after `devbox build`); that case also
+    # falls through to "no domains" without an error.
+    local domains domain_count top_lines
+    domains=$(allow_for::harvest_domains "$log_start_byte" || true)
+    domain_count=0
+    [ -n "$domains" ] && domain_count=$(printf '%s\n' "$domains" | wc -l)
+
+    # Timestamps are rendered in human-readable form here (TZ-named, no
+    # `T` separator) because this file is opened by the user via the
+    # Windows toast click. Sentinel + pending JSON keep the ISO 8601
+    # shape (machine-parseable). Container inherits host TZ via the
+    # `TZ` env baked into the image, so the displayed local time and
+    # TZ abbreviation match the user's host clock.
+    {
+        echo "# devbox allow-for harvest log"
+        echo "container:   $container"
+        echo "started_at:  $(allow_for::human_time "$started_at")"
+        echo "expires_at:  $(allow_for::human_time "$expires_at")"
+        echo "ended_at:    $(allow_for::human_time "$(allow_for::now_iso)")"
+        echo "reason:      $reason"
+        echo "domain_count: $domain_count"
+        echo "# ----------------------------------------------------------------"
+        if [ -n "$domains" ]; then
+            printf '%s\n' "$domains"
+        else
+            echo "# (no non-allowlist domains were queried during the window)"
+        fi
+    } > "$log_path"
+    chmod 0644 "$log_path"
+
+    # Build the top-3 list for the toast body — most-queried, then
+    # alphabetical for ties. The dnsmasq log has one line per query, so
+    # `sort | uniq -c | sort -rn` ranks correctly.
+    top_lines=""
+    if [ -n "$domains" ]; then
+        local sb=$((log_start_byte + 1))
+        top_lines=$(tail -c "+${sb}" "$ALLOW_FOR_DNSMASQ_QUERIES" 2>/dev/null \
+            | grep -oP "query\[(A|AAAA)\] \K[^ ]+" \
+            | grep -Fxf <(printf '%s\n' "$domains") \
+            | sort | uniq -c | sort -rn -k1,1 -k2,2 \
+            | awk '{print $2}' | head -3 | tr '\n' '|' | sed 's/|$//' || true)
+    fi
+
+    # Notification handoff for Phase 3. Pending JSON files are picked up
+    # by the host-side delivery script on the next `devbox` invocation
+    # (or by a one-shot watcher started alongside the window). Writing
+    # the file is fire-and-forget — if no delivery runs, the harvest log
+    # is still the canonical record.
+    #
+    # The pending dir is host-user-owned (see ensure-allow-for-host-state.sh)
+    # so the deliver script can rename-claim atomically; the file itself
+    # is still written as root:root 0644, so its CONTENTS can't be forged
+    # mid-flight by the in-container node user. If the pending dir is
+    # missing (pre-Phase-3 install upgraded without `devbox update`), skip
+    # the handoff — the harvest log is canonical and the next update will
+    # provision the dir.
+    if [ -d "$ALLOW_FOR_PENDING_DIR" ] && [ -d "$ALLOW_FOR_TMP_DIR" ]; then
+        local pending="${ALLOW_FOR_PENDING_DIR}/.pending-${container}-${ts_safe}.json"
+        # Atomic publish via root-only scratch dir + cross-subdir rename.
+        # See teardown-allow-for-window.sh and ensure-allow-for-host-state.sh
+        # for the full TOCTOU-defence rationale.
+        local pending_tmp
+        if pending_tmp=$(mktemp "${ALLOW_FOR_TMP_DIR}/pending.XXXXXXXXXX"); then
+            cat > "$pending_tmp" <<EOF
+{
+  "container": "${container}",
+  "log_path": "${log_path}",
+  "started_at": "${started_at}",
+  "ended_at": "$(allow_for::now_iso)",
+  "reason": "${reason}",
+  "domain_count": ${domain_count},
+  "top_domains": "${top_lines}"
+}
+EOF
+            chmod 0644 "$pending_tmp"
+            mv "$pending_tmp" "$pending" 2>/dev/null || rm -f "$pending_tmp"
+        fi
+    fi
+
+    printf 'Allow-for window closed for %s (reason=%s, %d domains captured) — %s\n' \
+        "$container" "$reason" "$domain_count" "$log_path"
+}

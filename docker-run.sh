@@ -52,7 +52,7 @@ Usage:
 Build flags:
   devbox build                     Build image (uses cache)
   devbox build --no-cache          Full rebuild without cache
-  devbox build --clean             Full reset (volumes + cache) + rebuild
+  devbox build --clean             Wipe build cache + dangling images, then rebuild
   devbox build --progress=plain    Show full build log
 
 Examples:

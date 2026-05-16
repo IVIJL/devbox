@@ -104,6 +104,7 @@ Run `devbox --help` for the full list. Summary:
 | `devbox allow [domain]` | List allowed domains, or add one |
 | `devbox deny [domain]` | Remove allowed domain (interactive if no arg) |
 | `devbox blocked` | Show blocked DNS queries, allow interactively via fzf |
+| `devbox allow-for [N] [name]` | Open an N-minute window that records (not blocks) non-allowlist DNS; `--stop` closes early |
 | `devbox cursor [name]` | Open Cursor attached to running devbox |
 | `devbox code [name]` | Open VS Code attached to running devbox |
 | `devbox clip` | Grab clipboard image for container use |
@@ -163,6 +164,24 @@ devbox blocked                   # Show blocked DNS queries, allow interactively
 ```
 
 Changes take effect immediately across all running containers — dnsmasq is reloaded and ipset rules are updated without restart.
+
+### Allow-for harvest window
+
+When running unattended agents (LLM tools, scripts) it's useful to let them reach the wider internet for a short time and afterwards see *what* they actually queried, so the allowlist can be informed by reality instead of guesswork. `devbox allow-for` opens a time-bounded window where:
+
+- Domains outside the allowlist are **recorded, not blocked** — DNS resolution succeeds and traffic to those IPs is accepted via a transient `harvest-pool` ipset.
+- Domains in the allowlist behave exactly as before — no change in routing.
+- When the window closes (timer expires, `--stop`, or `devbox stop` on the container), the firewall is reversed and a harvest log lists every non-allowlist domain that was queried. A clickable desktop notification (Windows toast / Linux notify-send / macOS osascript) opens the log.
+
+```bash
+devbox allow-for 30              # 30-minute window in CWD's container
+devbox allow-for 30 myapp        # 30-minute window in 'myapp'
+devbox allow-for myapp           # Show status (remaining time, captured count)
+devbox allow-for --stop          # Close the active window in CWD's container
+devbox allow-for --stop myapp    # Close the active window in 'myapp'
+```
+
+Harvest logs persist at `/var/log/devbox/allow-for/<container>-<timestamp>.log` on the host (root-owned, tamper-proof from inside the container). See [ADR 0009](docs/adr/0009-allow-for-harvest-window.md) for the security model.
 
 ## Port Routing
 

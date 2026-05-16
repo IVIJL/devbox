@@ -77,7 +77,7 @@ if allow_for::sentinel_exists && ! allow_for::is_expired && runtime_state_intact
     ' "$ALLOW_FOR_SENTINEL" > "$tmp"
     chmod 0644 "$tmp"
     mv "$tmp" "$ALLOW_FOR_SENTINEL"
-    echo "Allow-for window extended: now expires at $new_expires"
+    echo "Allow-for window extended: now expires at $(allow_for::human_time "$new_expires")"
     exit 0
 fi
 
@@ -220,4 +220,4 @@ awk -v pid="$DAEMON_PID" '
 chmod 0644 "$tmp"
 mv "$tmp" "$ALLOW_FOR_SENTINEL"
 
-echo "Allow-for window opened: expires at ${EXPIRES_AT} (daemon pid ${DAEMON_PID})"
+echo "Allow-for window opened: expires at $(allow_for::human_time "$EXPIRES_AT") (daemon pid ${DAEMON_PID})"

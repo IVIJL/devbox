@@ -31,8 +31,15 @@ else
     echo "No Docker DNS rules to restore"
 fi
 
-# First allow DNS and localhost before any restrictions
-iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+# Pin outbound DNS to the in-container resolver (127.0.0.1 = dnsmasq).
+# External UDP/TCP 53 and DoT (TCP 853) are rejected so every name
+# resolution flows through our audited resolver — precondition for the
+# allow-for harvest pool (ADR 0009) and a general hardening win.
+iptables -A OUTPUT -p udp --dport 53 -d 127.0.0.1 -j ACCEPT
+iptables -A OUTPUT -p tcp --dport 53 -d 127.0.0.1 -j ACCEPT
+iptables -A OUTPUT -p udp --dport 53 -j REJECT --reject-with icmp-admin-prohibited
+iptables -A OUTPUT -p tcp --dport 53 -j REJECT --reject-with icmp-admin-prohibited
+iptables -A OUTPUT -p tcp --dport 853 -j REJECT --reject-with icmp-admin-prohibited
 iptables -A INPUT -p udp --sport 53 -j ACCEPT
 iptables -A INPUT -i lo -j ACCEPT
 iptables -A OUTPUT -o lo -j ACCEPT
@@ -124,6 +131,14 @@ cat > /etc/dnsmasq.d/devbox-firewall.conf <<DNSCONF
 bind-interfaces
 listen-address=127.0.0.1
 port=53
+# Pin dnsmasq to the dnsmasq user explicitly. The DNS-bypass guard below
+# (allow 127.0.0.11 only for --uid-owner dnsmasq) depends on this — if
+# dnsmasq fell back to nobody, its own upstream queries would be rejected.
+# No group= line on purpose: Debian's dnsmasq postinst creates user
+# dnsmasq with primary group nogroup, not a same-named group, so an
+# explicit group=dnsmasq would make dnsmasq fail to start. The iptables
+# rule below matches on UID anyway via --uid-owner, so GID is irrelevant.
+user=dnsmasq
 no-resolv
 server=${UPSTREAM_DNS}
 log-queries
@@ -148,6 +163,20 @@ else
     exit 1
 fi
 
+# Close the Docker embedded DNS bypass at 127.0.0.11. The Docker DNS NAT
+# rules restored above DNAT 127.0.0.11:53 to a high port before filter
+# OUTPUT runs, so the `--dport 53` REJECTs miss the packet and
+# `-o lo -j ACCEPT` would then let it through. Block the destination —
+# except for dnsmasq itself, which forwards to ${UPSTREAM_DNS} captured
+# from the original resolv.conf (= 127.0.0.11 on user-defined Docker
+# networks). Without the dnsmasq exception, every allowed-domain
+# resolution would fail. Rules inserted in reverse order so the
+# resulting OUTPUT chain has the dnsmasq-allow *before* the
+# everyone-reject. The whole block must happen after the GitHub IP
+# fetch above, which still needs Docker DNS unfiltered.
+iptables -I OUTPUT 1 -d 127.0.0.11 -j REJECT --reject-with icmp-admin-prohibited
+iptables -I OUTPUT 1 -d 127.0.0.11 -m owner --uid-owner dnsmasq -j ACCEPT
+
 echo "Firewall configuration complete"
 echo "Verifying firewall rules..."
 if curl --connect-timeout 5 https://www.google.com >/dev/null 2>&1; then
@@ -162,4 +191,23 @@ if ! curl --connect-timeout 5 https://api.github.com/zen >/dev/null 2>&1; then
     exit 1
 else
     echo "Firewall verification passed - able to reach https://api.github.com as expected"
+fi
+
+# DNS pinning check — external resolvers must be unreachable so every
+# query flows through the in-container dnsmasq (ADR 0009 invariant).
+if dig +short +tries=1 +time=3 @8.8.8.8 google.com >/dev/null 2>&1; then
+    echo "ERROR: Firewall verification failed - external DNS @8.8.8.8 is reachable"
+    exit 1
+else
+    echo "Firewall verification passed - external DNS @8.8.8.8 unreachable as expected"
+fi
+
+# Docker's embedded DNS at 127.0.0.11 must also be blocked, otherwise a
+# process can bypass dnsmasq by querying it directly. Regression check
+# for the explicit REJECT inserted right after dnsmasq starts.
+if dig +short +tries=1 +time=3 @127.0.0.11 google.com >/dev/null 2>&1; then
+    echo "ERROR: Firewall verification failed - Docker embedded DNS @127.0.0.11 is reachable"
+    exit 1
+else
+    echo "Firewall verification passed - Docker embedded DNS @127.0.0.11 unreachable as expected"
 fi

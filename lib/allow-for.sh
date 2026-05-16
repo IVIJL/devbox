@@ -140,13 +140,30 @@ allow_for::harvest_domains() {
 }
 
 # --- Time helpers ------------------------------------------------------------
-# ISO 8601 in the local timezone (matches what the user sees in toast/log).
+# ISO 8601 in the local timezone — used for machine-parseable fields
+# (sentinel state, pending JSON). Kept ISO because the host-side
+# deliver script's iso_to_epoch parses both GNU `date -d` and BSD
+# `date -j -f '%Y-%m-%dT%H:%M:%S%z'`, and the latter requires the
+# fixed `T`-separated shape.
 allow_for::now_iso() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 
 # "+15 min" → ISO 8601 timestamp, local TZ.
 allow_for::iso_plus_minutes() {
     local minutes="$1"
     date -d "+${minutes} minutes" '+%Y-%m-%dT%H:%M:%S%z'
+}
+
+# Convert ISO 8601 → `YYYY-MM-DD HH:MM:SS TZ` for display in the harvest
+# log header and `show-allow-for-status` output. Containers run with
+# `TZ=Europe/Prague` (or whichever the user's host uses) inherited at
+# image build, so the rendered local time and TZ abbreviation match
+# what the user sees on the host clock. Falls back to the raw ISO if
+# `date -d` can't parse — defensive only, our writers always emit
+# canonical shape.
+allow_for::human_time() {
+    local iso="$1"
+    [ -z "$iso" ] && { printf '\n'; return 0; }
+    date -d "$iso" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || printf '%s\n' "$iso"
 }
 
 # Human-friendly "Xm Ys remaining" for status output. Negative deltas

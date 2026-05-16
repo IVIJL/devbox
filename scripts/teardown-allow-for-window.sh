@@ -74,12 +74,18 @@ do_teardown() {
     domain_count=0
     [ -n "$domains" ] && domain_count=$(printf '%s\n' "$domains" | wc -l)
 
+    # Timestamps are rendered in human-readable form here (TZ-named, no
+    # `T` separator) because this file is opened by the user via the
+    # Windows toast click. Sentinel + pending JSON keep the ISO 8601
+    # shape (machine-parseable). Container inherits host TZ via the
+    # `TZ` env baked into the image, so the displayed local time and
+    # TZ abbreviation match the user's host clock.
     {
         echo "# devbox allow-for harvest log"
         echo "container:   $container"
-        echo "started_at:  $started_at"
-        echo "expires_at:  $expires_at"
-        echo "ended_at:    $(allow_for::now_iso)"
+        echo "started_at:  $(allow_for::human_time "$started_at")"
+        echo "expires_at:  $(allow_for::human_time "$expires_at")"
+        echo "ended_at:    $(allow_for::human_time "$(allow_for::now_iso)")"
         echo "reason:      $reason"
         echo "domain_count: $domain_count"
         echo "# ----------------------------------------------------------------"

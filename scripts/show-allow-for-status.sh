@@ -37,7 +37,7 @@ captured=$(allow_for::harvest_domains "$log_start_byte" || true)
 
 cat <<EOF
 Allow-for window active for ${container}
-  Started:   ${started_at}
-  Expires:   ${expires_at}   (${remaining} remaining)
+  Started:   $(allow_for::human_time "$started_at")
+  Expires:   $(allow_for::human_time "$expires_at")   (${remaining} remaining)
   Captured:  ${captured_count} non-allowlist domains so far
 EOF

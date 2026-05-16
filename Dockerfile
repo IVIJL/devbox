@@ -321,6 +321,7 @@ COPY --chown=node:node config/claude/ /etc/claude-defaults/
 RUN chmod +x /etc/claude-defaults/hooks/*.sh /etc/claude-defaults/statusline-info.sh
 
 COPY lib/allowlist.sh /usr/local/share/devbox/lib/allowlist.sh
+COPY lib/allow-for.sh /usr/local/share/devbox/lib/allow-for.sh
 COPY init-firewall.sh /usr/local/bin/
 COPY scripts/setup-chezmoi.sh /usr/local/bin/
 COPY scripts/n scripts/nx /usr/local/bin/
@@ -329,11 +330,17 @@ COPY scripts/devbox-entrypoint.sh /usr/local/bin/
 COPY scripts/devbox-firewall-reload.sh /usr/local/bin/devbox-firewall-reload
 COPY scripts/setup-claude.sh /usr/local/bin/
 COPY scripts/setup-nvim-data.sh /usr/local/bin/
+COPY scripts/start-allow-for-window.sh /usr/local/bin/start-allow-for-window
+COPY scripts/teardown-allow-for-window.sh /usr/local/bin/teardown-allow-for-window
+COPY scripts/show-allow-for-status.sh /usr/local/bin/show-allow-for-status
 
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/n /usr/local/bin/nx /usr/local/bin/start-rootless-docker.sh \
     /usr/local/bin/devbox-entrypoint.sh /usr/local/bin/devbox-firewall-reload \
-    /usr/local/bin/setup-claude.sh /usr/local/bin/setup-nvim-data.sh
+    /usr/local/bin/setup-claude.sh /usr/local/bin/setup-nvim-data.sh \
+    /usr/local/bin/start-allow-for-window \
+    /usr/local/bin/teardown-allow-for-window \
+    /usr/local/bin/show-allow-for-status
 
 # Sudo with password — prevents AI agents from modifying firewall rules
 # Password is injected via --mount=type=secret (never stored in image layers/metadata)

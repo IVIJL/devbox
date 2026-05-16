@@ -1526,6 +1526,16 @@ if [ "$MODE" = "update" ]; then
     # migration tears it down.
     _devbox::self_heal_resolver_drop_in
 
+    # Allow-for host state self-heal (ADR 0009). install.sh is the canonical
+    # creator; this call brings existing pre-ADR-0009 installs forward.
+    # `--quiet-if-noop` keeps the steady-state run silent: only a real
+    # provisioning step or a warning surfaces in the update log. Failure
+    # to provision the harvest-log dir is informational here — `devbox
+    # allow-for` itself will refuse cleanly if the dir is missing.
+    if [ -x "$DEVBOX_DIR/scripts/ensure-allow-for-host-state.sh" ]; then
+        "$DEVBOX_DIR/scripts/ensure-allow-for-host-state.sh" --quiet-if-noop || true
+    fi
+
     if [ "${DEVBOX_UPDATE_PULLED:-}" = "1" ]; then
         # Install or refresh zsh completion file (no .zshrc modifications here)
         _completion_src="$DEVBOX_DIR/completions/_devbox"
@@ -2716,6 +2726,16 @@ DOCKER_ARGS+=(-e "HOST_HOME=$HOME")
 mkdir -p "$ALLOWLIST_HOST_DIR"
 touch "$ALLOWLIST_HOST_FILE"
 DOCKER_ARGS+=(-v "$ALLOWLIST_HOST_FILE:$ALLOWLIST_CONTAINER_FILE:ro")
+
+# Harvest log directory for `devbox allow-for` (ADR 0009). Provisioned
+# root:root 0755 by install.sh / `devbox update` self-heal. Mounted RW so
+# the in-container root daemon can write reports; the node user (host UID
+# 1000) can read but cannot delete or overwrite — that's the tamper-proof
+# half of the audit invariant. Missing host dir → degrade silently here;
+# `devbox allow-for` will refuse with a clear error when invoked.
+if [ -d /var/log/devbox/allow-for ]; then
+    DOCKER_ARGS+=(-v /var/log/devbox/allow-for:/var/log/devbox/allow-for)
+fi
 
 # Clipboard images shared directory (host → container, same ~/.clipboard-images path)
 CLIPBOARD_DIR="$HOME/.clipboard-images"

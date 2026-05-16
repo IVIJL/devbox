@@ -229,6 +229,65 @@ if [ "$UNINSTALL" = true ]; then
         fi
     fi
 
+    # Ask about allow-for harvest log directory (ADR 0009). Root-owned, so
+    # removal requires sudo. Kept opt-in because harvest logs document past
+    # outbound traffic from autonomous agents — some users will want to
+    # preserve them across reinstalls (forensics, allowlist audit trail).
+    ALLOW_FOR_LOG_DIR="/var/log/devbox/allow-for"
+    if [ -d "$ALLOW_FOR_LOG_DIR" ]; then
+        echo ""
+        echo "Allow-for harvest logs found: $ALLOW_FOR_LOG_DIR"
+        # Use sudo for the count too — directory is 0755 so listing works
+        # without it, but if perms drift `find` would still succeed.
+        log_count=$(find "$ALLOW_FOR_LOG_DIR" -maxdepth 1 -type f -name '*.log' 2>/dev/null | wc -l)
+        echo "  Contains: $log_count harvest log file(s)"
+        if [ -t 0 ]; then
+            printf "Remove harvest logs? [y/N] "
+            read -r answer
+            if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
+                sudo rm -rf /var/log/devbox
+                echo "Removed: /var/log/devbox"
+            else
+                echo "Kept: $ALLOW_FOR_LOG_DIR"
+            fi
+        else
+            echo "  Skipped (non-interactive). Remove manually: sudo rm -rf /var/log/devbox"
+        fi
+    fi
+
+    # Ask about the WSL2 toast notification AppId (ADR 0009). The HKCU key
+    # itself is harmless if left behind — without the harvest-log dir it
+    # simply never gets fired — but a thorough purge should sweep it.
+    if grep -qi microsoft /proc/version 2>/dev/null && command -v powershell.exe >/dev/null 2>&1; then
+        # Cheap probe: Test-Path is one PowerShell round-trip (~200 ms).
+        # Skip the whole block when the key isn't there to avoid prompting
+        # the user about something that doesn't exist.
+        if powershell.exe -NoProfile -Command \
+            "if (Test-Path 'HKCU:\\Software\\Classes\\AppUserModelId\\Devbox.AllowFor') { exit 0 } else { exit 1 }" \
+            >/dev/null 2>&1; then
+            echo ""
+            echo "Windows toast AppId found: HKCU\\...\\AppUserModelId\\Devbox.AllowFor"
+            if [ -t 0 ]; then
+                printf "Remove HKCU AppId? [y/N] "
+                read -r answer
+                if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
+                    if powershell.exe -NoProfile -Command \
+                        "Remove-Item -Path 'HKCU:\\Software\\Classes\\AppUserModelId\\Devbox.AllowFor' -Recurse -Force" \
+                        >/dev/null 2>&1; then
+                        echo "Removed: HKCU\\...\\AppUserModelId\\Devbox.AllowFor"
+                    else
+                        echo "WARN: Failed to remove HKCU AppId (check Windows event log)."
+                    fi
+                else
+                    echo "Kept: HKCU\\...\\AppUserModelId\\Devbox.AllowFor"
+                fi
+            else
+                echo "  Skipped (non-interactive). Remove manually via Windows PowerShell:"
+                echo "    Remove-Item -Path 'HKCU:\\Software\\Classes\\AppUserModelId\\Devbox.AllowFor' -Recurse -Force"
+            fi
+        fi
+    fi
+
     echo ""
     echo "=== Uninstall done ==="
     exit 0

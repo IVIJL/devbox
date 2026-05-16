@@ -402,6 +402,30 @@ install_mkcert() {
     fi
 }
 
+# --- Allow-for host state (ADR 0009) -----------------------------------------
+# Provisions /var/log/devbox/allow-for/ (root-owned, mounted into containers)
+# and, on WSL2, the toast notification AppId. install.sh is the canonical
+# creation path; `devbox update` runs the same provisioner as a self-heal
+# for existing installs that predate ADR 0009. The script is idempotent and
+# only fires sudo when the dir is missing or has wrong perms.
+
+setup_allow_for_state() {
+    info "Configuring allow-for host state..."
+
+    local provisioner="$DEVBOX_DIR/scripts/ensure-allow-for-host-state.sh"
+    if [ ! -x "$provisioner" ]; then
+        warn "scripts/ensure-allow-for-host-state.sh missing or non-executable; skipping."
+        SKIPPED+=("allow-for host state (provisioner script missing)")
+        return
+    fi
+
+    if "$provisioner"; then
+        CONFIGURED+=("allow-for host state (/var/log/devbox/allow-for + WSL toast AppId)")
+    else
+        SKIPPED+=("allow-for host state (setup failed; see warnings above)")
+    fi
+}
+
 # --- SSH agent configuration -------------------------------------------------
 
 configure_ssh_agent() {
@@ -747,9 +771,10 @@ main() {
         msg "  2. Configure SSH agent via keychain"
         msg "  3. Clone devbox to $DEVBOX_DIR"
         msg "  4. Install mkcert v$MKCERT_VERSION (HTTPS dev certs; CA install deferred to dns-install)"
-        msg "  5. Install 'devbox' command to $SYMLINK_PATH"
-        msg "  6. Optionally generate Claude Code token for containers"
-        msg "  7. Check Docker availability"
+        msg "  5. Set up /var/log/devbox/allow-for (root-owned harvest log dir; sudo prompt)"
+        msg "  6. Install 'devbox' command to $SYMLINK_PATH"
+        msg "  7. Optionally generate Claude Code token for containers"
+        msg "  8. Check Docker availability"
         echo ""
         if ! confirm "Continue?"; then
             msg "Aborted."
@@ -771,6 +796,9 @@ main() {
 
     echo ""
     install_mkcert
+
+    echo ""
+    setup_allow_for_state
 
     echo ""
     install_command

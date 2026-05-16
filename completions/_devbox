@@ -41,6 +41,7 @@ _devbox() {
                 'allow:List or add allowed firewall domain'
                 'deny:Remove allowed domain (interactive)'
                 'blocked:Show blocked DNS queries, allow interactively'
+                'allow-for:Open a time-bounded Allow-for window (default 15 min)'
                 'cursor:Open Cursor attached to running devbox'
                 'code:Open VS Code attached to running devbox'
                 'clip:Grab clipboard image for container use'
@@ -65,6 +66,16 @@ _devbox() {
                     ;;
                 cursor|code|remove)
                     _devbox_containers
+                    ;;
+                allow-for)
+                    # Positionals can be in any order: minutes (numeric) or
+                    # project name. --stop is a flag.
+                    if (( CURRENT == 3 )) || (( CURRENT == 4 )); then
+                        _devbox_containers
+                        local -a flags
+                        flags=('--stop:Close the active window immediately')
+                        _describe 'flags' flags
+                    fi
                     ;;
                 connect)
                     if (( CURRENT == 3 )); then

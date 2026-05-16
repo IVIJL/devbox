@@ -102,19 +102,26 @@ ipset create "$ALLOW_FOR_IPSET" hash:net
 # Insert the harvest-pool ACCEPT rule immediately before the final
 # catch-all REJECT. init-firewall.sh produces an OUTPUT chain that
 # contains multiple REJECTs:
-#   - line 1:    REJECT to 127.0.0.11           (Docker DNS bypass guard)
-#   - middle:    REJECT udp/tcp dpt 53/853      (DNS pinning)
-#   - last:      REJECT all 0.0.0.0/0 → 0.0.0.0/0 reject-with ...   <-- target
+#   - Docker DNS guard (REJECT to 127.0.0.11)
+#   - DNS pinning (REJECT udp/tcp dpt 53/853)
+#   - catch-all final REJECT                <-- target
 #
-# A loose regex would match the first REJECT (Docker DNS) and insert
-# harvest-pool ahead of the DNS-pinning rejects, letting an in-window
-# harvested IP — e.g. dns.google — bypass port-53/853 blocks. Match the
-# catch-all signature exactly: proto=all, src=dst=0.0.0.0/0, and
-# `reject-with` immediately after dst (no per-port qualifier in between).
-# Take the LAST match in case future rules ever add another all-zeros
-# REJECT — the catch-all is appended last by design.
-reject_line=$(iptables -L OUTPUT --line-numbers -n 2>/dev/null \
-    | awk '$2 == "REJECT" && $3 == "all" && $5 == "0.0.0.0/0" && $6 == "0.0.0.0/0" && $7 == "reject-with" {last=$1} END{if (last) print last}')
+# Parsing `iptables -L -n` is fragile: iptables-nft renders the protocol
+# column as a number (`0` for all) while iptables-legacy prints `all`,
+# and the column count differs subtly between versions. Use `iptables -S`
+# instead — it dumps rules in restorable `-A` syntax with a stable
+# canonical flag order, independent of the kernel backend. The catch-all
+# is the single line shaped exactly `-A OUTPUT -j REJECT --reject-with...`
+# (no `-d`/`-s`/`-p`/`-m` qualifiers before `-j`). Counting `-A OUTPUT`
+# lines gives the 1-based rule number used by `iptables -I OUTPUT <N>`.
+# Take the last match defensively in case anything ever adds a second
+# such REJECT — the catch-all is appended last by design.
+reject_line=$(iptables -S OUTPUT 2>/dev/null \
+    | awk '
+        /^-A OUTPUT/ { n++ }
+        /^-A OUTPUT -j REJECT --reject-with/ { last=n }
+        END { if (last) print last }
+    ')
 if [ -z "$reject_line" ]; then
     echo "ERROR: could not locate final OUTPUT REJECT rule — firewall in unexpected state" >&2
     ipset destroy "$ALLOW_FOR_IPSET" 2>/dev/null || true
@@ -178,10 +185,30 @@ log_start_byte=${LOG_START_BYTE}
 EOF
 chmod 0644 "$ALLOW_FOR_SENTINEL"
 
+# Belt-and-braces for old containers that predate the Phase 1 host-state
+# bind mount: ensure the daemon's log directory exists before the
+# shell-redirect tries to open it. Without this, an ENOENT here cancels
+# the redirect AND the setsid command silently, leaving a sentinel with
+# a garbage PID and no daemon to fire teardown.
+mkdir -p "$(dirname "$ALLOW_FOR_DAEMON_LOG")" 2>/dev/null || true
+
 setsid nohup /usr/local/bin/teardown-allow-for-window \
     </dev/null >>"$ALLOW_FOR_DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 disown "$DAEMON_PID" 2>/dev/null || true
+
+# Sanity-check that the daemon actually started. A failed redirect or
+# missing binary would have produced a phantom PID; without this guard,
+# the window would silently never close.
+sleep 0.2
+if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+    echo "ERROR: teardown daemon failed to start — rolling back" >&2
+    rm -f "$ALLOW_FOR_SENTINEL" "$ALLOW_FOR_DNSMASQ_CONF"
+    iptables -D OUTPUT -m set --match-set "$ALLOW_FOR_IPSET" dst -j ACCEPT 2>/dev/null || true
+    ipset destroy "$ALLOW_FOR_IPSET" 2>/dev/null || true
+    /usr/local/bin/devbox-firewall-reload >/dev/null 2>&1 || true
+    exit 1
+fi
 
 # Patch the daemon PID into the sentinel via atomic rename.
 tmp="${ALLOW_FOR_SENTINEL}.tmp.$$"

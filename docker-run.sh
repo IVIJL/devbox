@@ -43,6 +43,12 @@ Usage:
                                    (entry matches domain + all subdomains)
   devbox deny [domain]             Remove allowed domain (interactive)
   devbox blocked                   Show blocked DNS queries, allow interactively
+  devbox allow-for [N] [name]      Open an Allow-for window for N min (default 15)
+                                   in one container; non-allowlist domains are
+                                   passively allowed and recorded. No args =
+                                   status of CWD's container, or start 15-min
+                                   window if none active. See ADR 0009.
+  devbox allow-for --stop [name]   Close the active window immediately
   devbox cursor [name]             Open Cursor attached to running devbox
   devbox code [name]               Open VS Code attached to running devbox
   devbox clip                      Grab clipboard image for container use
@@ -74,6 +80,9 @@ Examples:
   devbox allow pypi.org            Allow pypi.org (and *.pypi.org) through firewall
   devbox deny                      Interactive domain removal
   devbox blocked                   See blocked queries, allow with fzf
+  devbox allow-for 30              Open a 30-min Allow-for window in CWD's container
+  devbox allow-for 30 myapp        Open a 30-min window in 'myapp'
+  devbox allow-for --stop          Close the active window in CWD's container
 EOF
     exit 0
 }
@@ -1277,6 +1286,51 @@ list_running_containers() {
     fi
 }
 
+# Print a heads-up when an allow-for window is currently live in any
+# running devbox container. Called from MODE=allow and MODE=deny so the
+# user knows the allowlist edit they just made interacts with the
+# transient harvest pool (ADR 0009).
+#
+# $1 = the affected domain  (just for the message body)
+# $2 = action — "allow" or "deny"
+#
+# Cost: one `docker exec` per running container. Acceptable: allow/deny is
+# a single human-driven operation; nobody runs it in a hot loop. The probe
+# is read-only (`-u node`, `test -f`, `cut`).
+warn_if_allow_for_active() {
+    local domain="$1" action="$2"
+    local containers
+    containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | filter_user_containers)
+    [ -z "$containers" ] && return 0
+
+    local c exp_iso exp_hhmm
+    while IFS= read -r c; do
+        [ -z "$c" ] && continue
+        exp_iso=$(docker exec -u node "$c" bash -c '
+            f=/etc/devbox-shared/.allow-for.state
+            [ -f "$f" ] || exit 1
+            exp=$(grep -E "^expires_at=" "$f" | head -1 | cut -d= -f2-)
+            [ -n "$exp" ] || exit 1
+            now=$(date +%s)
+            target=$(date -d "$exp" +%s 2>/dev/null) || exit 1
+            [ "$now" -lt "$target" ] || exit 1
+            echo "$exp"
+        ' 2>/dev/null) || continue
+        exp_hhmm=$(date -d "$exp_iso" +%H:%M 2>/dev/null || echo "$exp_iso")
+        case "$action" in
+            allow)
+                echo "Note: allow-for window is active in ${c} until ${exp_hhmm}."
+                echo "  ${domain} is being permanently allowed; effect is identical after the window closes."
+                ;;
+            deny)
+                echo "Note: allow-for window is active in ${c} until ${exp_hhmm}."
+                echo "  ${domain} remains accepted via harvest-pool until the window closes."
+                echo "  Use 'devbox allow-for --stop' to close the window immediately."
+                ;;
+        esac
+    done <<< "$containers"
+}
+
 # Trigger dnsmasq config reload in all running devbox containers.
 # Implementation lives in /usr/local/bin/devbox-firewall-reload (in the image);
 # this is just the per-container fan-out.
@@ -1405,6 +1459,21 @@ case "${1:-}" in
     allow)   MODE="allow";   shift; DOMAIN="${1:-}" ;;
     deny)    MODE="deny";    shift; DOMAIN="${1:-}" ;;
     blocked)   MODE="blocked";   shift ;;
+    allow-for) MODE="allow-for"; shift
+             # Positionals can come in either order: a numeric token is the
+             # window length in minutes, a non-numeric token is the project
+             # target. --stop is a flag that swaps start → stop.
+             ALLOW_FOR_MINUTES=""
+             ALLOW_FOR_TARGET=""
+             ALLOW_FOR_STOP=false
+             for arg in "$@"; do
+                 case "$arg" in
+                     --stop)         ALLOW_FOR_STOP=true ;;
+                     ''|*[!0-9]*)    ALLOW_FOR_TARGET="$arg" ;;
+                     *)              ALLOW_FOR_MINUTES="$arg" ;;
+                 esac
+             done
+             ;;
     cursor)    MODE="cursor";     shift; CURSOR_TARGET="${1:-}" ;;
     code)      MODE="code";       shift; CODE_TARGET="${1:-}" ;;
     ssh-config) MODE="ssh-config"; shift; SSH_CONFIG_ACTION="${1:-}" ;;
@@ -2364,6 +2433,117 @@ if [ "$MODE" = "blocked" ]; then
     exit 0
 fi
 
+# --- devbox allow-for [N] [project] [--stop] ---------------------------------
+# Opens, queries, or closes an Allow-for window in one container (ADR 0009).
+# In-container heavy lifting lives in /usr/local/bin/start-allow-for-window,
+# teardown-allow-for-window, and show-allow-for-status; this handler is just
+# argument resolution and the right docker exec.
+
+if [ "$MODE" = "allow-for" ]; then
+    # Resolve target container. Precedence: explicit token → CWD basename →
+    # interactive picker. Token resolution can yield a name whose container
+    # is not running (typo, stopped); fall back to the picker rather than
+    # erroring, mirroring how `cursor` / `code` recover.
+    if [ -n "$ALLOW_FOR_TARGET" ]; then
+        devbox::names_from_token "$ALLOW_FOR_TARGET"
+    else
+        devbox::names_from_path "$(pwd)"
+    fi
+    container="$DEVBOX_CONTAINER_NAME"
+
+    if ! docker ps --filter "name=^${container}$" --format '{{.Names}}' | grep -q .; then
+        if [ -n "$ALLOW_FOR_TARGET" ]; then
+            echo "Container ${container} is not running." >&2
+        fi
+        # Pick from running containers only — the docker exec below would
+        # fail on a stopped one, so offering it is just a confusing dead
+        # end. `pick_container` uses `docker ps -a` (legacy quirk, not in
+        # scope to change), so list running containers inline instead.
+        running=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | filter_user_containers)
+        if [ -z "$running" ]; then
+            echo "No running devbox containers." >&2
+            exit 1
+        fi
+        container=$(printf '%s\n' "$running" | picker::one --prompt "Pick a container for allow-for: ") || exit 1
+    fi
+
+    # Probe sentinel + runtime state in one docker exec. Three outcomes:
+    #
+    #   absent  — no sentinel file. No window ever opened (or already
+    #             cleanly torn down).
+    #   exists  — sentinel present but not genuinely live: either expired
+    #             (daemon never ran or died) or runtime state was wiped by
+    #             `docker restart` while the timestamp is still future-dated.
+    #             Either way the firewall does NOT have the harvest pool
+    #             ACCEPT installed, so any "active" message would mislead.
+    #   active  — future-dated AND ipset+iptables rule both present.
+    #
+    # The probe needs root because `ipset list -n` and `iptables -C` both
+    # require CAP_NET_ADMIN. The sentinel file alone is 0644-readable, but
+    # we'd still need root for the runtime check, so consolidate into one
+    # exec.
+    state=$(docker exec -u root "$container" sh -c '
+        f=/etc/devbox-shared/.allow-for.state
+        if [ ! -f "$f" ]; then
+            echo absent; exit 0
+        fi
+        exp=$(grep -E "^expires_at=" "$f" | head -1 | cut -d= -f2-)
+        if [ -z "$exp" ]; then echo exists; exit 0; fi
+        now=$(date +%s)
+        target=$(date -d "$exp" +%s 2>/dev/null) || { echo exists; exit 0; }
+        if [ "$now" -ge "$target" ]; then echo exists; exit 0; fi
+        if ipset list -n harvest-pool >/dev/null 2>&1 \
+           && iptables -C OUTPUT -m set --match-set harvest-pool dst -j ACCEPT 2>/dev/null; then
+            echo active
+        else
+            echo exists
+        fi
+    ' 2>/dev/null || echo absent)
+
+    sentinel_exists=false
+    sentinel_active=false
+    case "$state" in
+        active) sentinel_exists=true; sentinel_active=true ;;
+        exists) sentinel_exists=true ;;
+    esac
+
+    # --- --stop ------------------------------------------------------------
+    # `--stop` cleans up whenever any sentinel exists, including the
+    # stale/expired case where the daemon failed to run. The teardown
+    # script is idempotent (no-ops on missing pieces) so it's safe to
+    # invoke when only some of the runtime state remains.
+    if [ "$ALLOW_FOR_STOP" = true ]; then
+        if [ "$sentinel_exists" != true ]; then
+            echo "No allow-for window active in ${container}."
+            exit 0
+        fi
+        docker exec -u root "$container" /usr/local/bin/teardown-allow-for-window --now
+        exit $?
+    fi
+
+    # --- status ------------------------------------------------------------
+    # No minutes given AND a *genuinely* live window → show status. The
+    # runtime check inside `sentinel_active` is what prevents this branch
+    # from lying to the user after a `docker restart` cleared the firewall
+    # but the sentinel file (a bind-mount) survived. Falling through to
+    # the start branch in that case is the right recovery —
+    # start-allow-for-window's own runtime_state_intact() will see the
+    # missing pieces and rebuild from scratch.
+    if [ -z "$ALLOW_FOR_MINUTES" ] && [ "$sentinel_active" = true ]; then
+        docker exec -u node "$container" /usr/local/bin/show-allow-for-status
+        exit $?
+    fi
+
+    # --- start / reset-clock ----------------------------------------------
+    # Default duration when none specified. start-allow-for-window
+    # handles the reset-clock case (live sentinel + intact runtime) by
+    # rewriting expires_at; the runtime-gone case (sentinel survived a
+    # container restart) falls through to a fresh rebuild.
+    minutes="${ALLOW_FOR_MINUTES:-15}"
+    docker exec -u root "$container" /usr/local/bin/start-allow-for-window "$minutes" "$container"
+    exit $?
+fi
+
 # --- devbox allow <domain> ----------------------------------------------------
 
 if [ "$MODE" = "allow" ]; then
@@ -2388,6 +2568,7 @@ if [ "$MODE" = "allow" ]; then
         echo "Already allowed: $DOMAIN"
     fi
 
+    warn_if_allow_for_active "$DOMAIN" allow
     reload_firewall_in_containers allow "$DOMAIN"
     exit 0
 fi
@@ -2424,6 +2605,7 @@ if [ "$MODE" = "deny" ]; then
         fi
     fi
 
+    warn_if_allow_for_active "$DENIED" deny
     reload_firewall_in_containers deny "$DENIED"
     exit 0
 fi

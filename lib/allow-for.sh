@@ -19,7 +19,14 @@
 ALLOW_FOR_SENTINEL="/etc/devbox-shared/.allow-for.state"
 ALLOW_FOR_DNSMASQ_CONF="/etc/dnsmasq.d/devbox-allow-for.conf"
 ALLOW_FOR_LOG_DIR="/var/log/devbox/allow-for"
-ALLOW_FOR_DAEMON_LOG="/var/log/devbox/allow-for-daemon.log"
+# Daemon's stdout/stderr go inside the bind-mounted log dir as a dotfile
+# so they're visible from the host alongside harvest logs (useful when
+# diagnosing window-open failures) without colliding with `<container>-
+# <ts>.log` filenames. A `mkdir -p` in start-allow-for-window keeps this
+# path working even if the container was started before Phase 1 host
+# state existed (in that case the dir lives on container rootfs, not on
+# the host — diagnostic-only, gone on restart).
+ALLOW_FOR_DAEMON_LOG="/var/log/devbox/allow-for/.daemon.log"
 ALLOW_FOR_IPSET="harvest-pool"
 ALLOW_FOR_DNSMASQ_QUERIES="/var/log/dnsmasq-queries.log"
 

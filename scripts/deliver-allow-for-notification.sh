@@ -299,10 +299,11 @@ try {
         if ($p) { $bodyXml += "<text>$p</text>" }
     }
 
+    $actionsXml = "<actions><action content='Dismiss' arguments='dismiss' activationType='system'/></actions>"
     if ($launch) {
-        $toastXml = "<toast activationType='protocol' launch='$launch'><visual><binding template='ToastGeneric'><text>$title</text>$bodyXml</binding></visual></toast>"
+        $toastXml = "<toast activationType='protocol' launch='$launch' scenario='reminder'><visual><binding template='ToastGeneric'><text>$title</text>$bodyXml</binding></visual>$actionsXml</toast>"
     } else {
-        $toastXml = "<toast><visual><binding template='ToastGeneric'><text>$title</text>$bodyXml</binding></visual></toast>"
+        $toastXml = "<toast scenario='reminder'><visual><binding template='ToastGeneric'><text>$title</text>$bodyXml</binding></visual>$actionsXml</toast>"
     }
 
     $xmlDoc = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime]::new()

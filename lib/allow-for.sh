@@ -19,6 +19,24 @@
 ALLOW_FOR_SENTINEL="/etc/devbox-shared/.allow-for.state"
 ALLOW_FOR_DNSMASQ_CONF="/etc/dnsmasq.d/devbox-allow-for.conf"
 ALLOW_FOR_LOG_DIR="/var/log/devbox/allow-for"
+# Pending notification files (Phase 3 hand-off to the host deliver script)
+# live in a separate subdirectory that is host-user-owned, so the host-side
+# deliver script can atomically rename-claim them. The parent ALLOW_FOR_LOG_DIR
+# stays root:root 0755 for the tamper-proof harvest-log guarantee (ADR 0009
+# §3-4); only this subdir is host-user-writable. See
+# scripts/ensure-allow-for-host-state.sh for the provisioning step.
+ALLOW_FOR_PENDING_DIR="/var/log/devbox/allow-for/pending"
+# Root-only scratch space for the teardown daemon's atomic publish of
+# pending JSON files. Sibling of pending/ inside the same bind mount —
+# critical because rename(2) requires same-filesystem operands and the
+# pending dir is on a separate mount from the container rootfs. The .tmp/
+# parent (allow-for/) is root:root 0755, so the in-container node user
+# cannot rmdir or replace .tmp/ even though they own pending/; the
+# subdir itself is 0700 root:root, so the attacker can't enumerate or
+# pre-create files inside. Together those properties close the TOCTOU
+# race where an attacker could swap a tempfile for a symlink between
+# mktemp and the daemon's `cat >`.
+ALLOW_FOR_TMP_DIR="/var/log/devbox/allow-for/.tmp"
 # Daemon's stdout/stderr go inside the bind-mounted log dir as a dotfile
 # so they're visible from the host alongside harvest logs (useful when
 # diagnosing window-open failures) without colliding with `<container>-

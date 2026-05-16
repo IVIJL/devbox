@@ -119,8 +119,40 @@ do_teardown() {
     # (or by a one-shot watcher started alongside the window). Writing
     # the file is fire-and-forget — if no delivery runs, the harvest log
     # is still the canonical record.
-    local pending="${ALLOW_FOR_LOG_DIR}/.pending-${container}-${ts_safe}.json"
-    cat > "$pending" <<EOF
+    #
+    # The pending dir is host-user-owned (see ensure-allow-for-host-state.sh)
+    # so the deliver script can rename-claim atomically; the file itself
+    # is still written as root:root 0644, so its CONTENTS can't be forged
+    # mid-flight by the in-container node user. If the pending dir is
+    # missing (pre-Phase-3 install upgraded without `devbox update`), skip
+    # the handoff — the harvest log is canonical and the next update will
+    # provision the dir.
+    if [ -d "$ALLOW_FOR_PENDING_DIR" ] && [ -d "$ALLOW_FOR_TMP_DIR" ]; then
+        local pending="${ALLOW_FOR_PENDING_DIR}/.pending-${container}-${ts_safe}.json"
+        # Atomic publish via root-only scratch dir + cross-subdir rename.
+        #
+        # The pending dir is intentionally host-user-writable (= the
+        # in-container node user, our adversary) so the host deliver
+        # script can rename-claim notifications. That makes ANY file
+        # we create inside it race-able: between mktemp's create and
+        # the next `cat >` reopen, the attacker can unlink the tempfile
+        # and replace it with a symlink to /etc/shadow, then root's
+        # write follows the link.
+        #
+        # Solution: write the tempfile in $ALLOW_FOR_TMP_DIR — same
+        # bind mount (so rename(2) doesn't EXDEV), but root-owned 0700
+        # with a root-owned parent (no rmdir-and-recreate-as-node game).
+        # The attacker cannot see the tempfile names, cannot create
+        # files in there, cannot relocate the dir itself.
+        #
+        # The final `mv` is rename(2): atomic on same-filesystem; if
+        # the destination is a symlink left by the attacker, rename
+        # REPLACES the link rather than following it. Mode and
+        # ownership are preserved, so the host-side deliver script
+        # can still read the published JSON.
+        local pending_tmp
+        if pending_tmp=$(mktemp "${ALLOW_FOR_TMP_DIR}/pending.XXXXXXXXXX"); then
+            cat > "$pending_tmp" <<EOF
 {
   "container": "${container}",
   "log_path": "${log_path}",
@@ -131,7 +163,14 @@ do_teardown() {
   "top_domains": "${top_lines}"
 }
 EOF
-    chmod 0644 "$pending"
+            chmod 0644 "$pending_tmp"
+            # If mv fails (target is a node-owned directory, EXDEV
+            # because someone broke the mount layout, etc.), don't
+            # leave the tmpfile behind to leak. The harvest log is
+            # canonical regardless.
+            mv "$pending_tmp" "$pending" 2>/dev/null || rm -f "$pending_tmp"
+        fi
+    fi
 
     printf 'Allow-for window closed for %s (reason=%s, %d domains captured) — %s\n' \
         "$container" "$reason" "$domain_count" "$log_path"

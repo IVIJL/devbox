@@ -177,6 +177,24 @@ set_tab_title() {
     printf '\033]0;%s\033\\' "$1"
 }
 
+# Portable fire-and-forget background launcher. setsid + nohup gives a
+# bulletproof detach on Linux (new session + SIGHUP ignored); macOS BSD
+# coreutils lacks `setsid`, so degrade to plain `nohup`. Both survive
+# parent shell exit — the new-session isolation that only setsid provides
+# isn't needed for the helper jobs we launch here (they don't read tty
+# and don't fork further job-control trees).
+#
+# Stdin/stdout/stderr are detached so the child can't tail-pipe noise
+# into the user's terminal even if it crashes early.
+detach_bg() {
+    if command -v setsid >/dev/null 2>&1; then
+        setsid nohup "$@" </dev/null >/dev/null 2>&1 &
+    else
+        nohup "$@" </dev/null >/dev/null 2>&1 &
+    fi
+    disown 2>/dev/null || true
+}
+
 # Filter a stream of `docker ps` output (one container per line, optional
 # tab-separated extra fields) down to user-owned devbox containers. Drops
 # DEVBOX_SHARED_CONTAINER_NAMES entries. awk-based so empty result still
@@ -1434,6 +1452,24 @@ attach_ide() {
     "$binary" --folder-uri "$folder_uri"
 }
 
+# --- Allow-for notification sweep (ADR 0009, Phase 3) ------------------------
+# Every `devbox` invocation kicks a background sweep of pending notification
+# files left by the in-container teardown daemon. Fire-and-forget: detached
+# via setsid, output redirected, errors swallowed so it never interferes
+# with the user's actual command. Gated on the pending subdir existing —
+# pre-Phase-3 installs lack the subdir until `devbox update` runs the
+# self-heal; skipping in that window is correct (no pending files can
+# exist yet).
+#
+# Cost when there's nothing to do: one fork + a `find -mmin +N` over an
+# empty directory, single-digit ms. Worth paying for the "user reboots
+# host, then runs any devbox command" case where pending files from a
+# pre-reboot window finally get a chance to render.
+if [ -d /var/log/devbox/allow-for/pending ] \
+    && [ -x "$DEVBOX_DIR/scripts/deliver-allow-for-notification.sh" ]; then
+    detach_bg "$DEVBOX_DIR/scripts/deliver-allow-for-notification.sh" --sweep
+fi
+
 # --- Subcommand parsing ------------------------------------------------------
 
 CLEAN_VOLUMES=false
@@ -2541,7 +2577,34 @@ if [ "$MODE" = "allow-for" ]; then
     # container restart) falls through to a fresh rebuild.
     minutes="${ALLOW_FOR_MINUTES:-15}"
     docker exec -u root "$container" /usr/local/bin/start-allow-for-window "$minutes" "$container"
-    exit $?
+    start_rc=$?
+
+    # Spawn a host-side watcher to catch the pending notification when
+    # the window closes (ADR 0009 Phase 3). The watcher polls until a
+    # pending matching this container arrives, or until expires_at +
+    # grace passes (safety net for dead daemons). On reset-clock we
+    # spawn a second watcher; both poll the same glob and the
+    # rename-claim in deliver_one serialises delivery.
+    #
+    # Only attempt this on a successful start (or reset-clock) — a
+    # failed start means no sentinel exists and reading expires_at
+    # would return empty.
+    if [ "$start_rc" -eq 0 ] \
+        && [ -d /var/log/devbox/allow-for/pending ] \
+        && [ -x "$DEVBOX_DIR/scripts/deliver-allow-for-notification.sh" ]; then
+        # Pull expires_at directly from the sentinel — single source of
+        # truth, handles reset-clock (sentinel was rewritten) and fresh
+        # start identically. Sentinel is 0644 so `-u node` is enough,
+        # avoiding the root exec cost.
+        expires_at=$(docker exec -u node "$container" sh -c '
+            grep -E "^expires_at=" /etc/devbox-shared/.allow-for.state \
+                | head -1 | cut -d= -f2-' 2>/dev/null) || expires_at=""
+        if [ -n "$expires_at" ]; then
+            detach_bg "$DEVBOX_DIR/scripts/deliver-allow-for-notification.sh" \
+                --watch "$container" "$expires_at"
+        fi
+    fi
+    exit "$start_rc"
 fi
 
 # --- devbox allow <domain> ----------------------------------------------------

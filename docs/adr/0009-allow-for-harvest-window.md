@@ -112,6 +112,36 @@ for the chosen "restart = end window" semantics.
 - One-time `sudo` prompt at install for the `/var/log/devbox/allow-for/`
   root-owned directory. Devbox already requires sudo for DNS install, so
   this is consistent rather than novel.
+- The pending-notification hand-off (Phase 3) requires a host-user-owned
+  subdirectory `/var/log/devbox/allow-for/pending/` so the host-side
+  deliver script can rename-claim files atomically. The parent log dir
+  stays `root:root 0755` (harvest logs unchanged). Inside the container
+  the host UID maps to the `node` user, so the in-container adversary
+  shares write access to that subdir and can forge or replace pending
+  files. Two complementary defences close every vector this opens:
+  - **Symlink-clobber resistance on the writer side.** The in-container
+    teardown daemon never writes directly into the user-writable
+    `pending/`. It `mktemp`s in a sibling `.tmp/` subdir (mode 0700
+    root:root, under the root-owned `allow-for/` parent so the node
+    user can neither enumerate it nor relocate it), writes the JSON,
+    and atomic-renames into `pending/`. `rename(2)` replaces a
+    symlink at the destination instead of following it, so a
+    pre-planted `.pending-… → /etc/shadow` symlink is harmlessly
+    overwritten. The TOCTOU race a user-writable tempdir would allow
+    is eliminated by writing in the root-only dir.
+  - **Filesystem-trust validation on the reader side.** The host
+    deliver script treats pending JSON contents as untrusted: it
+    derives the harvest log path by reconstructing it from the pending
+    filename (which must match the writer's strict
+    `<container>-<ts_safe>` shape) and verifies the corresponding log
+    file exists in the root-owned parent dir. A forged pending
+    pointing at `/etc/passwd` or `evil.bat` cannot reach the toast's
+    `launch="file://..."` URI because the reconstructed path is fixed
+    and the existence check fails for any log the in-container root
+    daemon did not actually write. The attacker-controllable display
+    fields (`reason`, `domain_count`, `top_domains`) are bounded and
+    only affect the toast's text body — at worst a misleading
+    message, no RCE.
 - `init-firewall.sh` gains a new responsibility (sentinel closeout) and a
   small amount of state-aware code. The "fresh-deny from scratch" model
   weakens slightly.

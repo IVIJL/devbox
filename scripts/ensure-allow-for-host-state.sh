@@ -2,14 +2,29 @@
 set -euo pipefail
 # Idempotent host-side state for `devbox allow-for` (ADR 0009).
 #
-# Provisions two pieces of state that live outside Docker and therefore
+# Provisions four pieces of state that live outside Docker and therefore
 # survive container teardown:
 #   1. /var/log/devbox/allow-for/ as root:root 0755 — the harvest log
 #      directory. Mounted read-write into every container so the in-container
 #      root daemon can write reports; the node user (host UID 1000) can read
 #      but cannot delete or overwrite, which is the tamper-proof guarantee
 #      ADR 0009 §3-4 hangs the security argument on.
-#   2. (WSL2 only) HKCU\Software\Classes\AppUserModelId\Devbox.AllowFor —
+#   2. /var/log/devbox/allow-for/pending/ as <host-uid>:<host-gid> 0755 —
+#      the pending notification subdir (ADR 0009 Phase 3). Files inside
+#      are still written by container root as root:root 0644, but the
+#      directory's write bit is delegated so the host-side deliver script
+#      can `mv pending pending.lock` for atomic claim semantics. Tamper-
+#      proof guarantee on log FILES is unchanged (root-owned 0644 — no
+#      content tampering); only the pending-signal subdirectory becomes
+#      host-user-writable.
+#   3. /var/log/devbox/allow-for/.tmp/ as root:root 0700 — scratch dir
+#      for the teardown daemon's atomic pending publish (mktemp here,
+#      atomic-rename into pending/). Must live inside the same bind
+#      mount as pending/ so rename(2) doesn't return EXDEV, but the
+#      mode 0700 + root parent denies the in-container node user any
+#      visibility — closing the TOCTOU race a user-writable tempdir
+#      would otherwise allow.
+#   4. (WSL2 only) HKCU\Software\Classes\AppUserModelId\Devbox.AllowFor —
 #      the toast notification AppId so the inline-COM PowerShell toast at
 #      window close can launch File Explorer at the harvest log via WSL
 #      UNC path. Missing AppId would degrade to a generic toast without
@@ -26,6 +41,19 @@ set -euo pipefail
 # since that breaks the feature; HKCU failure is informational.
 
 ALLOW_FOR_LOG_DIR="/var/log/devbox/allow-for"
+# Pending notification subdir (ADR 0009 Phase 3). Host-user-owned so the
+# host-side deliver script can rename-claim files; the parent stays
+# root:root 0755 for the tamper-proof harvest-log guarantee. Capture
+# UID/GID before any sudo invocation so `install -o`/`-g` get the real
+# user's numbers, not 0:0.
+ALLOW_FOR_PENDING_DIR="$ALLOW_FOR_LOG_DIR/pending"
+# Root-only scratch dir for the teardown daemon's atomic pending publish
+# (sibling of pending/, but in the root-owned parent so the in-container
+# node user can't relocate or peek into it). See lib/allow-for.sh for
+# the full threat-model reasoning.
+ALLOW_FOR_TMP_DIR="$ALLOW_FOR_LOG_DIR/.tmp"
+HOST_UID=$(id -u)
+HOST_GID=$(id -g)
 WSL_APP_ID="Devbox.AllowFor"
 
 # --- Argument parsing --------------------------------------------------------
@@ -42,11 +70,13 @@ for arg in "$@"; do
 Usage: ensure-allow-for-host-state.sh [--quiet-if-noop]
 
 Idempotently provision the host-side state `devbox allow-for` needs:
-  - /var/log/devbox/allow-for/ owned root:root 0755
+  - /var/log/devbox/allow-for/         owned root:root 0755
+  - /var/log/devbox/allow-for/pending/ owned <host-uid>:<host-gid> 0755
+  - /var/log/devbox/allow-for/.tmp/    owned root:root 0700
   - (WSL2 only) HKCU\...\AppUserModelId\Devbox.AllowFor toast AppId
 
 Options:
-  --quiet-if-noop   Stay silent when both pieces of state are already in
+  --quiet-if-noop   Stay silent when every piece of state is already in
                     the desired shape. Created / repaired / failed steps
                     still print. Intended for the `devbox update` self-heal.
 USAGE
@@ -114,6 +144,58 @@ ensure_log_dir() {
     _ok "$ALLOW_FOR_LOG_DIR ready."
 }
 
+# --- Step 1b: pending notification subdir ------------------------------------
+# Sibling of the harvest log dir, but owned by the host user so the deliver
+# script's atomic rename-claim (`mv pending pending.lock`) can succeed —
+# rename(2) needs write on the parent directory, which a normal user lacks
+# on the root-owned ALLOW_FOR_LOG_DIR. Files INSIDE this dir are still
+# written as root:root by the in-container teardown daemon; only the
+# directory's write bit is delegated.
+ensure_pending_dir() {
+    local want="${HOST_UID}:${HOST_GID}:755"
+    if [ -d "$ALLOW_FOR_PENDING_DIR" ]; then
+        local stat_out
+        stat_out="$(_stat_owner_mode "$ALLOW_FOR_PENDING_DIR" || true)"
+        if [ "$stat_out" = "$want" ]; then
+            _noop_msg "$ALLOW_FOR_PENDING_DIR already ${HOST_UID}:${HOST_GID} 0755 — skipping."
+            return 0
+        fi
+    fi
+
+    _info "Creating $ALLOW_FOR_PENDING_DIR (${HOST_UID}:${HOST_GID} 0755) — sudo may prompt."
+    if ! sudo install -d -o "$HOST_UID" -g "$HOST_GID" -m 0755 "$ALLOW_FOR_PENDING_DIR"; then
+        _warn "Failed to create $ALLOW_FOR_PENDING_DIR — 'devbox allow-for' notifications will not deliver until this is fixed."
+        return 1
+    fi
+    _ok "$ALLOW_FOR_PENDING_DIR ready."
+}
+
+# --- Step 1c: root-only tmp subdir for atomic pending publish ---------------
+# Used by the in-container teardown daemon (root) to mktemp + write pending
+# JSON, then atomic-rename into the user-writable pending dir. Sibling of
+# pending/ on the same filesystem (same bind mount) so rename(2) works
+# without EXDEV. Mode 0700 root:root denies the in-container node user
+# both write (no symlink planting) and read (no enumeration of in-flight
+# tempfile names).
+ensure_tmp_dir() {
+    local want="0:0:700"
+    if [ -d "$ALLOW_FOR_TMP_DIR" ]; then
+        local stat_out
+        stat_out="$(_stat_owner_mode "$ALLOW_FOR_TMP_DIR" || true)"
+        if [ "$stat_out" = "$want" ]; then
+            _noop_msg "$ALLOW_FOR_TMP_DIR already root:root 0700 — skipping."
+            return 0
+        fi
+    fi
+
+    _info "Creating $ALLOW_FOR_TMP_DIR (root:root 0700) — sudo may prompt."
+    if ! sudo install -d -o 0 -g 0 -m 0700 "$ALLOW_FOR_TMP_DIR"; then
+        _warn "Failed to create $ALLOW_FOR_TMP_DIR — 'devbox allow-for' notifications will not deliver until this is fixed (TOCTOU-safe publish requires this dir)."
+        return 1
+    fi
+    _ok "$ALLOW_FOR_TMP_DIR ready."
+}
+
 # --- Step 2: WSL2 HKCU toast AppId ------------------------------------------
 # HKCU writes never elevate, so this is a plain powershell.exe call (no
 # Start-Process -Verb RunAs). The script is doubly idempotent: outer
@@ -150,4 +232,6 @@ ensure_wsl_app_id() {
 }
 
 ensure_log_dir
+ensure_pending_dir
+ensure_tmp_dir
 ensure_wsl_app_id

@@ -313,6 +313,11 @@ try {
     $notifier.Show($toast)
     exit 0
 } catch {
+    # Surface typed exception details on stderr so failures are
+    # diagnosable. Our caller redirects to /dev/null in steady state,
+    # but a `bash -x` or a temporary patch will see this line.
+    [Console]::Error.WriteLine("ERROR: $($_.Exception.Message)")
+    [Console]::Error.WriteLine("TYPE:  $($_.Exception.GetType().FullName)")
     exit 1
 }
 PS_INNER
@@ -321,6 +326,12 @@ PS_INNER
     local encoded
     encoded=$(printf '%s' "$inner" | iconv -t UTF-16LE 2>/dev/null | base64 -w0 2>/dev/null) || return 1
 
+    # `WSLENV` is required to forward env vars across the WSL/Windows
+    # boundary — without it, PowerShell sees `$env:DEVBOX_TOAST_*` as
+    # empty strings, `CreateToastNotifier("")` throws, and our catch
+    # block silently exits 1. The colon-separated list names every
+    # variable that must cross.
+    WSLENV="DEVBOX_TOAST_APPID:DEVBOX_TOAST_TITLE:DEVBOX_TOAST_BODY:DEVBOX_TOAST_LAUNCH" \
     DEVBOX_TOAST_APPID="$WSL_APP_ID" \
     DEVBOX_TOAST_TITLE="$T_TITLE" \
     DEVBOX_TOAST_BODY="$T_BODY" \

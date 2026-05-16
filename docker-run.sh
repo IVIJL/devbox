@@ -1200,9 +1200,30 @@ upsert_connection_record() {
     mv "$tmp" "$config_file"
 }
 
-# Gracefully stop a devbox container — stop inner DinD containers first
+# Gracefully stop a devbox container — close allow-for window first, then
+# inner DinD containers, then the container itself.
 graceful_stop_container() {
     local name="$1"
+
+    # Close any live allow-for window BEFORE docker stop. Three reasons this
+    # has to run here and not in the restart closeout:
+    #   1. MODE=stop calls `docker rm` right after this — the container fs
+    #      (including /etc/devbox-shared/.allow-for.state and the dnsmasq
+    #      queries log) is about to be destroyed. After `docker rm` there's
+    #      nothing for closeout-allow-for-on-restart to harvest.
+    #   2. The teardown daemon dies on SIGKILL from `docker stop` without
+    #      running its own teardown — no trap handler, just a sleep loop.
+    #   3. Running teardown while the container is still alive gives the
+    #      harvest full access to the dnsmasq queries log, so the captured
+    #      domain list is complete instead of "no data available".
+    # Best-effort: a failed teardown must not block container shutdown.
+    # `docker exec` on a stopped container fails harmlessly via `|| true`,
+    # which handles the rare race where the container exits between our
+    # `test -f` and the teardown invocation.
+    if docker exec -u root "$name" test -f /etc/devbox-shared/.allow-for.state 2>/dev/null; then
+        docker exec -u root "$name" /usr/local/bin/teardown-allow-for-window --now 2>/dev/null || true
+    fi
+
     docker exec -u node "$name" bash -c '
         if [ -S "$XDG_RUNTIME_DIR/docker.sock" ] && docker info >/dev/null 2>&1; then
             inner=$(docker ps --format "{{.ID}} {{.Names}}" 2>/dev/null)

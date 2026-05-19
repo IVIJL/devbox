@@ -123,6 +123,26 @@ bootstrap_codex_cli() {
     fi
 }
 
+# Same problem as bootstrap_codex_cli: upgraded devboxes have a pre-existing
+# devbox-npm-global volume that masks the image-layer `npm install -g
+# agent-browser@${AGENT_BROWSER_VERSION}`, so the CLI is invisible after the
+# rebuild. Bootstrap with the image-pinned version (Dockerfile sets ENV
+# AGENT_BROWSER_VERSION) so image-layer and bootstrap stay in lockstep.
+bootstrap_agent_browser_cli() {
+    [ ! -x /usr/local/share/npm-global/bin/agent-browser ] || return 0
+    local version="${AGENT_BROWSER_VERSION:-}"
+    if [ -z "$version" ]; then
+        WARNINGS+=("agent-browser CLI not installed and AGENT_BROWSER_VERSION unset — rebuild the image")
+        return 0
+    fi
+    echo "Bootstrapping agent-browser CLI ($version) into npm-global volume..."
+    if npm install -g "agent-browser@${version}"; then
+        echo "agent-browser CLI installed"
+    else
+        WARNINGS+=("agent-browser CLI install failed — run 'npm install -g agent-browser@${version}' manually")
+    fi
+}
+
 # Every-start. ~/.local/bin/claude lives in the image layer and docker run
 # resets it; re-link to the highest version in the RO bind-mounted host dir.
 repair_claude_bin() {
@@ -158,6 +178,7 @@ main() {
     show_migration_notice
     ensure_npm_global_path     # must precede bootstrap_codex (shared parent dir)
     bootstrap_codex_cli
+    bootstrap_agent_browser_cli
     repair_claude_bin
     print_summary
 }

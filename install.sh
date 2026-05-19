@@ -426,6 +426,40 @@ setup_allow_for_state() {
     fi
 }
 
+# --- Agent-browser OS user (ADR 0010) ----------------------------------------
+# Provisions the `devbox-agent` host OS user that Host agent Chrome runs
+# under. The OS-identity separation is the primary defence the agent-browser
+# feature buys (see ADR 0010 § Actor 1) — without it, Chrome with
+# --user-data-dir alone could still file:// the developer's home or write
+# autostart payloads as the real user. Idempotent: a second run is a no-op
+# when the user already exists. Sudo prompts only on first install
+# (Linux/WSL2: useradd; macOS: sysadminctl).
+
+setup_agent_user() {
+    info "Configuring devbox-agent OS user (agent-browser feature)..."
+
+    local lib="$DEVBOX_DIR/lib/host-platform.sh"
+    if [ ! -r "$lib" ]; then
+        warn "lib/host-platform.sh missing; skipping devbox-agent user creation."
+        SKIPPED+=("devbox-agent user (host-platform.sh missing)")
+        return
+    fi
+
+    # Subshell so the sourced functions don't leak into the rest of install.sh.
+    if id devbox-agent >/dev/null 2>&1; then
+        SKIPPED+=("devbox-agent user (already exists)")
+        return
+    fi
+
+    # shellcheck source=lib/host-platform.sh disable=SC1091
+    if ( . "$lib" && host_platform::ensure_agent_user ); then
+        CONFIGURED+=("devbox-agent user (created)")
+    else
+        warn "Failed to create devbox-agent user — devbox agent-browser commands will not work until this is fixed."
+        SKIPPED+=("devbox-agent user (creation failed; see warnings above)")
+    fi
+}
+
 # --- SSH agent configuration -------------------------------------------------
 
 configure_ssh_agent() {
@@ -772,9 +806,10 @@ main() {
         msg "  3. Clone devbox to $DEVBOX_DIR"
         msg "  4. Install mkcert v$MKCERT_VERSION (HTTPS dev certs; CA install deferred to dns-install)"
         msg "  5. Set up /var/log/devbox/allow-for (root-owned harvest log dir; sudo prompt)"
-        msg "  6. Install 'devbox' command to $SYMLINK_PATH"
-        msg "  7. Optionally generate Claude Code token for containers"
-        msg "  8. Check Docker availability"
+        msg "  6. Create devbox-agent OS user (agent-browser feature; sudo prompt)"
+        msg "  7. Install 'devbox' command to $SYMLINK_PATH"
+        msg "  8. Optionally generate Claude Code token for containers"
+        msg "  9. Check Docker availability"
         echo ""
         if ! confirm "Continue?"; then
             msg "Aborted."
@@ -799,6 +834,9 @@ main() {
 
     echo ""
     setup_allow_for_state
+
+    echo ""
+    setup_agent_user
 
     echo ""
     install_command

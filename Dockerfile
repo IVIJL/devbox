@@ -289,6 +289,16 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 # bootstraps Codex at runtime when missing.
 RUN npm install -g @openai/codex
 
+# agent-browser CLI (vercel-labs/agent-browser) — Rust-native browser
+# automation CLI for AI agents. ADR 0010 wires this binary up against a
+# host-side Chrome via CDP through an in-container socat bridge; only the
+# CLI lives inside the container. Pinned via ARG so version bumps are
+# explicit and reviewable; do NOT use `latest` per the no-runtime-installs
+# rule (would silently drift across rebuilds).
+ARG AGENT_BROWSER_VERSION=0.27.0
+ENV AGENT_BROWSER_VERSION=${AGENT_BROWSER_VERSION}
+RUN npm install -g "agent-browser@${AGENT_BROWSER_VERSION}"
+
 # =============================================================================
 # Layer 6: Firewall + scripts (root)
 # =============================================================================

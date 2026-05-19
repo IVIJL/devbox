@@ -51,9 +51,14 @@ Usage:
   devbox allow-for --stop [name]   Close the active window immediately
   devbox agent-browser <cmd> [name]
                                    Manage the Agent-browser session for a
-                                   container. <cmd> is start | stop | status.
-                                   Launches Host agent Chrome on the host and
-                                   the in-container CDP bridge. See ADR 0010.
+                                   container. <cmd> is start | stop | status
+                                   | allow-for. Launches Host agent Chrome on
+                                   the host and the in-container CDP bridge.
+                                   See ADR 0010.
+  devbox agent-browser allow-for <N> [name]
+                                   Open a network window for N minutes (proxy
+                                   in harvest mode + JSONL log). Pass --stop
+                                   to close immediately.
   devbox cursor [name]             Open Cursor attached to running devbox
   devbox code [name]               Open VS Code attached to running devbox
   devbox clip                      Grab clipboard image for container use
@@ -1547,7 +1552,47 @@ case "${1:-}" in
     agent-browser) MODE="agent-browser"; shift
              AGENT_BROWSER_SUB="${1:-}"
              [ -n "$AGENT_BROWSER_SUB" ] && shift
-             AGENT_BROWSER_TARGET="${1:-}"
+             # `allow-for` carries an extra positional: either <minutes>
+             # or `--stop`, with an optional trailing project token. All
+             # other subcommands take just an optional project token in
+             # AGENT_BROWSER_TARGET. The broker performs final argument
+             # validation; this layer only collects the tokens.
+             AGENT_BROWSER_MINUTES=""
+             AGENT_BROWSER_STOP=false
+             AGENT_BROWSER_TARGET=""
+             if [ "$AGENT_BROWSER_SUB" = "allow-for" ]; then
+                 # Position-disambiguated parse so a project name that
+                 # happens to be all digits (`devbox-123`) is not
+                 # mistaken for a minutes argument. --stop is a flag;
+                 # other positionals fill the minutes slot first (only
+                 # when numeric, to keep the `allow-for 30 myapp` shape)
+                 # and then fall through to the project-name slot.
+                 ab_first_positional=true
+                 for arg in "$@"; do
+                     case "$arg" in
+                         --stop)
+                             AGENT_BROWSER_STOP=true
+                             ;;
+                         '')
+                             ;;
+                         *)
+                             if [ "$ab_first_positional" = true ] \
+                                 && [ -z "$AGENT_BROWSER_MINUTES" ] \
+                                 && [ "$AGENT_BROWSER_STOP" != true ] \
+                                 && case "$arg" in *[!0-9]*) false ;; *) true ;; esac
+                             then
+                                 AGENT_BROWSER_MINUTES="$arg"
+                             else
+                                 AGENT_BROWSER_TARGET="$arg"
+                             fi
+                             ab_first_positional=false
+                             ;;
+                     esac
+                 done
+                 unset ab_first_positional
+             else
+                 AGENT_BROWSER_TARGET="${1:-}"
+             fi
              ;;
     cursor)    MODE="cursor";     shift; CURSOR_TARGET="${1:-}" ;;
     code)      MODE="code";       shift; CODE_TARGET="${1:-}" ;;
@@ -2654,14 +2699,14 @@ fi
 
 if [ "$MODE" = "agent-browser" ]; then
     if [ -z "$AGENT_BROWSER_SUB" ]; then
-        echo "Usage: devbox agent-browser <start|stop|status> [name]" >&2
+        echo "Usage: devbox agent-browser <start|stop|status|allow-for> [args]" >&2
         exit 2
     fi
     case "$AGENT_BROWSER_SUB" in
-        start|stop|status|-h|--help|help) ;;
+        start|stop|status|allow-for|-h|--help|help) ;;
         *)
             echo "Unknown agent-browser subcommand: $AGENT_BROWSER_SUB" >&2
-            echo "Usage: devbox agent-browser <start|stop|status> [name]" >&2
+            echo "Usage: devbox agent-browser <start|stop|status|allow-for> [args]" >&2
             exit 2
             ;;
     esac
@@ -2696,6 +2741,21 @@ if [ "$MODE" = "agent-browser" ]; then
             exit 1
         fi
         container=$(printf '%s\n' "$running" | picker::one --prompt "Pick a container for agent-browser: ") || exit 1
+    fi
+
+    # `allow-for` carries an extra positional (minutes or --stop) ahead
+    # of the resolved container. The broker accepts both shapes; we
+    # forward the captured token in the order it expects.
+    if [ "$AGENT_BROWSER_SUB" = "allow-for" ]; then
+        if [ "$AGENT_BROWSER_STOP" = true ]; then
+            exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" "$AGENT_BROWSER_SUB" --stop "$container"
+        fi
+        if [ -z "$AGENT_BROWSER_MINUTES" ]; then
+            echo "Usage: devbox agent-browser allow-for <minutes> [name]" >&2
+            echo "       devbox agent-browser allow-for --stop [name]" >&2
+            exit 2
+        fi
+        exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" "$AGENT_BROWSER_SUB" "$AGENT_BROWSER_MINUTES" "$container"
     fi
 
     exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" "$AGENT_BROWSER_SUB" "$container"

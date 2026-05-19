@@ -7,10 +7,21 @@ owned log file. Mode is read from a mode-file at startup and re-read on
 SIGHUP; allowlist is also re-read on SIGHUP so the user can edit
 agent-browser-allowed-domains.conf without restarting Chrome.
 
-Only `default` mode ships in slice 04. The mode file may carry `harvest`
-(written by slice 05's `allow-for`); for now we treat any non-default
-value identically to `default` — the proxy log will continue to record
-the mode field so slice 05 can flip enforcement by changing one branch.
+Mode-file schema. Two accepted forms; both survived for backward
+compatibility with the slice-04 layout:
+
+  * Plain text (legacy): the literal word `default` or `harvest` on its
+    own line. No expiry — `harvest` from a plain-text file is treated as
+    open-ended (the broker's host-side timer is the only guard).
+  * JSON: `{"mode": "default"|"harvest", "expires_at": "<ISO-8601-UTC>"
+    | null}`. The proxy enforces the expiry itself: when `mode` is
+    `harvest` and `expires_at` is in the past, requests are decided as if
+    the file said `default` — no SIGHUP required for correctness.
+
+The broker's host-side timer still sends SIGHUP at expiry for prompt
+log-record accuracy (the `mode` field in records logged after expiry
+should not falsely read `harvest`), but expiry of the window is enforced
+by the proxy regardless of timer liveness.
 
 The bypass list (`*.test`, `*.127.0.0.1.sslip.io`, `127.0.0.1`,
 `localhost`) is applied on the Chrome side via `--proxy-bypass-list`,
@@ -50,14 +61,39 @@ class ProxyState:
         self._lock = threading.Lock()
         self._patterns: list[str] = []
         self._mode: str = "default"
+        self._expires_at: _dt.datetime | None = None
         self.reload()
 
     def reload(self) -> None:
         patterns = _read_allowlist(self.allowlist_path)
-        mode = _read_mode(self.mode_path)
+        mode, expires_at = _read_mode(self.mode_path)
         with self._lock:
             self._patterns = patterns
             self._mode = mode
+            self._expires_at = expires_at
+
+    def effective_mode(self) -> str:
+        """Mode as seen by request decisions: harvest is only honoured
+        when the mode file carries a future expires_at. Two reasons:
+
+        * Slice 04 invariant — legacy plain-text `harvest` (no JSON
+          envelope, therefore no expiry) was treated like default.
+          Carrying that invariant forward means a stale mode file or a
+          poorly-formed harvest write cannot fail open.
+        * The feature is explicitly time-bounded — a missing expiry is
+          a malformed harvest write, not a request to allow everything
+          indefinitely.
+        """
+        with self._lock:
+            mode = self._mode
+            expires_at = self._expires_at
+        if mode != "harvest":
+            return mode
+        if expires_at is None:
+            return "default"
+        if _dt.datetime.now(_dt.timezone.utc) >= expires_at:
+            return "default"
+        return mode
 
     @property
     def mode(self) -> str:
@@ -107,19 +143,76 @@ def _read_allowlist(path: str) -> list[str]:
     return patterns
 
 
-def _read_mode(path: str) -> str:
+def _parse_iso_utc(value: str) -> _dt.datetime | None:
+    # Accept the canonical `...Z` suffix (what the broker writes) and the
+    # equivalent `+00:00` form (what `datetime.isoformat()` emits on
+    # tz-aware datetimes). Anything else is treated as a parse failure
+    # and surfaced as a warning by the caller.
+    raw = value.strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = _dt.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return parsed.astimezone(_dt.timezone.utc)
+
+
+def _read_mode(path: str) -> tuple[str, _dt.datetime | None]:
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            value = fh.read().strip().lower()
+            raw = fh.read()
     except FileNotFoundError:
-        return "default"
+        return "default", None
     except OSError as exc:
         logging.warning("mode-file read failed (%s); defaulting to 'default'", exc)
-        return "default"
+        return "default", None
+
+    stripped = raw.strip()
+    if not stripped:
+        return "default", None
+
+    if stripped.startswith("{"):
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            logging.warning("mode-file: invalid JSON (%s); defaulting to 'default'", exc)
+            return "default", None
+        if not isinstance(payload, dict):
+            logging.warning("mode-file: JSON root is not an object; defaulting to 'default'")
+            return "default", None
+        mode_raw = payload.get("mode")
+        if not isinstance(mode_raw, str):
+            logging.warning("mode-file: missing/invalid 'mode' field; defaulting to 'default'")
+            return "default", None
+        mode = mode_raw.strip().lower()
+        if mode not in ("default", "harvest"):
+            logging.warning("mode-file: unknown mode %r; treating as 'default'", mode)
+            return "default", None
+        expires_raw = payload.get("expires_at")
+        if expires_raw is None:
+            return mode, None
+        if not isinstance(expires_raw, str):
+            logging.warning("mode-file: invalid 'expires_at' field; ignoring expiry")
+            return mode, None
+        expires_at = _parse_iso_utc(expires_raw)
+        if expires_at is None:
+            logging.warning("mode-file: unparseable 'expires_at' %r; ignoring expiry", expires_raw)
+            return mode, None
+        return mode, expires_at
+
+    # Legacy plain-text form — `default` or `harvest` on its own line,
+    # no expiry. Broker still writes this during initial session start
+    # (slice 04 invariant), so we keep parsing it.
+    value = stripped.lower()
     if value not in ("default", "harvest"):
         logging.warning("mode-file: unknown value %r; treating as 'default'", value)
-        return "default"
-    return value
+        return "default", None
+    return value, None
 
 
 class _JsonlLog:
@@ -196,26 +289,34 @@ class _Handler(BaseHTTPRequestHandler):
     def _jsonl(self) -> _JsonlLog:
         return self.server.proxy_log  # type: ignore[attr-defined]
 
-    def _decision(self, host: str) -> tuple[bool, str | None]:
-        mode = self._state.mode
-        if mode == "default":
-            if self._state.is_allowed(host):
-                return True, None
-            return False, "no allowlist match"
-        # `harvest` is slice 05's territory. For slice 04 we treat it
-        # exactly like default so the only-default-ships invariant holds;
-        # slice 05 will replace this branch with allow-all + logging.
+    def _decision(self, host: str) -> tuple[bool, str | None, str]:
+        # Effective mode auto-degrades harvest → default once the window
+        # expires, even if the broker's timer hasn't fired the SIGHUP
+        # yet. Decisions and the logged `mode` field both use this view
+        # so the JSONL never misrepresents a post-expiry request as
+        # harvest.
+        mode = self._state.effective_mode()
+        if mode == "harvest":
+            return True, None, mode
         if self._state.is_allowed(host):
-            return True, None
-        return False, "no allowlist match"
+            return True, None, mode
+        return False, "no allowlist match", mode
 
-    def _log(self, method: str, host: str, port: int, decision: str, reason: str | None) -> None:
+    def _log(
+        self,
+        method: str,
+        host: str,
+        port: int,
+        decision: str,
+        reason: str | None,
+        mode: str,
+    ) -> None:
         record = {
             "ts": _iso_utc_now(),
             "method": method,
             "host": host,
             "port": port,
-            "mode": self._state.mode,
+            "mode": mode,
             "decision": decision,
         }
         if reason is not None:
@@ -247,8 +348,8 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError:
             self.send_error(400, "Bad CONNECT target")
             return
-        allowed, reason = self._decision(host)
-        self._log("CONNECT", host, port, "allow" if allowed else "deny", reason)
+        allowed, reason, mode = self._decision(host)
+        self._log("CONNECT", host, port, "allow" if allowed else "deny", reason, mode)
         if not allowed:
             self._send_403(host)
             return
@@ -268,8 +369,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _do_forward(self) -> None:
         host, port, path = _strip_url_host(self.path)
         method = self.command
-        allowed, reason = self._decision(host)
-        self._log(method, host, port, "allow" if allowed else "deny", reason)
+        allowed, reason, mode = self._decision(host)
+        self._log(method, host, port, "allow" if allowed else "deny", reason, mode)
         if not allowed:
             self._send_403(host)
             return

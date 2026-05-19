@@ -105,6 +105,7 @@ Run `devbox --help` for the full list. Summary:
 | `devbox deny [domain]` | Remove allowed domain (interactive if no arg) |
 | `devbox blocked` | Show blocked DNS queries, allow interactively via fzf |
 | `devbox allow-for [N] [name]` | Open an N-minute window that records (not blocks) non-allowlist DNS; `--stop` closes early |
+| `devbox agent-browser <start\|stop\|status\|allow-for> [args]` | Drive a hardened host Chrome from inside the container; `allow-for` opens an N-minute proxy harvest window |
 | `devbox cursor [name]` | Open Cursor attached to running devbox |
 | `devbox code [name]` | Open VS Code attached to running devbox |
 | `devbox clip` | Grab clipboard image for container use |
@@ -182,6 +183,85 @@ devbox allow-for --stop myapp    # Close the active window in 'myapp'
 ```
 
 Harvest logs persist at `/var/log/devbox/allow-for/<container>-<timestamp>.log` on the host (root-owned, tamper-proof from inside the container). See [ADR 0009](docs/adr/0009-allow-for-harvest-window.md) for the security model.
+
+## Agent-browser
+
+`devbox agent-browser` gives an LLM agent inside the container a real Chrome on the host to drive — screenshots of the project's dev URL, JS console output, network-tab inspection, click-through flows. The **Host agent Chrome** runs under a dedicated `devbox-agent` OS user with hardened launch flags; the container reaches its CDP endpoint through an **Agent-browser session bridge** (a per-session socat process inside the container's network namespace). All of Chrome's outbound HTTP/HTTPS is forced through the **Agent-browser proxy** that mirrors the firewall's default-deny posture at the browser layer. See [ADR 0010](docs/adr/0010-agent-browser-host-broker-and-proxy.md) for the full security model and the **Agent-browser** section of [CONTEXT.md](CONTEXT.md) for the terminology.
+
+### Quick start
+
+A full session from launch to teardown, including a short network window for one external request:
+
+```bash
+# Host: launch Host agent Chrome + per-session bridge into the 'my-app' container
+devbox agent-browser start my-app
+
+# Container: drive Chrome via the agent-browser CLI (dev URLs go through the
+# Chrome bypass list — no network window needed)
+agent-browser navigate http://3000.my-app.test
+agent-browser screenshot --output /tmp/dash.png
+
+# Host: open a 5-minute Agent-browser network window (proxy flips to harvest
+# mode) so Chrome can reach a host that isn't a dev URL and isn't in the
+# Agent-browser allowlist
+devbox agent-browser allow-for 5 my-app
+
+# Container: that external navigation can now succeed
+agent-browser navigate https://developers.facebook.com/tools/debug/
+
+# Host: close the window early (or let the timer expire) and tear down the session
+devbox agent-browser allow-for --stop my-app
+devbox agent-browser stop my-app
+
+# Host: any time during the session, inspect status
+devbox agent-browser status my-app       # active session + remaining network-window time
+```
+
+### Two time gates
+
+`agent-browser` has two independent time gates. The **Agent-browser session** is the Chrome+bridge lifecycle and can run for hours (the Chrome window on your desktop is the visual audit surface). The **Agent-browser network window** is a short sub-state that flips the proxy from default-deny into harvest mode, paralleling the firewall `allow-for` on the browser layer.
+
+| Layer | Window | Started by | Closed by | Default |
+|---|---|---|---|---|
+| Firewall (DNS + iptables) | Allow-for window | `devbox allow-for N` | `--stop`, timer, container stop | closed |
+| Agent-browser (HTTP proxy) | Agent-browser session | `devbox agent-browser start` | `... stop`, idle timeout, container stop | absent |
+| Agent-browser (HTTP proxy) | Agent-browser network window | `devbox agent-browser allow-for N` | `... allow-for --stop`, timer, session stop | closed |
+
+Dev URLs (`localhost`, `*.test`, `*.127.0.0.1.sslip.io`) are set as Chrome's `--proxy-bypass-list` and go direct without touching the proxy — opening a network window is only needed for genuinely external hosts.
+
+```bash
+devbox agent-browser allow-for 15 my-app   # 15-minute window in 'my-app'
+devbox agent-browser allow-for --stop my-app   # close the window early
+```
+
+### Default-deny and growing the allowlist
+
+The Agent-browser proxy reads its allowlist from `~/.config/devbox/agent-browser-allowed-domains.conf` (distinct from the firewall allowlist). Format: one domain pattern per line, `#` for comments, `*` glob for subdomains.
+
+```bash
+# devbox agent-browser default-mode allowlist
+*.github.com
+api.openai.com
+registry.npmjs.org
+```
+
+The installer drops a documented `agent-browser-allowed-domains.conf.example` next to it on first run. Edits take effect on the next `devbox agent-browser start`; mid-session reloads happen automatically when you run `devbox agent-browser allow-for ...` (the broker re-stages the snapshot and SIGHUPs the proxy). Hosts that show up in a window's harvest log are good candidates for promotion to the durable list.
+
+### Artefacts
+
+Each session leaves three files on the host, owned by `devbox-agent:devbox-agent` mode `0640` — your user reads them via group membership; nothing inside the container can write to them.
+
+```
+/var/log/devbox/agent-browser/<container>-<ISO>.netlog.json    # Chrome's native netlog
+/var/log/devbox/agent-browser/<container>-<ISO>.proxy.log      # JSONL of every proxy decision
+/var/log/devbox/agent-browser/<container>-<ISO>.summary.md     # human-readable digest
+```
+
+`summary.md` lists visited hosts, out-of-allowlist hits during harvest, denied requests, and any hard fails (`file://`, `chrome://`, native messaging, denied downloads). A clickable desktop notification at session and network-window close opens the relevant file.
+
+### Per-OS prerequisites
+
+Chrome must be installed on the host (on WSL2 that means inside the Linux distro, not Windows). Cross-platform parity for the broker (per-OS user creation, Chrome detection, notification dispatch) is tracked separately and not yet documented here. See ADR 0010 § "Cross-platform abstraction" for the design.
 
 ## Port Routing
 

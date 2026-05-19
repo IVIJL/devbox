@@ -43,6 +43,20 @@ set -euo pipefail
 # pending JSON's `log_path` field, so this script never needs to know
 # the log dir directly.
 ALLOW_FOR_PENDING_DIR="/var/log/devbox/allow-for/pending"
+# Agent-browser toast pending dir + archive / profile roots (ADR 0010 +
+# slice 08). The pending dir is host-user-owned (XDG state), so no sudo
+# is needed for sweep. Archive + profile roots are devbox-agent-owned;
+# we only stat through them (`sudo test`) to reconstruct trusted click
+# targets — no reads of attacker-controlled content.
+AGENT_BROWSER_PENDING_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/devbox/agent-browser/pending"
+# Archive + profile roots are env-overridable solely for the
+# slice-08 reconstruction test (no production knob). Defaults match
+# the broker's hardcoded layout. Overrides MUST be absolute paths;
+# the per-event validator still enforces filesystem-trust against the
+# resulting trusted_path so a hostile env can only re-anchor reads at
+# a different absolute prefix, not bypass the existence check.
+AGENT_BROWSER_ARCHIVE_DIR="${DEVBOX_AGENT_BROWSER_ARCHIVE_DIR:-/var/log/devbox/agent-browser}"
+AGENT_BROWSER_PROFILES_DIR="${DEVBOX_AGENT_BROWSER_PROFILES_DIR:-/var/lib/devbox-agent/profiles}"
 WSL_APP_ID="Devbox.AllowFor"
 # Files older than this are dropped on --sweep with a stderr warning. Keeps
 # a stale pending from a long-past unclean shutdown from firing at every
@@ -106,28 +120,55 @@ parse_pending() {
 
     P_CONTAINER=""; P_LOG_PATH=""; P_REASON=""
     P_DOMAIN_COUNT=0; P_TOP_DOMAINS=""
+    # Agent-browser additions (slice 08). Default-empty so the allow-for
+    # path keeps working unchanged when the event-class fields are
+    # missing from a pending JSON. `event` is parsed for diagnostic
+    # purposes only — the actual class dispatch in `deliver_one` runs
+    # off the filename prefix, never off this JSON field.
+    P_SESSION_TS=""; P_DURATION_SECONDS=""
 
     if command -v jq >/dev/null 2>&1; then
-        local out
+        local out sentinel='__EMPTY__'
         # One jq invocation, tab-separated. `// ""` keeps missing fields
-        # from breaking the read-into-vars below. `domain_count` is the
-        # one numeric field; `// 0` keeps it parseable.
-        out=$(jq -r '
-            [ .container // "",
-              .log_path  // "",
-              .reason    // "",
+        # from breaking the read-into-vars below. Numeric fields use `// 0`
+        # / `// ""` so absence stays parseable.
+        #
+        # The literal $sentinel substitutes for empty strings before the
+        # @tsv encoding: bash's `read` collapses runs of whitespace IFS
+        # characters (tab included) when IFS is non-default-but-still-
+        # whitespace, so consecutive empty TSV fields would otherwise
+        # vanish. We strip the sentinel back out per-variable below.
+        out=$(jq -r --arg s "$sentinel" '
+            def nonempty(s): if (s|tostring|length) == 0 then $s else (s|tostring) end;
+            [ nonempty(.container // ""),
+              nonempty(.log_path  // ""),
+              nonempty(.reason    // ""),
               (.domain_count // 0),
-              .top_domains // ""
+              nonempty(.top_domains // ""),
+              nonempty(.session_ts // ""),
+              nonempty(.duration_seconds // "")
             ] | @tsv
         ' "$file" 2>/dev/null) || return 1
         IFS=$'\t' read -r P_CONTAINER P_LOG_PATH P_REASON \
-            P_DOMAIN_COUNT P_TOP_DOMAINS <<< "$out"
+            P_DOMAIN_COUNT P_TOP_DOMAINS \
+            P_SESSION_TS P_DURATION_SECONDS <<< "$out"
+        [ "$P_CONTAINER"        = "$sentinel" ] && P_CONTAINER=""
+        [ "$P_LOG_PATH"         = "$sentinel" ] && P_LOG_PATH=""
+        [ "$P_REASON"           = "$sentinel" ] && P_REASON=""
+        [ "$P_TOP_DOMAINS"      = "$sentinel" ] && P_TOP_DOMAINS=""
+        [ "$P_SESSION_TS"       = "$sentinel" ] && P_SESSION_TS=""
+        [ "$P_DURATION_SECONDS" = "$sentinel" ] && P_DURATION_SECONDS=""
+        # jq renders a missing numeric as the literal "null" string after
+        # tostring; flatten that back to empty so the downstream check
+        # treats it as "unknown".
+        [ "$P_DURATION_SECONDS" = "null" ] && P_DURATION_SECONDS=""
     else
         # Fallback parser for hosts without jq. Matches the exact shape
-        # teardown-allow-for-window.sh writes: one `"key": value` or
-        # `"key": "value"` per line. Strings are unquoted, numbers stay
-        # literal. The regex tolerates leading whitespace and trailing
-        # comma but nothing more exotic — fine because we own the writer.
+        # teardown-allow-for-window.sh / agent-browser-broker.sh write:
+        # one `"key": value` or `"key": "value"` per line. Strings are
+        # unquoted, numbers stay literal. The regex tolerates leading
+        # whitespace and trailing comma but nothing more exotic — fine
+        # because we own the writers.
         local raw key val
         while IFS= read -r raw; do
             key=$(printf '%s' "$raw" | sed -n 's/^[[:space:]]*"\([^"]*\)"[[:space:]]*:.*/\1/p')
@@ -141,19 +182,22 @@ parse_pending() {
                 \"*\") val="${val#\"}"; val="${val%\"}" ;;
             esac
             case "$key" in
-                container)    P_CONTAINER="$val" ;;
-                log_path)     P_LOG_PATH="$val" ;;
-                reason)       P_REASON="$val" ;;
-                domain_count) P_DOMAIN_COUNT="$val" ;;
-                top_domains)  P_TOP_DOMAINS="$val" ;;
+                container)        P_CONTAINER="$val" ;;
+                log_path)         P_LOG_PATH="$val" ;;
+                reason)           P_REASON="$val" ;;
+                domain_count)     P_DOMAIN_COUNT="$val" ;;
+                top_domains)      P_TOP_DOMAINS="$val" ;;
+                session_ts)       P_SESSION_TS="$val" ;;
+                duration_seconds) [ "$val" = "null" ] || P_DURATION_SECONDS="$val" ;;
             esac
         done < "$file"
     fi
 
-    # Minimum viable record. log_path and container are mandatory; without
-    # them the toast can't link to anything useful and the writer is
-    # broken in a way the sweeper can't fix.
-    [ -n "$P_CONTAINER" ] && [ -n "$P_LOG_PATH" ]
+    # Container is mandatory across event classes. Allow-for additionally
+    # requires log_path; agent-browser reconstructs log_path from the
+    # filename so its mandatory field is `event` instead. The caller's
+    # type-specific validator enforces these post-parse.
+    [ -n "$P_CONTAINER" ]
 }
 
 # --- Toast body composition --------------------------------------------------
@@ -193,6 +237,143 @@ build_toast_body() {
     else
         T_BODY="${count_line}"
     fi
+}
+
+# --- Toast body composition: agent-browser (slice 08) ------------------------
+# Two event classes, both produced by scripts/agent-browser-broker.sh:
+# session-close (fires when the agent-browser session ends) and
+# window-close (fires when the per-window network gate closes).
+# Reason / duration / container come from the bounded, post-validation
+# globals set by `parse_pending` + the per-class validator.
+build_toast_body_agent_browser_session() {
+    T_TITLE="Agent-browser session ended: ${P_CONTAINER}"
+    if [ -n "$P_DURATION_SECONDS" ]; then
+        local mins secs
+        mins=$(( P_DURATION_SECONDS / 60 ))
+        secs=$(( P_DURATION_SECONDS % 60 ))
+        if [ "$mins" -gt 0 ]; then
+            T_BODY="Container: ${P_CONTAINER}"$'\n'"Duration: ${mins}m ${secs}s"
+        else
+            T_BODY="Container: ${P_CONTAINER}"$'\n'"Duration: ${secs}s"
+        fi
+    else
+        T_BODY="Container: ${P_CONTAINER}"
+    fi
+}
+
+build_toast_body_agent_browser_window() {
+    T_TITLE="Agent-browser network window closed: ${P_CONTAINER}"
+    local reason_line=""
+    case "$P_REASON" in
+        timer-expiry)   reason_line="Reason: timer expired" ;;
+        explicit-stop)  reason_line="Reason: stopped manually" ;;
+        session-stop)   reason_line="Reason: session ended" ;;
+        *)              reason_line="" ;;
+    esac
+    if [ -n "$reason_line" ]; then
+        T_BODY="Container: ${P_CONTAINER}"$'\n'"${reason_line}"
+    else
+        T_BODY="Container: ${P_CONTAINER}"
+    fi
+}
+
+# --- Filesystem-trust validation: agent-browser (slice 08) -------------------
+# Mirrors the allow-for reconstruction discipline: derive the trusted
+# click-target path from the pending filename + the canonical archive /
+# profile roots, NEVER from a JSON field the writer set. The host-side
+# broker that emits agent-browser events runs as the developer, but the
+# pending dir lives under XDG state where the in-container `node` UID
+# (which is the developer UID at the host kernel layer) can still
+# replace files. The same threat model that motivated ADR 0009 applies
+# here, so we apply the same defence.
+#
+# Both functions overwrite P_CONTAINER and P_LOG_PATH with the trusted
+# derivatives and bound P_REASON to the small enum the writer emits.
+# P_DURATION_SECONDS stays as the writer's value but is bounded to
+# digits-only so the body builder never embeds shell metacharacters.
+#
+# `pending_basename_norm` is the basename minus `.json` (and the
+# `.pending-ab-<kind>-` prefix already stripped). Caller guarantees it.
+#
+# Returns 0 on success, non-zero on validation failure (caller drops the
+# pending). Sets P_LOG_PATH to the chosen trusted path; for window-close
+# the live profile path is preferred during the session and the archive
+# path is preferred after `cmd_stop`.
+_validate_agent_browser_common() {
+    local pending="$1" body_norm="$2"
+    # Strict shape: [A-Za-z0-9._-]+ container charset (matches broker's
+    # _require_container_arg) joined by `-` to a compact ISO ts
+    # ([0-9]{8}T[0-9]{6}Z) the broker stamps at session start, plus an
+    # optional numeric `-<emit_ts>` suffix so repeated events for one
+    # session (multiple allow-for windows opened/closed within the same
+    # session) get unique pending filenames and survive retry under
+    # transient backend failure.
+    if ! [[ "$body_norm" =~ ^([A-Za-z0-9._-]+)-([0-9]{8}T[0-9]{6}Z)(-([0-9]+))?$ ]]; then
+        _warn "rejecting pending: filename does not match agent-browser writer pattern: $pending"
+        return 1
+    fi
+    P_CONTAINER="${BASH_REMATCH[1]}"
+    P_SESSION_TS="${BASH_REMATCH[2]}"
+    # Defensive: refuse container basenames the reconstruction would
+    # collapse to a traversal anchor under the archive root.
+    case "$P_CONTAINER" in
+        .|..|*/*) _warn "rejecting pending: container name unsafe: $pending"; return 1 ;;
+    esac
+    # Reason bounding (window-close uses three known values; session-
+    # close accepts a wider set but the body builder ignores unknowns).
+    case "$P_REASON" in
+        timer-expiry|explicit-stop|session-stop|container-stop) ;;
+        *) P_REASON="" ;;
+    esac
+    # Numeric bounding for duration_seconds.
+    case "$P_DURATION_SECONDS" in
+        ""|*[!0-9]*) P_DURATION_SECONDS="" ;;
+    esac
+    return 0
+}
+
+_validate_agent_browser_session() {
+    local pending="$1" body_norm="$2"
+    _validate_agent_browser_common "$pending" "$body_norm" || return 1
+    local trusted="${AGENT_BROWSER_ARCHIVE_DIR}/${P_CONTAINER}-${P_SESSION_TS}.summary.md"
+    # The archive dir is devbox-agent-owned 0750 — the developer reads
+    # via group membership; `sudo test` covers the case where the
+    # developer is not yet in that group and the existence check would
+    # otherwise false-negative.
+    if [ ! -f "$trusted" ] && ! sudo test -f "$trusted" 2>/dev/null; then
+        _warn "rejecting pending: summary missing for session-close: $trusted"
+        return 1
+    fi
+    P_LOG_PATH="$trusted"
+    return 0
+}
+
+_validate_agent_browser_window() {
+    local pending="$1" body_norm="$2"
+    _validate_agent_browser_common "$pending" "$body_norm" || return 1
+    # Two valid reconstruction paths, tried in order: the post-stop
+    # archive (preferred — readable to the developer once session ended)
+    # and the live per-session proxy log under the devbox-agent profile
+    # dir (used when window-close fires mid-session). Either is safe;
+    # neither comes from JSON content.
+    local archive_path="${AGENT_BROWSER_ARCHIVE_DIR}/${P_CONTAINER}-${P_SESSION_TS}.proxy.log"
+    local live_path="${AGENT_BROWSER_PROFILES_DIR}/${P_CONTAINER}-${P_SESSION_TS}/proxy.log"
+    if [ -f "$archive_path" ] || sudo test -f "$archive_path" 2>/dev/null; then
+        P_LOG_PATH="$archive_path"
+        return 0
+    fi
+    if [ -f "$live_path" ] || sudo test -f "$live_path" 2>/dev/null; then
+        P_LOG_PATH="$live_path"
+        return 0
+    fi
+    # Reject when neither the live nor archived per-session proxy log
+    # exists. The pending dir is host-user-owned (forgeable by the
+    # in-container node UID); without a devbox-agent-owned per-session
+    # artifact to anchor the toast we have no proof the session ever
+    # ran. Falling back to the archive dir here would let an attacker
+    # manufacture window-close toasts for sessions that never existed.
+    _warn "rejecting pending: no live or archived proxy log for ${P_CONTAINER}-${P_SESSION_TS}: $pending"
+    return 1
 }
 
 # --- Path conversion for Windows protocol activation ------------------------
@@ -416,64 +597,88 @@ deliver_one() {
     # The pending hand-off dir is host-user-owned, so the in-container
     # node user (UID 1000 on both sides of the bind mount) can forge,
     # replace, or delete `.pending-*.json` files. Treat every JSON
-    # field as untrusted input. Instead, lean on filesystem invariants
-    # the attacker CANNOT subvert:
+    # field as untrusted input. Lean on filesystem invariants the
+    # attacker cannot subvert: the filename matches a strict writer
+    # pattern, and the click target is reconstructed from filename
+    # components anchored at a root-owned (allow-for) or
+    # devbox-agent-owned (agent-browser) directory.
     #
-    #   - Legit pending filename matches the writer pattern produced
-    #     by start-allow-for-window + teardown-allow-for-window:
-    #     `.pending-<container>-<ts_safe>.json`. Container names go
-    #     through devbox::sanitize → [a-zA-Z0-9-]+; ts_safe is a
-    #     strict YYYY-MM-DDTHH-MM-SS±HHMM shape (colons → dashes).
-    #   - The corresponding harvest log lives at
-    #     /var/log/devbox/allow-for/<container>-<ts_safe>.log. That
-    #     directory is root:root 0755 with files 0644 root-owned —
-    #     the in-container node user has NO write access there, so a
-    #     forged pending pointing at a non-existent harvest log fails
-    #     this existence check and gets dropped.
-    #
-    # Override JSON-supplied log_path and container with the trusted
-    # derivatives; the attacker-controlled fields that remain
-    # (reason, domain_count, top_domains) only feed the toast body
-    # text, so the worst case is a misleading message — no path or
-    # protocol-handler control. Defensively bound those too.
-    # Derive basename from the ORIGINAL pending path, not $claim — after
-    # the atomic rename, $claim has a `.json.lock` suffix that basename
-    # wouldn't strip in one pass.
+    # Three dispatchers, picked by the basename's lead segment:
+    #   .pending-ab-session-…    agent-browser session-close (slice 08)
+    #   .pending-ab-window-…     agent-browser window-close  (slice 08)
+    #   .pending-…               allow-for harvest closeout  (ADR 0009)
     local pending_base
     pending_base=$(basename "$pending" .json)
-    pending_base="${pending_base#.pending-}"
-    # Note: `[-+]` (dash first) — `[+-]` in some bash builds is parsed as
-    # the range U+002B..U+002D (`+,-`), which happens to include `+` but
-    # tickles a locale-dependent BASH_REMATCH bug where captures come
-    # back empty even on a successful match. Dash-first is unambiguous.
-    if ! [[ "$pending_base" =~ ^([a-zA-Z0-9-]+)-([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}[-+][0-9]{4})$ ]]; then
-        _warn "rejecting pending: filename does not match writer pattern: $pending"
-        rm -f "$claim"
-        return 1
-    fi
-    local trusted_container="${BASH_REMATCH[1]}"
-    local trusted_log_path="/var/log/devbox/allow-for/${pending_base}.log"
-    if [ ! -f "$trusted_log_path" ]; then
-        _warn "rejecting pending: corresponding harvest log missing: $trusted_log_path"
-        rm -f "$claim"
-        return 1
-    fi
-    P_CONTAINER="$trusted_container"
-    P_LOG_PATH="$trusted_log_path"
-    case "$P_REASON" in
-        expired|stopped|interrupted) ;;
-        *) P_REASON="expired" ;;
+    local event_kind=""
+    local body_norm=""
+    case "$pending_base" in
+        .pending-ab-session-*)
+            event_kind="agent-browser-session"
+            body_norm="${pending_base#.pending-ab-session-}"
+            ;;
+        .pending-ab-window-*)
+            event_kind="agent-browser-window"
+            body_norm="${pending_base#.pending-ab-window-}"
+            ;;
+        .pending-*)
+            event_kind="allow-for"
+            body_norm="${pending_base#.pending-}"
+            ;;
+        *)
+            _warn "rejecting pending: unknown filename shape: $pending"
+            rm -f "$claim"
+            return 1
+            ;;
     esac
-    case "$P_DOMAIN_COUNT" in
-        *[!0-9]*|"") P_DOMAIN_COUNT=0 ;;
+    case "$event_kind" in
+        allow-for)
+            # Note: `[-+]` (dash first) — `[+-]` in some bash builds is parsed as
+            # the range U+002B..U+002D (`+,-`), which happens to include `+` but
+            # tickles a locale-dependent BASH_REMATCH bug where captures come
+            # back empty even on a successful match. Dash-first is unambiguous.
+            if ! [[ "$body_norm" =~ ^([a-zA-Z0-9-]+)-([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}[-+][0-9]{4})$ ]]; then
+                _warn "rejecting pending: filename does not match writer pattern: $pending"
+                rm -f "$claim"
+                return 1
+            fi
+            local trusted_container="${BASH_REMATCH[1]}"
+            local trusted_log_path="/var/log/devbox/allow-for/${body_norm}.log"
+            if [ ! -f "$trusted_log_path" ]; then
+                _warn "rejecting pending: corresponding harvest log missing: $trusted_log_path"
+                rm -f "$claim"
+                return 1
+            fi
+            P_CONTAINER="$trusted_container"
+            P_LOG_PATH="$trusted_log_path"
+            case "$P_REASON" in
+                expired|stopped|interrupted) ;;
+                *) P_REASON="expired" ;;
+            esac
+            case "$P_DOMAIN_COUNT" in
+                *[!0-9]*|"") P_DOMAIN_COUNT=0 ;;
+            esac
+            # Bound the attacker-controlled top-domains string before it
+            # reaches the renderers. Each backend does its own XML / shell
+            # escaping, but a kilobyte-long body can wedge Action Center
+            # rendering on Windows; cap it here so all paths benefit.
+            P_TOP_DOMAINS="${P_TOP_DOMAINS:0:200}"
+            build_toast_body
+            ;;
+        agent-browser-session)
+            if ! _validate_agent_browser_session "$pending" "$body_norm"; then
+                rm -f "$claim"
+                return 1
+            fi
+            build_toast_body_agent_browser_session
+            ;;
+        agent-browser-window)
+            if ! _validate_agent_browser_window "$pending" "$body_norm"; then
+                rm -f "$claim"
+                return 1
+            fi
+            build_toast_body_agent_browser_window
+            ;;
     esac
-    # Bound the attacker-controlled top-domains string before it
-    # reaches the renderers. Each backend does its own XML / shell
-    # escaping, but a kilobyte-long body can wedge Action Center
-    # rendering on Windows; cap it here so all paths benefit.
-    P_TOP_DOMAINS="${P_TOP_DOMAINS:0:200}"
-
-    build_toast_body
 
     # Pick a backend by applicability, then run delivery. Outcome
     # depends on both — only "applicable but failed" preserves the
@@ -512,41 +717,43 @@ deliver_one() {
 # --- Stale pruning -----------------------------------------------------------
 # Drop pending files older than STALE_HOURS so a long-past unclean shutdown
 # doesn't fire toasts on every `devbox` invocation. Stderr-only warning.
+# Applied to both pending dirs (allow-for + agent-browser, slice 08) so a
+# crashed broker can't accumulate forever in either.
 prune_stale() {
-    [ -d "$ALLOW_FOR_PENDING_DIR" ] || return 0
-    local stale
-    # `-mmin +N` is portable across coreutils-find and BSD-find. Convert
-    # hours to minutes once.
-    # Pattern intentionally matches both `.pending-*.json` (legit hand-off
-    # files) and `.pending-*.json.lock` (claim leftovers from a crashed
-    # delivery) — both should age out by the same clock. Anything else
-    # under this dotfile prefix is unexpected and worth sweeping too.
-    stale=$(find "$ALLOW_FOR_PENDING_DIR" -maxdepth 1 -name '.pending-*' \
-        -mmin "+$((STALE_HOURS * 60))" 2>/dev/null) || return 0
-    [ -z "$stale" ] && return 0
-    while IFS= read -r f; do
-        [ -z "$f" ] && continue
-        _warn "dropping stale pending (>${STALE_HOURS}h): $f"
-        rm -f "$f"
-    done <<< "$stale"
+    local dir
+    for dir in "$ALLOW_FOR_PENDING_DIR" "$AGENT_BROWSER_PENDING_DIR"; do
+        [ -d "$dir" ] || continue
+        local stale
+        # `-mmin +N` is portable across coreutils-find and BSD-find. Convert
+        # hours to minutes once.
+        # Pattern intentionally matches both `.pending-*.json` (legit hand-off
+        # files) and `.pending-*.json.lock` (claim leftovers from a crashed
+        # delivery) — both should age out by the same clock. Anything else
+        # under this dotfile prefix is unexpected and worth sweeping too.
+        stale=$(find "$dir" -maxdepth 1 -name '.pending-*' \
+            -mmin "+$((STALE_HOURS * 60))" 2>/dev/null) || continue
+        [ -z "$stale" ] && continue
+        while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            _warn "dropping stale pending (>${STALE_HOURS}h): $f"
+            rm -f "$f"
+        done <<< "$stale"
+    done
 }
 
 # --- Sweep -------------------------------------------------------------------
-# Iterate every .pending-*.json. Each delivery is independent; one failure
-# doesn't abort the rest.
+# Iterate every .pending-*.json across both supported pending dirs. Each
+# delivery is independent; one failure doesn't abort the rest.
 sweep() {
-    [ -d "$ALLOW_FOR_PENDING_DIR" ] || return 0
     prune_stale
-    local pending
-    # `nullglob`-style: explicitly check the glob expanded to anything,
-    # otherwise the literal `.pending-*.json` would be passed to the loop.
-    local matched=false
-    for pending in "$ALLOW_FOR_PENDING_DIR"/.pending-*.json; do
-        [ -e "$pending" ] || continue
-        matched=true
-        deliver_one "$pending" || true
+    local dir pending
+    for dir in "$ALLOW_FOR_PENDING_DIR" "$AGENT_BROWSER_PENDING_DIR"; do
+        [ -d "$dir" ] || continue
+        for pending in "$dir"/.pending-*.json; do
+            [ -e "$pending" ] || continue
+            deliver_one "$pending" || true
+        done
     done
-    [ "$matched" = false ] && return 0
     return 0
 }
 

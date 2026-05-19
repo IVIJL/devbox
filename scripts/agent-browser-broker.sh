@@ -64,6 +64,20 @@ AGENT_USER_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/devbox/agent-browser
 AGENT_PROXY_STATE_DIR="${AGENT_USER_STATE_DIR}/proxy"
 AGENT_PROXY_MODE_FILE="${AGENT_PROXY_STATE_DIR}/active-mode"
 
+# Host-user-owned hand-off dir for agent-browser toast events (slice 08).
+# Lives under XDG_STATE so no install-time provisioning is needed and the
+# broker (running as the developer) can write without sudo. The matching
+# deliver-allow-for-notification.sh sweeps this dir alongside the
+# allow-for one. Kept separate so the deliver script can apply
+# event-type-specific reconstruction rules without disturbing the
+# allow-for path.
+AGENT_PENDING_DIR="${AGENT_USER_STATE_DIR}/pending"
+
+# Path to the notification deliver script. Best-effort spawn on each
+# event emit — failure to dispatch never blocks the broker's stop or
+# window-close paths.
+AGENT_DELIVER_BIN="${DEVBOX_DIR}/scripts/deliver-allow-for-notification.sh"
+
 # Upper bound on `allow-for <minutes>`. 1440 = 24h matches the spirit
 # of the firewall `allow-for` cap (which has no explicit cap; this is
 # defence-in-depth against a typo opening a multi-day window).
@@ -1098,6 +1112,141 @@ except Exception:
 PY
 }
 
+# --- Toast emission (slice 08) -----------------------------------------------
+
+# Emit one agent-browser toast event (session-close or window-close) as a
+# pending JSON for the host-side deliver script. Best-effort: every
+# failure path returns 0 so notification dispatch never blocks the
+# broker's stop or window-close flow. The pending dir is host-user-owned
+# so no sudo is required; tmp + atomic rename keeps a half-written file
+# from being picked up by a concurrent sweep.
+#
+# The pending JSON carries display fields only. The deliver script
+# reconstructs the click-target path from the filename's
+# `<container>-<ts_compact>` shape and the canonical archive / profile
+# dirs (slice 08 AC #4) — the broker's `click_target_hint` is at most a
+# diagnostic aid in the JSON; the deliver script never trusts it.
+#
+# Args:
+#   $1 event           agent-browser-session-close | agent-browser-window-close
+#   $2 container       devbox container name (already validated)
+#   $3 ts_compact      session timestamp, [0-9]{8}T[0-9]{6}Z
+#   $4 reason          for window-close: explicit-stop | timer-expiry | session-stop
+#                      for session-close: explicit-stop | container-stop | unknown
+#   $5 duration_secs   for session-close: integer seconds, or empty when unknown
+#   $6 hint_path       diagnostic click-target hint (not trusted by deliver)
+_emit_pending_event() {
+    local event="$1" container="$2" ts_compact="$3" reason="${4:-}" duration_secs="${5:-}" hint_path="${6:-}"
+    [ -n "$event" ] || return 0
+    [ -n "$container" ] || return 0
+    [ -n "$ts_compact" ] || return 0
+
+    # Strict shape guard mirrors the deliver script's reconstruction
+    # regex. Emitting a JSON the deliver script would later reject is a
+    # silent dead-end; refuse early.
+    case "$ts_compact" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) ;;
+        *) _warn "agent-browser: refusing to emit event with malformed ts: ${ts_compact}"; return 0 ;;
+    esac
+
+    local kind=""
+    case "$event" in
+        agent-browser-session-close) kind="session" ;;
+        agent-browser-window-close)  kind="window"  ;;
+        *) _warn "agent-browser: refusing to emit unknown event: ${event}"; return 0 ;;
+    esac
+
+    mkdir -p "$AGENT_PENDING_DIR" 2>/dev/null || return 0
+    chmod 700 "$AGENT_PENDING_DIR" 2>/dev/null || true
+
+    # Per-emit suffix so a session that opens multiple network windows
+    # (each producing its own window-close event) does not overwrite an
+    # earlier pending that is still queued for retry. `date +%s%N`
+    # is nanosecond-precision on GNU coreutils; on macOS BSD-date the
+    # `%N` is literal — fall back to PID+RANDOM, which is still unique
+    # enough at the per-broker-invocation granularity we need.
+    local emit_ts
+    emit_ts="$(date +%s%N 2>/dev/null || true)"
+    case "$emit_ts" in
+        *[!0-9]*|"") emit_ts="$(date +%s)$$${RANDOM}" ;;
+    esac
+    local pending="${AGENT_PENDING_DIR}/.pending-ab-${kind}-${container}-${ts_compact}-${emit_ts}.json"
+    local pending_tmp
+    pending_tmp="$(mktemp "${AGENT_PENDING_DIR}/.pending-ab-${kind}.XXXXXXXXXX" 2>/dev/null)" || return 0
+
+    local duration_field='null'
+    case "$duration_secs" in
+        ''|*[!0-9]*) ;;
+        *) duration_field="$duration_secs" ;;
+    esac
+
+    {
+        printf '{\n'
+        printf '  "event": "%s",\n' "$event"
+        printf '  "container": "%s",\n' "$container"
+        printf '  "session_ts": "%s",\n' "$ts_compact"
+        printf '  "reason": "%s",\n' "$reason"
+        printf '  "duration_seconds": %s,\n' "$duration_field"
+        printf '  "click_target_hint": "%s",\n' "$hint_path"
+        printf '  "emitted_at": "%s"\n'  "$(_iso_utc_now)"
+        printf '}\n'
+    } > "$pending_tmp" || { rm -f -- "$pending_tmp"; return 0; }
+    chmod 600 "$pending_tmp" 2>/dev/null || true
+    mv -- "$pending_tmp" "$pending" 2>/dev/null || { rm -f -- "$pending_tmp"; return 0; }
+
+    if [ -x "$AGENT_DELIVER_BIN" ]; then
+        local detach
+        detach="$(_detach_prefix)"
+        "$detach" "$AGENT_DELIVER_BIN" "$pending" </dev/null >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+    fi
+    return 0
+}
+
+# Compute seconds elapsed between two ISO-8601 UTC timestamps of the
+# `%Y-%m-%dT%H:%M:%SZ` shape produced by `_iso_utc_now`. Echoes the
+# integer count on stdout, empty string on parse failure. Used by
+# `cmd_stop` to populate the session-close event's duration field.
+_iso_duration_seconds() {
+    local start="$1" end="$2"
+    [ -n "$start" ] || return 0
+    [ -n "$end" ] || return 0
+    local start_epoch end_epoch
+    start_epoch="$(date -u -d "$start" +%s 2>/dev/null || true)"
+    if [ -z "$start_epoch" ]; then
+        start_epoch="$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$start" +%s 2>/dev/null || true)"
+    fi
+    end_epoch="$(date -u -d "$end" +%s 2>/dev/null || true)"
+    if [ -z "$end_epoch" ]; then
+        end_epoch="$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$end" +%s 2>/dev/null || true)"
+    fi
+    [ -n "$start_epoch" ] && [ -n "$end_epoch" ] || return 0
+    [ "$end_epoch" -ge "$start_epoch" ] || return 0
+    printf '%s\n' $(( end_epoch - start_epoch ))
+}
+
+# Extract the session's compact-ISO ts suffix from a managed profile dir
+# path, e.g. `/var/lib/devbox-agent/profiles/foo-20260519T123456Z` ->
+# `20260519T123456Z`. Echoes empty when the path doesn't follow the
+# expected `<container>-<ts>` tail or the ts portion doesn't match the
+# strict shape. Used as the canonical event-id timestamp by the toast
+# emitters so the deliver script can reconstruct trusted archive paths.
+_session_ts_from_profile_dir() {
+    local profile_dir="$1" container="$2"
+    [ -n "$profile_dir" ] || return 0
+    [ -n "$container" ] || return 0
+    local basename suffix
+    basename="${profile_dir##*/}"
+    case "$basename" in
+        "${container}-"*) suffix="${basename#"${container}-"}" ;;
+        *) return 0 ;;
+    esac
+    case "$suffix" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) printf '%s\n' "$suffix" ;;
+        *) return 0 ;;
+    esac
+}
+
 # Spawn the host-side window-expiry timer. Sleeps until `expires_at`,
 # then rewrites the staged mode file to `default` and SIGHUPs the
 # proxy. Detached via setsid + nohup so the calling shell exiting does
@@ -1112,12 +1261,13 @@ PY
 # in turn holds the sleep child; killing the bash pid kills the sleep
 # child as well (the trap below makes that explicit).
 _start_window_timer() {
-    local proxy_pid="$1" proxy_port="$2" profile_dir="$3" seconds="$4" state_file="$5"
+    local proxy_pid="$1" proxy_port="$2" profile_dir="$3" seconds="$4" state_file="$5" container="$6"
     [ -n "$proxy_pid" ] || return 1
     [ -n "$proxy_port" ] || return 1
     [ -n "$profile_dir" ] || return 1
     [ -n "$seconds" ] || return 1
     [ -n "$state_file" ] || return 1
+    [ -n "$container" ] || return 1
 
     local proxy_marker="--listen 127.0.0.1:${proxy_port}"
     _is_managed_path "$profile_dir" "$AGENT_PROFILES_DIR" \
@@ -1192,8 +1342,59 @@ PYEOF
                     | grep -qF -- "$5"; then
                 sudo -u devbox-agent kill -HUP "$4" 2>/dev/null || true
             fi
+            # Toast emit (slice 08, timer-expiry path). The full JSON
+            # body is composed inline so we do not depend on sourcing
+            # broker helpers from a detached subshell. Best-effort: any
+            # failure falls through silently — the canonical record is
+            # the proxy log on disk. The pending filename pattern must
+            # match the deliver script reconstruction regex.
+            if [ -n "${8:-}" ] && [ -n "${9:-}" ] && [ -n "${10:-}" ]; then
+                pending_dir="$9"
+                container_arg="$8"
+                deliver_bin="${10}"
+                profile_base=$(basename -- "$3")
+                ts_compact=${profile_base#"${container_arg}-"}
+                case "$ts_compact" in
+                    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) ;;
+                    *) ts_compact="" ;;
+                esac
+                if [ -n "$ts_compact" ]; then
+                    mkdir -p "$pending_dir" 2>/dev/null || true
+                    chmod 700 "$pending_dir" 2>/dev/null || true
+                    emit_ts=$(date +%s%N 2>/dev/null || echo "")
+                    case "$emit_ts" in
+                        *[!0-9]*|"") emit_ts="$(date +%s)$$${RANDOM}" ;;
+                    esac
+                    pending_path="${pending_dir}/.pending-ab-window-${container_arg}-${ts_compact}-${emit_ts}.json"
+                    pending_tmp=$(mktemp "${pending_dir}/.pending-ab-window.XXXXXXXXXX" 2>/dev/null || echo "")
+                    if [ -n "$pending_tmp" ]; then
+                        emitted_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+                        printf "%s\n" \
+                            "{" \
+                            "  \"event\": \"agent-browser-window-close\"," \
+                            "  \"container\": \"${container_arg}\"," \
+                            "  \"session_ts\": \"${ts_compact}\"," \
+                            "  \"reason\": \"timer-expiry\"," \
+                            "  \"duration_seconds\": null," \
+                            "  \"click_target_hint\": \"${3}/proxy.log\"," \
+                            "  \"emitted_at\": \"${emitted_at}\"" \
+                            "}" \
+                            > "$pending_tmp" \
+                            && chmod 600 "$pending_tmp" 2>/dev/null \
+                            && mv -- "$pending_tmp" "$pending_path" 2>/dev/null \
+                            || rm -f -- "$pending_tmp"
+                        if [ -x "$deliver_bin" ] && [ -e "$pending_path" ]; then
+                            (
+                                "$deliver_bin" "$pending_path" \
+                                    </dev/null \
+                                    >/dev/null 2>&1
+                            ) &
+                        fi
+                    fi
+                fi
+            fi
         fi
-    ' agent-browser-window-timer "$seconds" "$mode_default_json" "$profile_dir" "$proxy_pid" "$proxy_marker" "$AGENT_PROXY_MODE_FILE" "$state_file" \
+    ' agent-browser-window-timer "$seconds" "$mode_default_json" "$profile_dir" "$proxy_pid" "$proxy_marker" "$AGENT_PROXY_MODE_FILE" "$state_file" "$container" "$AGENT_PENDING_DIR" "$AGENT_DELIVER_BIN" \
         </dev/null \
         >/dev/null 2>&1 &
     local timer_pid=$!
@@ -1360,7 +1561,7 @@ PY
     local seconds
     seconds=$(( minutes * 60 ))
     local timer_pid=""
-    timer_pid="$(_start_window_timer "$proxy_pid" "$proxy_port" "$profile_dir" "$seconds" "$state_file" || true)"
+    timer_pid="$(_start_window_timer "$proxy_pid" "$proxy_port" "$profile_dir" "$seconds" "$state_file" "$container" || true)"
     if [ -z "$timer_pid" ]; then
         _warn "Window timer failed to start; the proxy will still self-revert at expiry but no SIGHUP will be issued."
         timer_pid=""
@@ -1436,6 +1637,17 @@ PY
 
     _state_set_network_window "$state_file" "null"
     _log "Agent-browser network window closed for ${container}."
+
+    # Best-effort toast for the explicit-stop branch. Reconstruction in
+    # the deliver script uses ${container}-${session_ts} so the live
+    # proxy log is the natural pre-archive click target.
+    local session_ts hint
+    session_ts="$(_session_ts_from_profile_dir "$profile_dir" "$container" || true)"
+    if [ -n "$session_ts" ]; then
+        hint="${profile_dir}/proxy.log"
+        _emit_pending_event "agent-browser-window-close" "$container" "$session_ts" \
+            "explicit-stop" "" "$hint"
+    fi
 }
 
 # --- subcommand: stop --------------------------------------------------------
@@ -1481,8 +1693,33 @@ cmd_stop() {
     # it can't race with the proxy shutdown below (the proxy is about to
     # die regardless, but a timer firing during cmd_stop would try to
     # SIGHUP a dead PID and write to a soon-removed staged mode file).
-    local window_timer_pid
+    local window_timer_pid was_window_active=false window_started_at=""
     window_timer_pid="$(_state_get_window_timer_pid "$state_file" || true)"
+    # Anchor window-active detection on `started_at` (always written
+    # when cmd_allow_for opens a window) rather than `timer_pid` alone —
+    # `_start_window_timer` may have failed and recorded the window with
+    # a null pid, which still requires a session-stop toast at teardown.
+    if command -v jq >/dev/null 2>&1; then
+        window_started_at="$(jq -r '.active_network_window.started_at // empty' "$state_file" 2>/dev/null || true)"
+    else
+        window_started_at="$(python3 - "$state_file" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    window = data.get("active_network_window")
+    if window:
+        s = window.get("started_at")
+        if s:
+            print(s)
+except Exception:
+    pass
+PY
+)"
+    fi
+    if [ -n "$window_started_at" ] && [ "$window_started_at" != "null" ]; then
+        was_window_active=true
+    fi
     if [ -n "$window_timer_pid" ] && [ "$window_timer_pid" != "null" ]; then
         _kill_window_timer "$window_timer_pid"
     fi
@@ -1702,6 +1939,28 @@ cmd_stop() {
 
     rm -f -- "$state_file"
     _log "Removed state file ${state_file}."
+
+    # Toast emission (slice 08). Both events depend on a recoverable
+    # session-ts; if the profile_dir tail did not parse we silently skip
+    # — the canonical record is on disk under the archive dir.
+    local session_ts
+    session_ts="$(_session_ts_from_profile_dir "$profile_dir" "$container" || true)"
+    if [ -n "$session_ts" ]; then
+        if [ "$was_window_active" = true ]; then
+            local window_hint=""
+            [ -n "$archived_proxy_log_path" ] && window_hint="$archived_proxy_log_path"
+            _emit_pending_event "agent-browser-window-close" "$container" "$session_ts" \
+                "session-stop" "" "$window_hint"
+        fi
+        local duration_secs="" session_hint=""
+        duration_secs="$(_iso_duration_seconds "$session_created_at" "$(_iso_utc_now)" || true)"
+        # Prefer the summary archive path; reconstruction in the deliver
+        # script targets the same `.summary.md` location anyway. Hint is
+        # diagnostic only.
+        session_hint="${AGENT_NETLOG_ARCHIVE_DIR}/${container}-${session_ts}.summary.md"
+        _emit_pending_event "agent-browser-session-close" "$container" "$session_ts" \
+            "explicit-stop" "$duration_secs" "$session_hint"
+    fi
 }
 
 # --- subcommand: status ------------------------------------------------------

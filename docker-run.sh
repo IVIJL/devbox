@@ -49,6 +49,11 @@ Usage:
                                    status of CWD's container, or start 15-min
                                    window if none active. See ADR 0009.
   devbox allow-for --stop [name]   Close the active window immediately
+  devbox agent-browser <cmd> [name]
+                                   Manage the Agent-browser session for a
+                                   container. <cmd> is start | stop | status.
+                                   Launches Host agent Chrome on the host and
+                                   the in-container CDP bridge. See ADR 0010.
   devbox cursor [name]             Open Cursor attached to running devbox
   devbox code [name]               Open VS Code attached to running devbox
   devbox clip                      Grab clipboard image for container use
@@ -1531,6 +1536,11 @@ case "${1:-}" in
                  esac
              done
              ;;
+    agent-browser) MODE="agent-browser"; shift
+             AGENT_BROWSER_SUB="${1:-}"
+             [ -n "$AGENT_BROWSER_SUB" ] && shift
+             AGENT_BROWSER_TARGET="${1:-}"
+             ;;
     cursor)    MODE="cursor";     shift; CURSOR_TARGET="${1:-}" ;;
     code)      MODE="code";       shift; CODE_TARGET="${1:-}" ;;
     ssh-config) MODE="ssh-config"; shift; SSH_CONFIG_ACTION="${1:-}" ;;
@@ -2628,6 +2638,61 @@ if [ "$MODE" = "allow-for" ]; then
     exit "$start_rc"
 fi
 
+# --- devbox agent-browser <cmd> [project] ------------------------------------
+# Thin wrapper over scripts/agent-browser-broker.sh — resolves the target
+# container the same way `allow-for` / `cursor` / `code` do (explicit token
+# → CWD basename → interactive picker), then dispatches to the broker. The
+# broker holds the actual lifecycle logic (ADR 0010 § Actor 1 + Actor 2).
+
+if [ "$MODE" = "agent-browser" ]; then
+    if [ -z "$AGENT_BROWSER_SUB" ]; then
+        echo "Usage: devbox agent-browser <start|stop|status> [name]" >&2
+        exit 2
+    fi
+    case "$AGENT_BROWSER_SUB" in
+        start|stop|status|-h|--help|help) ;;
+        *)
+            echo "Unknown agent-browser subcommand: $AGENT_BROWSER_SUB" >&2
+            echo "Usage: devbox agent-browser <start|stop|status> [name]" >&2
+            exit 2
+            ;;
+    esac
+
+    # help passes through without container resolution.
+    case "$AGENT_BROWSER_SUB" in
+        -h|--help|help)
+            exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" "$AGENT_BROWSER_SUB"
+            ;;
+    esac
+
+    if [ -n "$AGENT_BROWSER_TARGET" ]; then
+        devbox::names_from_token "$AGENT_BROWSER_TARGET"
+    else
+        devbox::names_from_path "$(pwd)"
+    fi
+    container="$DEVBOX_CONTAINER_NAME"
+
+    # Picker fallback only on `start` — `stop` and `status` must work
+    # against a container that has already been stopped or crashed, so the
+    # host Chrome and state file can still be cleaned up. The broker
+    # itself surfaces "container not running" for `start`; here we only
+    # interactively recover for the start path.
+    if [ "$AGENT_BROWSER_SUB" = "start" ] \
+        && ! docker ps --filter "name=^${container}$" --format '{{.Names}}' | grep -q .; then
+        if [ -n "$AGENT_BROWSER_TARGET" ]; then
+            echo "Container ${container} is not running." >&2
+        fi
+        running=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | filter_user_containers)
+        if [ -z "$running" ]; then
+            echo "No running devbox containers." >&2
+            exit 1
+        fi
+        container=$(printf '%s\n' "$running" | picker::one --prompt "Pick a container for agent-browser: ") || exit 1
+    fi
+
+    exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" "$AGENT_BROWSER_SUB" "$container"
+fi
+
 # --- devbox allow <domain> ----------------------------------------------------
 
 if [ "$MODE" = "allow" ]; then
@@ -2879,6 +2944,11 @@ bootstrap_dns
 DOCKER_ARGS=(
     --hostname "$DEVBOX_HOSTNAME"
     --network devproxy
+    # `host.docker.internal` resolution for the in-container Agent-browser
+    # bridge socat (ADR 0010). No-op on Docker Desktop (the hostname is
+    # built-in), required on native Linux (no built-in mapping). Uniform
+    # always — keeps the bridge command identical across platforms.
+    --add-host=host.docker.internal:host-gateway
     # Entrypoint needs root to set up firewall + symlinks, then drops to node
     # via runuser. See scripts/devbox-entrypoint.sh and docs/adr/0003.
     --user 0

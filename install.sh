@@ -460,6 +460,32 @@ setup_agent_user() {
     fi
 }
 
+# --- Agent-browser allowlist example file (ADR 0010) -------------------------
+# Ships a documented `.example` copy of the agent-browser allowlist so the
+# user has a template to copy when they decide to enable the feature. We
+# never overwrite the real `agent-browser-allowed-domains.conf` even if
+# present — the user's edits are sacred. Idempotent.
+
+setup_agent_allowlist_example() {
+    info "Installing agent-browser allowlist example..."
+
+    local cfg_dir="${XDG_CONFIG_HOME:-$HOME/.config}/devbox"
+    local example="$cfg_dir/agent-browser-allowed-domains.conf.example"
+
+    mkdir -p "$cfg_dir"
+    cat > "$example" <<'EOF'
+# devbox agent-browser default-mode allowlist
+# One domain pattern per line. `#` lines are comments.
+# Glob `*.example.com` matches all subdomains.
+#
+# Examples:
+# *.github.com
+# api.openai.com
+# registry.npmjs.org
+EOF
+    CONFIGURED+=("agent-browser allowlist example ($example)")
+}
+
 # --- SSH agent configuration -------------------------------------------------
 
 configure_ssh_agent() {
@@ -807,9 +833,10 @@ main() {
         msg "  4. Install mkcert v$MKCERT_VERSION (HTTPS dev certs; CA install deferred to dns-install)"
         msg "  5. Set up /var/log/devbox/allow-for (root-owned harvest log dir; sudo prompt)"
         msg "  6. Create devbox-agent OS user (agent-browser feature; sudo prompt)"
-        msg "  7. Install 'devbox' command to $SYMLINK_PATH"
-        msg "  8. Optionally generate Claude Code token for containers"
-        msg "  9. Check Docker availability"
+        msg "  7. Install agent-browser allowlist example to \$HOME/.config/devbox"
+        msg "  8. Install 'devbox' command to $SYMLINK_PATH"
+        msg "  9. Optionally generate Claude Code token for containers"
+        msg " 10. Check Docker availability"
         echo ""
         if ! confirm "Continue?"; then
             msg "Aborted."
@@ -837,6 +864,9 @@ main() {
 
     echo ""
     setup_agent_user
+
+    echo ""
+    setup_agent_allowlist_example
 
     echo ""
     install_command

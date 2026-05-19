@@ -52,8 +52,37 @@ AGENT_DOWNLOADS_DIR="/var/lib/devbox-agent/downloads"
 # Netlog archive dir on the host. Populated at `stop` time when the live
 # netlog (under the ephemeral profile dir) is moved here for forensics.
 # Owned by devbox-agent; the local developer reads via group membership
-# (ADR 0010 § "Tamper-proof property").
+# (ADR 0010 § "Tamper-proof property"). The same dir holds the archived
+# proxy-decision JSONL (slice 04 onwards).
 AGENT_NETLOG_ARCHIVE_DIR="/var/log/devbox/agent-browser"
+
+# Per-user agent-browser state root. The proxy daemon's active-mode file
+# lives here. The proxy itself runs as devbox-agent and reads files via
+# that OS identity, so paths must be reachable for that user (see
+# `_stage_allowlist` below for the allowlist-specific handling).
+AGENT_USER_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/devbox/agent-browser"
+AGENT_PROXY_STATE_DIR="${AGENT_USER_STATE_DIR}/proxy"
+AGENT_PROXY_MODE_FILE="${AGENT_PROXY_STATE_DIR}/active-mode"
+
+# The user-facing allowlist. The proxy never reads this path directly —
+# on hosts where $HOME or ~/.config is 0700, devbox-agent can't traverse
+# into it. Instead, `_stage_allowlist` snapshots this file into the
+# session-scoped profile dir (devbox-agent-owned) at session start, and
+# the proxy is pointed at the snapshot. Hot-reload of the user's edits
+# is still possible through `devbox agent-browser allow-for` (slice 05),
+# which will re-stage the snapshot and SIGHUP the proxy. For slice 04
+# the user edits + restarts the session, which is acceptable because
+# the user has no way yet to flip the mode at runtime anyway.
+AGENT_ALLOWLIST_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/devbox/agent-browser-allowed-domains.conf"
+
+# Bypass list applied on the Chrome side. Chrome routes these direct and
+# the proxy never sees the requests. The set mirrors devbox's dev URL
+# scheme (ADR 0007 + the wildcard rules in user CLAUDE.md).
+AGENT_PROXY_BYPASS_LIST="127.0.0.1;localhost;*.test;*.127.0.0.1.sslip.io"
+
+# Path to the proxy daemon. Relative to the broker's own directory so
+# it works regardless of how the broker was invoked.
+AGENT_PROXY_BIN="${DEVBOX_DIR}/scripts/agent-browser-proxy.py"
 
 # Container-side CDP endpoint exposed by the bridge socat. Stable so the
 # agent-browser CLI always sees the same URL regardless of which random
@@ -313,6 +342,111 @@ _cleanup_session_dirs() {
     fi
 }
 
+# --- Proxy provisioning ------------------------------------------------------
+
+# Ensure the per-user proxy state dir exists and the canonical
+# active-mode file is seeded with `default`. This is the user-visible
+# source of truth that slice 05's `allow-for` will rewrite; it is NOT
+# what the proxy reads at runtime (the proxy reads a staged copy under
+# the devbox-agent-owned profile dir, see `_stage_proxy_inputs` below).
+# Idempotent.
+_ensure_proxy_user_state() {
+    mkdir -p "$AGENT_PROXY_STATE_DIR"
+    chmod 700 "$AGENT_PROXY_STATE_DIR" 2>/dev/null || true
+    printf 'default\n' > "$AGENT_PROXY_MODE_FILE"
+    chmod 600 "$AGENT_PROXY_MODE_FILE" 2>/dev/null || true
+}
+
+# Stage the allowlist and mode file into the session-scoped profile dir
+# so the proxy (running as devbox-agent) can read them regardless of the
+# developer's home / ~/.config permission bits.
+#
+# Without this snapshot the proxy fails open on a 0700 home: it cannot
+# even traverse to ~/.config and treats the missing file as "empty
+# allowlist" — default mode then denies everything, even what the user
+# explicitly listed. Snapshotting at session start sidesteps the
+# permissions question entirely.
+#
+# The snapshot is short-lived (session-scoped) and disposed at `stop`
+# alongside the profile dir. Slice 05's `allow-for` will re-stage and
+# SIGHUP the proxy.
+_stage_proxy_inputs() {
+    local profile_dir="$1"
+    [ -n "$profile_dir" ] || return 1
+    local staged_allowlist="${profile_dir}/allowed-domains.conf"
+    local staged_mode="${profile_dir}/active-mode"
+
+    # The proxy must always get a readable allowlist + mode file, even
+    # when the user's allowlist is missing — an empty allowlist + default
+    # mode is the correct default-deny posture.
+    #
+    # We touch as devbox-agent first (creating the 640 files in the 0700
+    # profile dir), then pipe the user-side allowlist contents through
+    # `sudo tee` so the source is read as the invoking user (who owns
+    # ~/.config/devbox/...) and the destination is written as devbox-
+    # agent. This sidesteps SC2024: `sudo -u ... tee dest <src` would
+    # do the source-read in the invoking shell anyway, but the linter
+    # warns about it because the redirect could mislead the reader.
+    sudo -u devbox-agent install -m 640 /dev/null "$staged_allowlist"
+    if [ -r "$AGENT_ALLOWLIST_PATH" ]; then
+        cat -- "$AGENT_ALLOWLIST_PATH" \
+            | sudo -u devbox-agent tee "$staged_allowlist" >/dev/null
+        sudo -u devbox-agent chmod 640 "$staged_allowlist" 2>/dev/null || true
+    fi
+
+    sudo -u devbox-agent install -m 640 /dev/null "$staged_mode"
+    printf 'default\n' \
+        | sudo -u devbox-agent tee "$staged_mode" >/dev/null
+    sudo -u devbox-agent chmod 640 "$staged_mode" 2>/dev/null || true
+}
+
+# Launch the forward proxy as `devbox-agent`. Echoes "<pid>" on success,
+# returns non-zero if the proxy fails to come up within ~3s.
+_start_proxy() {
+    local profile_dir="$1" proxy_port="$2"
+    [ -n "$profile_dir" ] || return 1
+    [ -n "$proxy_port" ] || return 1
+    [ -x "$AGENT_PROXY_BIN" ] || _die "agent-browser-proxy.py not executable at ${AGENT_PROXY_BIN}."
+    local proxy_log_live="${profile_dir}/proxy.log"
+    local staged_allowlist="${profile_dir}/allowed-domains.conf"
+    local staged_mode="${profile_dir}/active-mode"
+
+    # devbox-agent must own the live log file (the in-container `node`
+    # user has no path to it; see ADR 0010 § Tamper-proof property).
+    sudo -u devbox-agent touch "$proxy_log_live"
+    sudo -u devbox-agent chmod 640 "$proxy_log_live" 2>/dev/null || true
+
+    local detach
+    detach="$(_detach_prefix)"
+    sudo -u devbox-agent "$detach" sh -c '
+        exec "$1" \
+            --listen "127.0.0.1:$2" \
+            --allowlist "$3" \
+            --mode-file "$4" \
+            --log "$5" \
+            </dev/null \
+            >"$6/proxy.stdout.log" \
+            2>"$6/proxy.stderr.log"
+    ' agent-browser-proxy "$AGENT_PROXY_BIN" "$proxy_port" "$staged_allowlist" "$staged_mode" "$proxy_log_live" "$profile_dir" &
+    disown 2>/dev/null || true
+
+    # Reconcile PID via the unique listen-port arg in cmdline. The marker
+    # mirrors the Chrome/relay reconciliation pattern.
+    local proxy_pid="" proxy_retry
+    local marker="--listen 127.0.0.1:${proxy_port}"
+    for proxy_retry in 1 2 3 4 5 6 7 8 9 10; do
+        : "$proxy_retry"
+        proxy_pid="$(pgrep -f -- "$marker" 2>/dev/null | head -1 || true)"
+        if [ -n "$proxy_pid" ] && _pid_alive_on_host "$proxy_pid"; then
+            break
+        fi
+        proxy_pid=""
+        sleep 0.2
+    done
+    [ -n "$proxy_pid" ] || return 1
+    printf '%s\n' "$proxy_pid"
+}
+
 # --- Sweep stale session -----------------------------------------------------
 
 # Remove a session-state file whose Chrome and bridge are both already
@@ -326,23 +460,26 @@ _sweep_if_stale() {
     file="$(_state_file "$container")"
     [ -f "$file" ] || return 0
 
-    local chrome_pid bridge_pid relay_pid profile_dir download_dir cdp_port
+    local chrome_pid bridge_pid relay_pid proxy_pid profile_dir download_dir cdp_port proxy_port
     chrome_pid="$(_state_get "$file" chrome_pid || true)"
     bridge_pid="$(_state_get "$file" bridge_pid_in_container || true)"
     relay_pid="$(_state_get "$file" relay_pid_host || true)"
+    proxy_pid="$(_state_get "$file" proxy_pid || true)"
     profile_dir="$(_state_get "$file" profile_dir || true)"
     download_dir="$(_state_get "$file" download_dir || true)"
     cdp_port="$(_state_get "$file" cdp_port_host || true)"
+    proxy_port="$(_state_get "$file" proxy_port_host || true)"
 
     # Identity markers: cmdline substrings unique to this session. PID
     # reuse after reboot would otherwise make an unrelated process look
-    # like our Chrome/relay. The bridge socat inside the container is
-    # also matched by cmdline via `_pid_matches_marker_in_container`.
+    # like our Chrome/relay/proxy. The bridge socat inside the container
+    # is matched by cmdline via `_pid_matches_marker_in_container`.
     local chrome_marker="--user-data-dir=$profile_dir"
     local relay_marker="TCP-LISTEN:${cdp_port}"
     local bridge_marker="socat TCP-LISTEN:${BRIDGE_CONTAINER_PORT}"
+    local proxy_marker="--listen 127.0.0.1:${proxy_port}"
 
-    local chrome_alive=false bridge_alive=false relay_alive=false
+    local chrome_alive=false bridge_alive=false relay_alive=false proxy_alive=false
     if [ -n "$chrome_pid" ] && _pid_matches_marker "$chrome_pid" "$chrome_marker"; then
         chrome_alive=true
     fi
@@ -355,12 +492,18 @@ _sweep_if_stale() {
         && _pid_matches_marker "$relay_pid" "$relay_marker"; then
         relay_alive=true
     fi
+    if [ -n "$proxy_pid" ] && [ "$proxy_pid" != "null" ] \
+        && [ -n "$proxy_port" ] && [ "$proxy_port" != "null" ] \
+        && _pid_matches_marker "$proxy_pid" "$proxy_marker"; then
+        proxy_alive=true
+    fi
 
-    if [ "$chrome_alive" = true ] || [ "$bridge_alive" = true ] || [ "$relay_alive" = true ]; then
+    if [ "$chrome_alive" = true ] || [ "$bridge_alive" = true ] \
+        || [ "$relay_alive" = true ] || [ "$proxy_alive" = true ]; then
         return 1
     fi
 
-    _warn "Sweeping stale session file for ${container} (Chrome=${chrome_pid:-?}, bridge=${bridge_pid:-?}, relay=${relay_pid:-?} all gone or reused)."
+    _warn "Sweeping stale session file for ${container} (Chrome=${chrome_pid:-?}, bridge=${bridge_pid:-?}, relay=${relay_pid:-?}, proxy=${proxy_pid:-?} all gone or reused)."
 
     # Cleaning up stale session resources from the prior crash: the
     # session-scoped profile/download dirs would otherwise accumulate
@@ -486,6 +629,25 @@ EOF
     cdp_port="$(_pick_free_port)"
     [ -n "$cdp_port" ] || _die "Failed to pick a free host port for CDP."
 
+    # Provision per-user proxy state + start the forward proxy before
+    # Chrome, so the Chrome `--proxy-server=http://127.0.0.1:<proxy_port>`
+    # flag points at a listener that already exists. ADR 0010 § Actor 3.
+    _ensure_proxy_user_state
+    _stage_proxy_inputs "$profile_dir"
+    local proxy_port proxy_pid proxy_log_live
+    proxy_port="$(_pick_free_port)"
+    [ -n "$proxy_port" ] || _die "Failed to pick a free host port for the proxy."
+    proxy_log_live="${profile_dir}/proxy.log"
+
+    _log "Starting Agent-browser proxy on 127.0.0.1:${proxy_port}..."
+    if ! proxy_pid="$(_start_proxy "$profile_dir" "$proxy_port")"; then
+        _warn "Agent-browser proxy failed to start. stderr:"
+        sudo cat "${profile_dir}/proxy.stderr.log" 2>/dev/null \
+            | sed 's/^/  /' >&2 || true
+        _cleanup_session_dirs "$profile_dir" "$download_dir" "${container}-"
+        exit 1
+    fi
+
     _log "Starting Host agent Chrome for ${container} on 127.0.0.1:${cdp_port}..."
 
     # Forward the caller's GUI session credentials so Chrome (running as
@@ -524,10 +686,12 @@ EOF
             --disable-features=NativeMessaging,OptimizationHints,AutofillServerCommunication \
             --download-default-directory="$4" \
             --log-net-log="$5" \
+            --proxy-server="http://127.0.0.1:$6" \
+            --proxy-bypass-list="$7" \
             </dev/null \
             >"$3/chrome.stdout.log" \
             2>"$3/chrome.stderr.log"
-    ' agent-browser-chrome "$chrome_bin" "$cdp_port" "$profile_dir" "$download_dir" "$netlog_path" &
+    ' agent-browser-chrome "$chrome_bin" "$cdp_port" "$profile_dir" "$download_dir" "$netlog_path" "$proxy_port" "$AGENT_PROXY_BYPASS_LIST" &
     disown 2>/dev/null || true
 
     # Reconcile Chrome's actual PID via pgrep on the unique --user-data-dir
@@ -549,6 +713,7 @@ EOF
         # the developer can't read it directly; route through sudo cat.
         sudo cat "$profile_dir/chrome.stderr.log" 2>/dev/null \
             | sed 's/^/  /' >&2 || true
+        sudo -u devbox-agent kill "$proxy_pid" 2>/dev/null || true
         _cleanup_session_dirs "$profile_dir" "$download_dir" "${container}-"
         exit 1
     fi
@@ -584,6 +749,7 @@ EOF
         # failure later.
         if ! command -v socat >/dev/null 2>&1; then
             sudo -u devbox-agent kill "$chrome_pid" 2>/dev/null || true
+            sudo -u devbox-agent kill "$proxy_pid" 2>/dev/null || true
             _cleanup_session_dirs "$profile_dir" "$download_dir" "${container}-"
             _die "host socat not found. Install it (Debian/Ubuntu: sudo apt-get install -y socat; Fedora/RHEL: sudo dnf install -y socat; Arch: sudo pacman -S socat; macOS: brew install socat). It is required for the Agent-browser host relay on this platform."
         fi
@@ -637,11 +803,12 @@ EOF
         socat \
             "TCP-LISTEN:${BRIDGE_CONTAINER_PORT},bind=127.0.0.1,fork,reuseaddr" \
             "TCP:host.docker.internal:${cdp_port}"; then
-        _warn "docker exec -d socat failed in ${container}; rolling back Chrome and relay."
+        _warn "docker exec -d socat failed in ${container}; rolling back Chrome, relay, and proxy."
         sudo -u devbox-agent kill "$chrome_pid" 2>/dev/null || true
         if [ -n "$relay_pid" ]; then
             sudo -u devbox-agent kill "$relay_pid" 2>/dev/null || true
         fi
+        sudo -u devbox-agent kill "$proxy_pid" 2>/dev/null || true
         _cleanup_session_dirs "$profile_dir" "$download_dir" "${container}-"
         exit 1
     fi
@@ -657,11 +824,12 @@ EOF
         sleep 0.2
     done
     if [ -z "$bridge_pid" ]; then
-        _warn "Bridge socat did not register inside ${container}; rolling back Chrome and relay."
+        _warn "Bridge socat did not register inside ${container}; rolling back Chrome, relay, and proxy."
         sudo -u devbox-agent kill "$chrome_pid" 2>/dev/null || true
         if [ -n "$relay_pid" ]; then
             sudo -u devbox-agent kill "$relay_pid" 2>/dev/null || true
         fi
+        sudo -u devbox-agent kill "$proxy_pid" 2>/dev/null || true
         _cleanup_session_dirs "$profile_dir" "$download_dir" "${container}-"
         exit 1
     fi
@@ -669,12 +837,16 @@ EOF
     local created_at
     created_at="$(_iso_utc_now)"
 
-    # Write state JSON. Fields that this slice doesn't use yet (proxy_pid,
-    # proxy_port_host, netlog_path, active_network_window) are emitted as
-    # null per the ADR's example shape, so later slices can populate them
-    # in-place without breaking readers. `relay_pid_host` is an addition
+    # Write state JSON. `active_network_window` stays null until slice 05
+    # adds the network-window machinery. `relay_pid_host` is an addition
     # over the ADR's listed shape — host-side relay PID for native Linux
     # only; null elsewhere — needed so `stop` can clean it up.
+    # `proxy_log_path` records the LIVE log location during the session
+    # (under the ephemeral profile dir); `cmd_stop` archives it under
+    # /var/log/devbox/agent-browser/ alongside the netlog and removes
+    # the state file in the same step, so there is no post-archive
+    # consumer of the field — keeping it as the live path matches the
+    # `netlog_path` convention.
     local relay_pid_json="null"
     [ -n "$relay_pid" ] && relay_pid_json="$relay_pid"
     local state_file
@@ -685,12 +857,13 @@ EOF
   "chrome_pid": ${chrome_pid},
   "bridge_pid_in_container": ${bridge_pid},
   "relay_pid_host": ${relay_pid_json},
-  "proxy_pid": null,
+  "proxy_pid": ${proxy_pid},
   "cdp_port_host": ${cdp_port},
-  "proxy_port_host": null,
+  "proxy_port_host": ${proxy_port},
   "profile_dir": "${profile_dir}",
   "download_dir": "${download_dir}",
   "netlog_path": "${netlog_path}",
+  "proxy_log_path": "${proxy_log_live}",
   "created_at": "${created_at}",
   "active_network_window": null
 }
@@ -735,10 +908,13 @@ EOF
     _log "Agent-browser session started."
     _log "  Chrome PID (host):         ${chrome_pid}"
     [ -n "$relay_pid" ] && _log "  Relay PID (host):          ${relay_pid}"
+    _log "  Proxy PID (host):          ${proxy_pid}"
     _log "  Bridge PID (in container): ${bridge_pid}"
     _log "  CDP (host):                127.0.0.1:${cdp_port}"
+    _log "  Proxy (host):              127.0.0.1:${proxy_port} (default mode)"
     _log "  CDP (in container):        127.0.0.1:${BRIDGE_CONTAINER_PORT}"
     _log "  Profile dir:               ${profile_dir}"
+    _log "  Proxy log (live):          ${proxy_log_live}"
     _log "  State:                     ${state_file}"
     _log "  CDP reachable from container: yes"
 }
@@ -757,18 +933,23 @@ cmd_stop() {
         return 0
     fi
 
-    local chrome_pid bridge_pid relay_pid profile_dir download_dir netlog_path cdp_port
+    local chrome_pid bridge_pid relay_pid proxy_pid profile_dir download_dir
+    local netlog_path proxy_log_path cdp_port proxy_port
     chrome_pid="$(_state_get "$state_file" chrome_pid || true)"
     bridge_pid="$(_state_get "$state_file" bridge_pid_in_container || true)"
     relay_pid="$(_state_get "$state_file" relay_pid_host || true)"
+    proxy_pid="$(_state_get "$state_file" proxy_pid || true)"
     profile_dir="$(_state_get "$state_file" profile_dir || true)"
     download_dir="$(_state_get "$state_file" download_dir || true)"
     netlog_path="$(_state_get "$state_file" netlog_path || true)"
+    proxy_log_path="$(_state_get "$state_file" proxy_log_path || true)"
     cdp_port="$(_state_get "$state_file" cdp_port_host || true)"
+    proxy_port="$(_state_get "$state_file" proxy_port_host || true)"
 
     local chrome_marker="--user-data-dir=$profile_dir"
     local relay_marker="TCP-LISTEN:${cdp_port}"
     local bridge_marker="socat TCP-LISTEN:${BRIDGE_CONTAINER_PORT}"
+    local proxy_marker="--listen 127.0.0.1:${proxy_port}"
 
     # All kill paths gate on the marker match, not bare PID existence —
     # if a saved PID has been reused by an unrelated process across a
@@ -798,6 +979,13 @@ cmd_stop() {
         && _pid_matches_marker "$relay_pid" "$relay_marker"; then
         _log "Stopping host relay PID ${relay_pid}..."
         sudo -u devbox-agent kill "$relay_pid" 2>/dev/null || true
+    fi
+
+    if [ -n "$proxy_pid" ] && [ "$proxy_pid" != "null" ] \
+        && [ -n "$proxy_port" ] && [ "$proxy_port" != "null" ] \
+        && _pid_matches_marker "$proxy_pid" "$proxy_marker"; then
+        _log "Stopping Agent-browser proxy PID ${proxy_pid}..."
+        sudo -u devbox-agent kill "$proxy_pid" 2>/dev/null || true
     fi
 
     if _container_running "$container" \
@@ -859,6 +1047,43 @@ cmd_stop() {
         _warn "State netlog_path '${netlog_path}' is outside the managed profile dir; skipping archive."
     fi
 
+    # Archive proxy log on the same shape and pre-checks as the netlog
+    # above. Same trust property: the proxy log path is sourced from a
+    # developer-writable state JSON, so it MUST live under the managed
+    # profile dir for the sudo mv to be safe.
+    local proxy_log_is_managed=false
+    if [ -n "$proxy_log_path" ] && [ "$proxy_log_path" != "null" ] \
+        && [ -n "$profile_dir" ] && [ "$profile_dir" != "null" ] \
+        && _is_managed_path "$profile_dir" "$AGENT_PROFILES_DIR" "${container}-" \
+        && _is_managed_path "$proxy_log_path" "$profile_dir"; then
+        proxy_log_is_managed=true
+    fi
+    if [ "$proxy_log_is_managed" = true ] && sudo test -f "$proxy_log_path"; then
+        if [ ! -d "$AGENT_NETLOG_ARCHIVE_DIR" ]; then
+            sudo mkdir -p "$AGENT_NETLOG_ARCHIVE_DIR"
+            sudo chown devbox-agent: "$AGENT_NETLOG_ARCHIVE_DIR"
+            sudo chmod 750 "$AGENT_NETLOG_ARCHIVE_DIR"
+        fi
+        local proxy_ts_suffix proxy_archive_path
+        proxy_ts_suffix="${profile_dir##*/"${container}"-}"
+        [ "$proxy_ts_suffix" = "$profile_dir" ] && proxy_ts_suffix=""
+        [ -n "$proxy_ts_suffix" ] || proxy_ts_suffix="$(date -u +"%Y%m%dT%H%M%SZ")"
+        proxy_archive_path="${AGENT_NETLOG_ARCHIVE_DIR}/${container}-${proxy_ts_suffix}.proxy.log"
+        if _is_managed_path "$proxy_archive_path" "$AGENT_NETLOG_ARCHIVE_DIR" "${container}-"; then
+            if sudo mv -- "$proxy_log_path" "$proxy_archive_path" 2>/dev/null; then
+                sudo chown devbox-agent: "$proxy_archive_path" 2>/dev/null || true
+                sudo chmod 640 "$proxy_archive_path" 2>/dev/null || true
+                _log "Archived proxy log: ${proxy_archive_path}"
+            else
+                _warn "Failed to archive proxy log from ${proxy_log_path} to ${proxy_archive_path}."
+            fi
+        else
+            _warn "Refusing to archive proxy log to suspicious path ${proxy_archive_path}."
+        fi
+    elif [ -n "$proxy_log_path" ] && [ "$proxy_log_path" != "null" ] && [ "$proxy_log_is_managed" != true ]; then
+        _warn "State proxy_log_path '${proxy_log_path}' is outside the managed profile dir; skipping archive."
+    fi
+
     # Remove the ephemeral profile and download dirs — they are session-
     # scoped per ADR 0010 § Actor 1, and any forensic value has already
     # been captured by the archived netlog above. Each path is validated
@@ -899,17 +1124,20 @@ cmd_status() {
         return 0
     fi
 
-    local chrome_pid bridge_pid relay_pid cdp_port profile_dir created_at
+    local chrome_pid bridge_pid relay_pid proxy_pid cdp_port proxy_port profile_dir created_at
     chrome_pid="$(_state_get "$state_file" chrome_pid || true)"
     bridge_pid="$(_state_get "$state_file" bridge_pid_in_container || true)"
     relay_pid="$(_state_get "$state_file" relay_pid_host || true)"
+    proxy_pid="$(_state_get "$state_file" proxy_pid || true)"
     cdp_port="$(_state_get "$state_file" cdp_port_host || true)"
+    proxy_port="$(_state_get "$state_file" proxy_port_host || true)"
     profile_dir="$(_state_get "$state_file" profile_dir || true)"
     created_at="$(_state_get "$state_file" created_at || true)"
 
     local chrome_marker="--user-data-dir=$profile_dir"
     local relay_marker="TCP-LISTEN:${cdp_port}"
     local bridge_marker="socat TCP-LISTEN:${BRIDGE_CONTAINER_PORT}"
+    local proxy_marker="--listen 127.0.0.1:${proxy_port}"
 
     local chrome_status="dead"
     if [ -n "$chrome_pid" ] && _pid_matches_marker "$chrome_pid" "$chrome_marker"; then
@@ -927,6 +1155,12 @@ cmd_status() {
         _pid_matches_marker "$relay_pid" "$relay_marker" && relay_status="alive"
         relay_line="  Relay PID (host):          ${relay_pid} (${relay_status})"
     fi
+    local proxy_line=""
+    if [ -n "$proxy_pid" ] && [ "$proxy_pid" != "null" ]; then
+        local proxy_status="dead"
+        _pid_matches_marker "$proxy_pid" "$proxy_marker" && proxy_status="alive"
+        proxy_line="  Proxy PID (host):          ${proxy_pid} (${proxy_status})"
+    fi
 
     cat <<EOF
 Agent-browser session for ${container}:
@@ -934,9 +1168,11 @@ Agent-browser session for ${container}:
   Chrome PID (host):         ${chrome_pid:-?} (${chrome_status})
 EOF
     [ -n "$relay_line" ] && printf '%s\n' "$relay_line"
+    [ -n "$proxy_line" ] && printf '%s\n' "$proxy_line"
     cat <<EOF
   Bridge PID (in container): ${bridge_pid:-?} (${bridge_status})
   CDP (host):                127.0.0.1:${cdp_port:-?}
+  Proxy (host):              127.0.0.1:${proxy_port:-?}
   CDP (in container):        127.0.0.1:${BRIDGE_CONTAINER_PORT}
   Profile dir:               ${profile_dir:-?}
   State file:                ${state_file}

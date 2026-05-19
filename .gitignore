@@ -12,3 +12,9 @@ build.log
 # OS
 .DS_Store
 Thumbs.db
+
+# Local issue tracker (Matt Pocock skills convention)
+.scratch/
+
+# Local plans / scratch notes
+local-*

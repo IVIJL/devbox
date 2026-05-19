@@ -54,6 +54,77 @@ The root-owned file inside the container (`/etc/devbox-shared/.allow-for.state`)
 recording the active window's `started_at`, `expires_at`, and daemon PID.
 Source of truth for status queries.
 
+### Agent-browser
+
+**Agent-browser session**:
+A long-lived host-side state, started by `devbox agent-browser start
+<project>` and ended by `... stop`. While active, exactly one **Host
+agent Chrome** runs on the host and exactly one **Container** can reach
+its CDP endpoint through an in-container bridge socket. Closes on
+explicit `stop`, idle timeout (`AGENT_BROWSER_IDLE_TIMEOUT_MS`), or
+container teardown.
+_Avoid_: chrome session, browser bridge
+
+**Host agent Chrome**:
+The dedicated Chrome instance launched on the host by the **Agent-browser
+session** broker. Runs as a distinct OS user (`devbox-agent` on all
+three platforms), with an ephemeral `--user-data-dir`, hardened launch
+flags (no extensions, no native messaging, no sync, no `file://`
+access), and `--log-net-log=<path>`. Binds CDP on the host's loopback
+(`127.0.0.1:<random-port>`) — never on a routable interface. All
+outbound HTTP/HTTPS is forced through the **Agent-browser proxy** via
+`--proxy-server`.
+_Avoid_: personal Chrome, shared Chrome
+
+**Agent-browser session bridge**:
+The per-session socat process running inside the outer **Container**'s
+network namespace, forwarding `127.0.0.1:9222` (inside the container)
+to `host.docker.internal:<random-port>` (the **Host agent Chrome**'s
+CDP). The container's network namespace is the security boundary: no
+other container or process can see this socket. socat is the
+transport, not the gate.
+_Avoid_: cdp tunnel, browser forwarder
+
+**Agent-browser network window**:
+A time-bounded sub-state of an **Agent-browser session**, started by
+`devbox agent-browser allow-for <minutes>`. While open, the
+**Agent-browser proxy** is in **harvest mode**: any host the browser
+contacts is allowed and logged, paralleling the firewall **Allow-for
+window**. Outside this sub-window, the proxy denies everything not in
+the **Agent-browser allowlist** or the local-dev bypass list.
+_Avoid_: browser allow-for, agent allow-for
+
+**Agent-browser proxy**:
+The host-side HTTP forward proxy daemon, run by `devbox-agent`, that
+gates all of **Host agent Chrome**'s outbound traffic. Reloadable via
+SIGHUP. Has two modes:
+- **default mode** — REJECT everything except the **Agent-browser
+  allowlist** and the bypass list (`localhost`, `*.test`,
+  `*.127.0.0.1.sslip.io`)
+- **harvest mode** — ALLOW + LOG every CONNECT/GET, time-bounded by
+  the active **Agent-browser network window**
+_Avoid_: agent proxy, browser proxy
+
+**Agent-browser allowlist**:
+The set of domain patterns in
+`~/.config/devbox/agent-browser-allowed-domains.conf`, distinct from
+the firewall **Allowlist**. Enforced at two points:
+1. **Agent-browser proxy** (network gate — CONNECT/GET host check)
+2. agent-browser's native `--allowed-domains` flag (page-level
+   navigation gate — a structured error reaches the agent on denial,
+   useful for LLM feedback)
+Read at session start, propagated into the **Container** via
+`AGENT_BROWSER_ALLOWED_DOMAINS`.
+_Avoid_: browser allowlist, navigation allowlist
+
+**Netlog**:
+The Chrome-native `--log-net-log=` JSON file written by **Host agent
+Chrome** for the lifetime of a session. Archived at session teardown
+to `/var/log/devbox/agent-browser/<container>-<timestamp>.netlog.json`
+and summarized into a human-readable `summary.md` (visited hosts,
+out-of-allowlist requests, downloads, suspicious flags).
+_Avoid_: chrome log, browser audit
+
 ### Project / container
 
 **Project**:
@@ -77,6 +148,21 @@ environment. Each project gets exactly one container at a time.
 - A domain added via `devbox allow` during an active window joins the
   **Allowlist** permanently; the **Harvest pool** keeps it (harmlessly
   redundant) until window teardown.
+- An **Agent-browser session** runs in exactly one **Container** at a
+  time and is bound to exactly one **Host agent Chrome** and exactly
+  one **Agent-browser session bridge** for its lifetime; all three die
+  together at session teardown.
+- An **Agent-browser session** can contain at most one active
+  **Agent-browser network window**. Starting a second `allow-for`
+  during an active window *resets the clock* (parallel to the firewall
+  **Allow-for window**).
+- The **Agent-browser allowlist** is shared across all of a user's
+  **Containers**, like the firewall **Allowlist**, but its enforcement
+  points are the **Agent-browser proxy** (network) and agent-browser
+  CLI (page navigation), not the firewall.
+- The **Agent-browser proxy** is the single network exit point for
+  **Host agent Chrome**. Chrome cannot reach the internet by any other
+  path; the `--proxy-server` flag is non-negotiable.
 
 ## Example dialogue
 

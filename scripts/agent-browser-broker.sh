@@ -45,8 +45,15 @@ SESSIONS_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/devbox/agent-browser/session
 # Ephemeral Chrome profiles + downloads live under a devbox-agent-owned
 # parent so the OS-identity boundary covers them too (ADR 0010 § Actor 1).
 # /var/lib is the FHS-canonical location for service-owned mutable state;
-# the parent dir is created (with sudo, once) on first `start`.
+# the parent dirs are created (with sudo, once) on first `start`.
 AGENT_PROFILES_DIR="/var/lib/devbox-agent/profiles"
+AGENT_DOWNLOADS_DIR="/var/lib/devbox-agent/downloads"
+
+# Netlog archive dir on the host. Populated at `stop` time when the live
+# netlog (under the ephemeral profile dir) is moved here for forensics.
+# Owned by devbox-agent; the local developer reads via group membership
+# (ADR 0010 § "Tamper-proof property").
+AGENT_NETLOG_ARCHIVE_DIR="/var/log/devbox/agent-browser"
 
 # Container-side CDP endpoint exposed by the bridge socat. Stable so the
 # agent-browser CLI always sees the same URL regardless of which random
@@ -73,9 +80,22 @@ EOF
 # Require a name that looks like a devbox container; the broker doesn't
 # resolve project-name -> container-name (that's `devbox agent-browser`
 # dispatch). We just validate the input shape and check Docker.
+#
+# Charset enforcement mirrors Docker's own `[a-zA-Z0-9][a-zA-Z0-9_.-]*`
+# regex. It's defence-in-depth: the container name flows into derived
+# paths (profile dir, archive filename) and into the state-file name,
+# so even though Docker would reject `../foo` upstream we still refuse
+# anything we'd be embarrassed to expand into a filesystem path.
 _require_container_arg() {
     local container="${1:-}"
     [ -n "$container" ] || { _usage >&2; exit 2; }
+    case "$container" in
+        [a-zA-Z0-9]*) ;;
+        *) _die "Invalid container name '${container}': must start with [a-zA-Z0-9]." ;;
+    esac
+    case "$container" in
+        *[!a-zA-Z0-9._-]*) _die "Invalid container name '${container}': only [a-zA-Z0-9._-] allowed." ;;
+    esac
     printf '%s\n' "$container"
 }
 
@@ -215,6 +235,84 @@ _pid_matches_marker_in_container() {
     " _ "$marker" 2>/dev/null
 }
 
+# --- Session-dir cleanup -----------------------------------------------------
+
+# Reject any path that doesn't sit directly under one of the agent-owned
+# parents we manage. The session-state JSON lives under the developer's
+# home dir and so is writable by the developer; without this guard, a
+# corrupted or tampered state file could direct the subsequent `sudo rm`
+# calls at any path.
+#
+# Acceptance rules:
+#   - must start with the expected parent + exactly one basename
+#     (single component, no nested subdirs)
+#   - must not equal the parent itself
+#   - basename charset restricted to [A-Za-z0-9._-] (matches our
+#     `<container>-<ts>` build pattern)
+#   - basename must not be `.` or `..` (traversal anchors)
+#   - if a third arg `session_prefix` is given, the basename must
+#     start with that exact string — used to bind cleanup to the
+#     currently-named container, so a tampered state JSON can't
+#     redirect rm/mv at a sibling session under the same parent.
+#
+# The full-path `..` substring check used in earlier drafts was
+# overzealous: Docker names like `foo..bar` produce legitimate paths
+# such as `/var/lib/devbox-agent/profiles/foo..bar-20260519T120000Z`
+# that contain `..` but are not traversal attempts. Doing the check
+# on the extracted basename after the single-component constraint
+# already rules out real traversal.
+_is_managed_path() {
+    local path="${1:-}" parent="${2:-}" session_prefix="${3:-}"
+    [ -n "$path" ] || return 1
+    [ -n "$parent" ] || return 1
+    [ "$path" != "$parent" ] || return 1
+    local prefix="${parent%/}/"
+    case "$path" in
+        "$prefix"*) ;;
+        *) return 1 ;;
+    esac
+    local basename="${path#"$prefix"}"
+    [ -n "$basename" ] || return 1
+    case "$basename" in
+        */*) return 1 ;;
+    esac
+    [ "$basename" != "." ] || return 1
+    [ "$basename" != ".." ] || return 1
+    case "$basename" in
+        *[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    if [ -n "$session_prefix" ]; then
+        case "$basename" in
+            "$session_prefix"*) ;;
+            *) return 1 ;;
+        esac
+    fi
+    return 0
+}
+
+# Remove the per-session profile and download dirs. Used by `cmd_start`'s
+# early-failure rollback paths (before the state JSON is written, so the
+# stale-session sweep on the next `start` has nothing to anchor on) and
+# anywhere else that needs to scrub the dirs without going through `stop`.
+# `session_prefix` (third arg, typically `${container}-`) binds the rm
+# to the currently-named session — a tampered state JSON cannot direct
+# the sudo rm at a sibling session's dir under the same parent.
+# Existence is checked through `sudo test` because the 0700 parents block
+# the developer from stat'ing into the devbox-agent-owned tree.
+_cleanup_session_dirs() {
+    local profile_dir="${1:-}" download_dir="${2:-}" session_prefix="${3:-}"
+    if [ -n "$profile_dir" ] \
+        && _is_managed_path "$profile_dir" "$AGENT_PROFILES_DIR" "$session_prefix" \
+        && sudo test -d "$profile_dir"; then
+        sudo rm -rf -- "$profile_dir" || _warn "Failed to remove profile dir ${profile_dir}."
+    fi
+    if [ -n "$download_dir" ] \
+        && _is_managed_path "$download_dir" "$AGENT_DOWNLOADS_DIR" "$session_prefix" \
+        && sudo test -d "$download_dir"; then
+        sudo rm -rf -- "$download_dir" || _warn "Failed to remove download dir ${download_dir}."
+    fi
+}
+
 # --- Sweep stale session -----------------------------------------------------
 
 # Remove a session-state file whose Chrome and bridge are both already
@@ -228,11 +326,12 @@ _sweep_if_stale() {
     file="$(_state_file "$container")"
     [ -f "$file" ] || return 0
 
-    local chrome_pid bridge_pid relay_pid profile_dir cdp_port
+    local chrome_pid bridge_pid relay_pid profile_dir download_dir cdp_port
     chrome_pid="$(_state_get "$file" chrome_pid || true)"
     bridge_pid="$(_state_get "$file" bridge_pid_in_container || true)"
     relay_pid="$(_state_get "$file" relay_pid_host || true)"
     profile_dir="$(_state_get "$file" profile_dir || true)"
+    download_dir="$(_state_get "$file" download_dir || true)"
     cdp_port="$(_state_get "$file" cdp_port_host || true)"
 
     # Identity markers: cmdline substrings unique to this session. PID
@@ -262,6 +361,28 @@ _sweep_if_stale() {
     fi
 
     _warn "Sweeping stale session file for ${container} (Chrome=${chrome_pid:-?}, bridge=${bridge_pid:-?}, relay=${relay_pid:-?} all gone or reused)."
+
+    # Cleaning up stale session resources from the prior crash: the
+    # session-scoped profile/download dirs would otherwise accumulate
+    # under /var/lib/devbox-agent/ across host crashes, leaking the
+    # netlog and any half-written downloads from the dead session.
+    # `_is_managed_path` blocks a corrupted state file from escalating
+    # the sudo rm into arbitrary deletion; `sudo test -d` is needed
+    # because the 0700 parent dirs block the developer from stat'ing
+    # into the devbox-agent-owned tree without elevation.
+    if [ -n "$profile_dir" ] && [ "$profile_dir" != "null" ] \
+        && _is_managed_path "$profile_dir" "$AGENT_PROFILES_DIR" "${container}-" \
+        && sudo test -d "$profile_dir"; then
+        _warn "Cleaning up stale session resources from ${profile_dir}..."
+        sudo rm -rf -- "$profile_dir" || _warn "Failed to remove stale profile dir ${profile_dir}."
+    fi
+    if [ -n "$download_dir" ] && [ "$download_dir" != "null" ] \
+        && _is_managed_path "$download_dir" "$AGENT_DOWNLOADS_DIR" "${container}-" \
+        && sudo test -d "$download_dir"; then
+        _warn "Cleaning up stale session resources from ${download_dir}..."
+        sudo rm -rf -- "$download_dir" || _warn "Failed to remove stale download dir ${download_dir}."
+    fi
+
     rm -f -- "$file"
     return 0
 }
@@ -300,21 +421,66 @@ cmd_start() {
     # `install -d` is the portable atomic equivalent of mkdir+chmod+chown,
     # but requires the target's parent to exist; we layer manually so the
     # first time through still works on a fresh host.
-    if [ ! -d "$AGENT_PROFILES_DIR" ]; then
-        sudo mkdir -p "$AGENT_PROFILES_DIR"
-        # Trailing colon = "owner's primary group", portable on Linux
-        # (GNU coreutils) and macOS (BSD chown). On Linux the primary
-        # group is `devbox-agent` (--user-group in lib/host-platform.sh);
-        # on macOS sysadminctl assigns `staff`. Either way no extra
-        # group lookup is needed.
-        sudo chown devbox-agent: "$AGENT_PROFILES_DIR"
-        sudo chmod 700 "$AGENT_PROFILES_DIR"
+    # Trailing colon on chown = "owner's primary group", portable on Linux
+    # (GNU coreutils) and macOS (BSD chown). On Linux the primary group is
+    # `devbox-agent` (--user-group in lib/host-platform.sh); on macOS
+    # sysadminctl assigns `staff`. Either way no extra group lookup is needed.
+    local agent_parent
+    for agent_parent in "$AGENT_PROFILES_DIR" "$AGENT_DOWNLOADS_DIR"; do
+        if [ ! -d "$agent_parent" ]; then
+            sudo mkdir -p "$agent_parent"
+            sudo chown devbox-agent: "$agent_parent"
+            sudo chmod 700 "$agent_parent"
+        fi
+    done
+
+    # Netlog archive dir under /var/log so the developer can read past
+    # sessions via group membership (parallels allow-for log layout).
+    # Group-readable bit on the dir lets future slices add group provisioning
+    # without revisiting this code; for slice 03 the local developer must
+    # already be in the devbox-agent group to read individual files.
+    if [ ! -d "$AGENT_NETLOG_ARCHIVE_DIR" ]; then
+        sudo mkdir -p "$AGENT_NETLOG_ARCHIVE_DIR"
+        sudo chown devbox-agent: "$AGENT_NETLOG_ARCHIVE_DIR"
+        sudo chmod 750 "$AGENT_NETLOG_ARCHIVE_DIR"
     fi
 
-    local ts profile_dir
+    local ts profile_dir download_dir netlog_path
     ts="$(date -u +"%Y%m%dT%H%M%SZ")"
     profile_dir="${AGENT_PROFILES_DIR}/${container}-${ts}"
-    sudo -u devbox-agent mkdir -p "$profile_dir"
+    download_dir="${AGENT_DOWNLOADS_DIR}/${container}-${ts}"
+    # Why: `netlog_path` in the state JSON tracks the LIVE location during
+    # the session; `cmd_stop` moves the file to the archive dir and the
+    # state file is removed in the same step, so there is no post-archive
+    # consumer of the field. Keeping it as the live path keeps the field
+    # meaningful while the session is running (e.g. `status` could surface it).
+    netlog_path="${profile_dir}/netlog.json"
+    sudo -u devbox-agent mkdir -p "$profile_dir" "$download_dir"
+
+    # Seed Default/Preferences with the download dir. ADR 0010 lists
+    # `--download-default-directory` as the mechanism, but in practice
+    # modern Chrome only consistently honours that path when it is
+    # ALSO present in the profile's Preferences JSON — the CLI flag
+    # alone is treated as an initial-state hint and can be overridden
+    # by the embedded prefs on first run. Writing the prefs eagerly
+    # closes the gap so user-initiated downloads land in the ephemeral
+    # dir we delete on `stop`, instead of escaping to ~devbox-agent.
+    # `prompt_for_download: false` keeps the agent from blocking on a
+    # save dialog inside a CDP-driven Chrome.
+    sudo -u devbox-agent mkdir -p "$profile_dir/Default"
+    sudo -u devbox-agent tee "$profile_dir/Default/Preferences" >/dev/null <<EOF
+{
+  "download": {
+    "default_directory": "${download_dir}",
+    "prompt_for_download": false
+  },
+  "profile": {
+    "default_content_setting_values": {
+      "automatic_downloads": 1
+    }
+  }
+}
+EOF
 
     local cdp_port
     cdp_port="$(_pick_free_port)"
@@ -351,10 +517,17 @@ cmd_start() {
             --user-data-dir="$3" \
             --no-first-run \
             --no-default-browser-check \
+            --disable-extensions \
+            --disable-sync \
+            --disable-background-networking \
+            --disable-component-update \
+            --disable-features=NativeMessaging,OptimizationHints,AutofillServerCommunication \
+            --download-default-directory="$4" \
+            --log-net-log="$5" \
             </dev/null \
             >"$3/chrome.stdout.log" \
             2>"$3/chrome.stderr.log"
-    ' agent-browser-chrome "$chrome_bin" "$cdp_port" "$profile_dir" &
+    ' agent-browser-chrome "$chrome_bin" "$cdp_port" "$profile_dir" "$download_dir" "$netlog_path" &
     disown 2>/dev/null || true
 
     # Reconcile Chrome's actual PID via pgrep on the unique --user-data-dir
@@ -372,7 +545,11 @@ cmd_start() {
     done
     if [ -z "$chrome_pid" ]; then
         _warn "Chrome failed to start. stderr:"
-        sed 's/^/  /' "$profile_dir/chrome.stderr.log" 2>/dev/null >&2 || true
+        # stderr log lives under the 0700 devbox-agent profile dir, so
+        # the developer can't read it directly; route through sudo cat.
+        sudo cat "$profile_dir/chrome.stderr.log" 2>/dev/null \
+            | sed 's/^/  /' >&2 || true
+        _cleanup_session_dirs "$profile_dir" "$download_dir" "${container}-"
         exit 1
     fi
 
@@ -407,6 +584,7 @@ cmd_start() {
         # failure later.
         if ! command -v socat >/dev/null 2>&1; then
             sudo -u devbox-agent kill "$chrome_pid" 2>/dev/null || true
+            _cleanup_session_dirs "$profile_dir" "$download_dir" "${container}-"
             _die "host socat not found. Install it (Debian/Ubuntu: sudo apt-get install -y socat; Fedora/RHEL: sudo dnf install -y socat; Arch: sudo pacman -S socat; macOS: brew install socat). It is required for the Agent-browser host relay on this platform."
         fi
         _log "Starting host relay on ${resolved_hdi}:${cdp_port} -> 127.0.0.1:${cdp_port}..."
@@ -464,6 +642,7 @@ cmd_start() {
         if [ -n "$relay_pid" ]; then
             sudo -u devbox-agent kill "$relay_pid" 2>/dev/null || true
         fi
+        _cleanup_session_dirs "$profile_dir" "$download_dir" "${container}-"
         exit 1
     fi
 
@@ -483,6 +662,7 @@ cmd_start() {
         if [ -n "$relay_pid" ]; then
             sudo -u devbox-agent kill "$relay_pid" 2>/dev/null || true
         fi
+        _cleanup_session_dirs "$profile_dir" "$download_dir" "${container}-"
         exit 1
     fi
 
@@ -509,8 +689,8 @@ cmd_start() {
   "cdp_port_host": ${cdp_port},
   "proxy_port_host": null,
   "profile_dir": "${profile_dir}",
-  "download_dir": null,
-  "netlog_path": null,
+  "download_dir": "${download_dir}",
+  "netlog_path": "${netlog_path}",
   "created_at": "${created_at}",
   "active_network_window": null
 }
@@ -577,11 +757,13 @@ cmd_stop() {
         return 0
     fi
 
-    local chrome_pid bridge_pid relay_pid profile_dir cdp_port
+    local chrome_pid bridge_pid relay_pid profile_dir download_dir netlog_path cdp_port
     chrome_pid="$(_state_get "$state_file" chrome_pid || true)"
     bridge_pid="$(_state_get "$state_file" bridge_pid_in_container || true)"
     relay_pid="$(_state_get "$state_file" relay_pid_host || true)"
     profile_dir="$(_state_get "$state_file" profile_dir || true)"
+    download_dir="$(_state_get "$state_file" download_dir || true)"
+    netlog_path="$(_state_get "$state_file" netlog_path || true)"
     cdp_port="$(_state_get "$state_file" cdp_port_host || true)"
 
     local chrome_marker="--user-data-dir=$profile_dir"
@@ -627,16 +809,80 @@ cmd_stop() {
         _log "Bridge PID ${bridge_pid:-?} already gone, reused, or container stopped."
     fi
 
+    # Archive netlog before removing the profile dir. Extract the ISO
+    # timestamp from the profile dir's basename (suffix after the
+    # container name) so the archived filename is anchored to the
+    # session that produced it. Fall back to "now" if for any reason
+    # the suffix can't be parsed — the moved file is still the same
+    # bytes, only the filename suffix differs.
+    #
+    # The `netlog_path` is sourced from a developer-writable state JSON,
+    # so it MUST live under the managed profile dir — otherwise the sudo
+    # mv could be redirected. Same parent check is applied to profile_dir
+    # itself, plus an inside-parent constraint on netlog_path against the
+    # corresponding profile_dir. Existence tests use `sudo test` because
+    # the 0700 parent blocks the developer from stat'ing through it.
+    local netlog_is_managed=false
+    if [ -n "$netlog_path" ] && [ "$netlog_path" != "null" ] \
+        && [ -n "$profile_dir" ] && [ "$profile_dir" != "null" ] \
+        && _is_managed_path "$profile_dir" "$AGENT_PROFILES_DIR" "${container}-" \
+        && _is_managed_path "$netlog_path" "$profile_dir"; then
+        netlog_is_managed=true
+    fi
+    if [ "$netlog_is_managed" = true ] && sudo test -f "$netlog_path"; then
+        if [ ! -d "$AGENT_NETLOG_ARCHIVE_DIR" ]; then
+            sudo mkdir -p "$AGENT_NETLOG_ARCHIVE_DIR"
+            sudo chown devbox-agent: "$AGENT_NETLOG_ARCHIVE_DIR"
+            sudo chmod 750 "$AGENT_NETLOG_ARCHIVE_DIR"
+        fi
+        local ts_suffix archive_path
+        ts_suffix="${profile_dir##*/"${container}"-}"
+        [ "$ts_suffix" = "$profile_dir" ] && ts_suffix=""
+        [ -n "$ts_suffix" ] || ts_suffix="$(date -u +"%Y%m%dT%H%M%SZ")"
+        # Final defence: the archive target must itself live under the
+        # archive dir and its basename must start with `${container}-`,
+        # protecting against a state file with crafted whitespace or path
+        # separators in container/ts that survived earlier checks.
+        archive_path="${AGENT_NETLOG_ARCHIVE_DIR}/${container}-${ts_suffix}.netlog.json"
+        if _is_managed_path "$archive_path" "$AGENT_NETLOG_ARCHIVE_DIR" "${container}-"; then
+            if sudo mv -- "$netlog_path" "$archive_path" 2>/dev/null; then
+                sudo chown devbox-agent: "$archive_path" 2>/dev/null || true
+                sudo chmod 640 "$archive_path" 2>/dev/null || true
+                _log "Archived netlog: ${archive_path}"
+            else
+                _warn "Failed to archive netlog from ${netlog_path} to ${archive_path}."
+            fi
+        else
+            _warn "Refusing to archive netlog to suspicious path ${archive_path}."
+        fi
+    elif [ -n "$netlog_path" ] && [ "$netlog_path" != "null" ] && [ "$netlog_is_managed" != true ]; then
+        _warn "State netlog_path '${netlog_path}' is outside the managed profile dir; skipping archive."
+    fi
+
+    # Remove the ephemeral profile and download dirs — they are session-
+    # scoped per ADR 0010 § Actor 1, and any forensic value has already
+    # been captured by the archived netlog above. Each path is validated
+    # against its managed parent AND the `${container}-` session prefix
+    # so a tampered state JSON cannot redirect rm at a sibling session.
+    if [ -n "$profile_dir" ] && [ "$profile_dir" != "null" ] \
+        && _is_managed_path "$profile_dir" "$AGENT_PROFILES_DIR" "${container}-" \
+        && sudo test -d "$profile_dir"; then
+        sudo rm -rf -- "$profile_dir" || _warn "Failed to remove profile dir ${profile_dir}."
+        _log "Removed profile dir ${profile_dir}."
+    elif [ -n "$profile_dir" ] && [ "$profile_dir" != "null" ]; then
+        _warn "State profile_dir '${profile_dir}' is outside the managed parent or session; skipping rm."
+    fi
+    if [ -n "$download_dir" ] && [ "$download_dir" != "null" ] \
+        && _is_managed_path "$download_dir" "$AGENT_DOWNLOADS_DIR" "${container}-" \
+        && sudo test -d "$download_dir"; then
+        sudo rm -rf -- "$download_dir" || _warn "Failed to remove download dir ${download_dir}."
+        _log "Removed download dir ${download_dir}."
+    elif [ -n "$download_dir" ] && [ "$download_dir" != "null" ]; then
+        _warn "State download_dir '${download_dir}' is outside the managed parent or session; skipping rm."
+    fi
+
     rm -f -- "$state_file"
     _log "Removed state file ${state_file}."
-
-    # Profile directory is intentionally kept — useful for post-session
-    # forensics (Chrome's saved cookies, the netlog once slice 03 lands).
-    # Cleanup policy belongs to a later slice; document so future readers
-    # don't expect rm here.
-    if [ -n "$profile_dir" ] && [ -d "$profile_dir" ]; then
-        _log "Profile dir kept for post-session inspection: ${profile_dir}"
-    fi
 }
 
 # --- subcommand: status ------------------------------------------------------

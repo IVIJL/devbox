@@ -1229,6 +1229,14 @@ graceful_stop_container() {
         docker exec -u root "$name" /usr/local/bin/teardown-allow-for-window --now 2>/dev/null || true
     fi
 
+    # Close any live Agent-browser session BEFORE docker stop — the broker
+    # signals the in-container bridge socat via `docker exec`, which needs
+    # the container still alive. Silent no-op when no session JSON exists.
+    # Best-effort: a failed teardown must not block container shutdown.
+    if [ -x "$DEVBOX_DIR/scripts/closeout-agent-browser-on-stop.sh" ]; then
+        "$DEVBOX_DIR/scripts/closeout-agent-browser-on-stop.sh" "$name" || true
+    fi
+
     docker exec -u node "$name" bash -c '
         if [ -S "$XDG_RUNTIME_DIR/docker.sock" ] && docker info >/dev/null 2>&1; then
             inner=$(docker ps --format "{{.ID}} {{.Names}}" 2>/dev/null)

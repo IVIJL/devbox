@@ -13,6 +13,10 @@ build.log
 .DS_Store
 Thumbs.db
 
+# Python bytecode caches (agent-browser-proxy.py, agent-browser-summarize.py)
+__pycache__/
+*.pyc
+
 # Local issue tracker (Matt Pocock skills convention)
 .scratch/
 

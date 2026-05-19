@@ -89,6 +89,11 @@ AGENT_PROXY_BYPASS_LIST="127.0.0.1;localhost;*.test;*.127.0.0.1.sslip.io"
 # it works regardless of how the broker was invoked.
 AGENT_PROXY_BIN="${DEVBOX_DIR}/scripts/agent-browser-proxy.py"
 
+# Path to the summary generator. Invoked from `cmd_stop` after the
+# netlog and proxy log are archived so the resulting summary.md sits
+# next to its inputs under `/var/log/devbox/agent-browser/`.
+AGENT_SUMMARIZE_BIN="${DEVBOX_DIR}/scripts/agent-browser-summarize.py"
+
 # Container-side CDP endpoint exposed by the bridge socat. Stable so the
 # agent-browser CLI always sees the same URL regardless of which random
 # host port Chrome chose this session. ADR 0010 § Actor 2.
@@ -1448,7 +1453,7 @@ cmd_stop() {
     fi
 
     local chrome_pid bridge_pid relay_pid proxy_pid profile_dir download_dir
-    local netlog_path proxy_log_path cdp_port proxy_port
+    local netlog_path proxy_log_path cdp_port proxy_port session_created_at
     chrome_pid="$(_state_get "$state_file" chrome_pid || true)"
     bridge_pid="$(_state_get "$state_file" bridge_pid_in_container || true)"
     relay_pid="$(_state_get "$state_file" relay_pid_host || true)"
@@ -1459,6 +1464,13 @@ cmd_stop() {
     proxy_log_path="$(_state_get "$state_file" proxy_log_path || true)"
     cdp_port="$(_state_get "$state_file" cdp_port_host || true)"
     proxy_port="$(_state_get "$state_file" proxy_port_host || true)"
+    session_created_at="$(_state_get "$state_file" created_at || true)"
+
+    # Captured-on-success paths threaded into the post-archive summary
+    # call below. Empty when the corresponding archive did not happen
+    # (missing live file, managed-path check failed, or `sudo mv` errored
+    # out). The summarizer accepts a missing path for either input.
+    local archived_netlog_path="" archived_proxy_log_path=""
 
     local chrome_marker="--user-data-dir=$profile_dir"
     local relay_marker="TCP-LISTEN:${cdp_port}"
@@ -1561,6 +1573,7 @@ cmd_stop() {
                 sudo chown devbox-agent: "$archive_path" 2>/dev/null || true
                 sudo chmod 640 "$archive_path" 2>/dev/null || true
                 _log "Archived netlog: ${archive_path}"
+                archived_netlog_path="$archive_path"
             else
                 _warn "Failed to archive netlog from ${netlog_path} to ${archive_path}."
             fi
@@ -1598,6 +1611,7 @@ cmd_stop() {
                 sudo chown devbox-agent: "$proxy_archive_path" 2>/dev/null || true
                 sudo chmod 640 "$proxy_archive_path" 2>/dev/null || true
                 _log "Archived proxy log: ${proxy_archive_path}"
+                archived_proxy_log_path="$proxy_archive_path"
             else
                 _warn "Failed to archive proxy log from ${proxy_log_path} to ${proxy_archive_path}."
             fi
@@ -1606,6 +1620,62 @@ cmd_stop() {
         fi
     elif [ -n "$proxy_log_path" ] && [ "$proxy_log_path" != "null" ] && [ "$proxy_log_is_managed" != true ]; then
         _warn "State proxy_log_path '${proxy_log_path}' is outside the managed profile dir; skipping archive."
+    fi
+
+    # Generate the session summary alongside the archives. Runs as
+    # `devbox-agent` so the output file inherits the same owner as the
+    # raw archives — readable to the user via group membership on the
+    # archive dir (ADR 0010 § Tamper-proof property). Both inputs are
+    # optional: a session that crashed before either log was written
+    # still gets a summary noting that no logs were captured. Summary
+    # failure is non-fatal; the broker's stop path keeps going so a
+    # malformed netlog or a missing python3 cannot block teardown.
+    if [ -f "$AGENT_SUMMARIZE_BIN" ]; then
+        local summary_ts_suffix summary_path session_ended_at
+        summary_ts_suffix=""
+        if [ -n "$profile_dir" ] && [ "$profile_dir" != "null" ]; then
+            summary_ts_suffix="${profile_dir##*/"${container}"-}"
+            [ "$summary_ts_suffix" = "$profile_dir" ] && summary_ts_suffix=""
+        fi
+        [ -n "$summary_ts_suffix" ] || summary_ts_suffix="$(date -u +"%Y%m%dT%H%M%SZ")"
+        summary_path="${AGENT_NETLOG_ARCHIVE_DIR}/${container}-${summary_ts_suffix}.summary.md"
+        if _is_managed_path "$summary_path" "$AGENT_NETLOG_ARCHIVE_DIR" "${container}-"; then
+            session_ended_at="$(_iso_utc_now)"
+            local summary_cmd=(sudo -u devbox-agent python3 "$AGENT_SUMMARIZE_BIN"
+                "--output" "$summary_path"
+                "--session-start" "${session_created_at:-unknown}"
+                "--session-end" "$session_ended_at"
+                "--container" "$container")
+            [ -n "$archived_netlog_path" ] \
+                && summary_cmd+=("--netlog" "$archived_netlog_path")
+            [ -n "$archived_proxy_log_path" ] \
+                && summary_cmd+=("--proxy-log" "$archived_proxy_log_path")
+            # Hand the staged allowlist (devbox-agent-readable copy used
+            # by the proxy this session) to the summarizer so harvest-
+            # mode requests that already match a rule are classified as
+            # in-allowlist rather than out-of-allowlist. The user's
+            # original ~/.config copy is 0600 under $HOME — devbox-agent
+            # cannot traverse into it. Profile dir is still on disk at
+            # this point; rm-rf below happens after this block.
+            local staged_allowlist=""
+            if [ -n "$profile_dir" ] && [ "$profile_dir" != "null" ] \
+                && _is_managed_path "$profile_dir" "$AGENT_PROFILES_DIR" "${container}-"; then
+                staged_allowlist="${profile_dir}/allowed-domains.conf"
+                if sudo test -f "$staged_allowlist"; then
+                    summary_cmd+=("--allowlist" "$staged_allowlist")
+                fi
+            fi
+            if "${summary_cmd[@]}"; then
+                sudo chmod 640 "$summary_path" 2>/dev/null || true
+                _log "Wrote session summary: ${summary_path}"
+            else
+                _warn "Summary generator exited non-zero; session teardown continues."
+            fi
+        else
+            _warn "Refusing to write summary to suspicious path ${summary_path}."
+        fi
+    else
+        _warn "Summary generator missing at ${AGENT_SUMMARIZE_BIN}; skipping."
     fi
 
     # Remove the ephemeral profile and download dirs — they are session-

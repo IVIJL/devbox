@@ -746,6 +746,7 @@ EOF
             --log-net-log="$5" \
             --proxy-server="http://127.0.0.1:$6" \
             --proxy-bypass-list="$7" \
+            --test-type \
             </dev/null \
             >"$3/chrome.stdout.log" \
             2>"$3/chrome.stderr.log"
@@ -856,11 +857,18 @@ EOF
     # image missing socat) must NOT escape set -e before rollback. Wrap
     # in an if/then/exit so the rollback path is reachable on every
     # failure mode below.
+    # Force IPv4 (`TCP4:`) for the upstream side. Docker Desktop on WSL2
+    # gives `host.docker.internal` a dual-stack response — both an IPv4
+    # (192.168.65.254) and an IPv6 ULA (fdc4:...:254). Linux glibc per
+    # RFC 6724 prefers IPv6, but Docker Desktop's forwarding to the host
+    # loopback Chrome only covers IPv4. Without TCP4 the in-container
+    # socat happily connects to the IPv6 address, never reaches host
+    # Chrome, and exits — leaving the CDP smoke test below to fail.
     _log "Starting in-container bridge: ${container}:127.0.0.1:${BRIDGE_CONTAINER_PORT} -> host.docker.internal:${cdp_port}"
     if ! docker exec -d "$container" \
         socat \
             "TCP-LISTEN:${BRIDGE_CONTAINER_PORT},bind=127.0.0.1,fork,reuseaddr" \
-            "TCP:host.docker.internal:${cdp_port}"; then
+            "TCP4:host.docker.internal:${cdp_port}"; then
         _warn "docker exec -d socat failed in ${container}; rolling back Chrome, relay, and proxy."
         sudo -u devbox-agent kill "$chrome_pid" 2>/dev/null || true
         if [ -n "$relay_pid" ]; then

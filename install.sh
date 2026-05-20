@@ -511,6 +511,32 @@ stage_agent_browser_helpers() {
     fi
 }
 
+# --- Upstream agent-browser skill (ADR 0011) ---------------------------------
+# Delegates to scripts/ensure-upstream-agent-browser-skill.sh — the same
+# script `devbox update` self-heals existing installs through, so install-time
+# and upgrade-time paths stay in lockstep. The helper invokes
+# `npx skills add vercel-labs/agent-browser …` headlessly. Soft failures
+# (npx missing, network down) surface as install warnings instead of aborting
+# the install.
+
+setup_upstream_agent_browser_skill() {
+    info "Installing upstream vercel-labs/agent-browser skill..."
+
+    local provisioner="$DEVBOX_DIR/scripts/ensure-upstream-agent-browser-skill.sh"
+    if [ ! -x "$provisioner" ]; then
+        warn "scripts/ensure-upstream-agent-browser-skill.sh missing or non-executable; skipping."
+        SKIPPED+=("upstream agent-browser skill (provisioner script missing)")
+        return
+    fi
+
+    if "$provisioner"; then
+        CONFIGURED+=("upstream agent-browser skill (~/.agents/skills/agent-browser)")
+    else
+        warn "Failed to install upstream agent-browser skill — see warnings above."
+        SKIPPED+=("upstream agent-browser skill (install failed; see warnings above)")
+    fi
+}
+
 # --- Agent-browser allowlist example file (ADR 0010) -------------------------
 # Ships a documented `.example` copy of the agent-browser allowlist so the
 # user has a template to copy when they decide to enable the feature. We
@@ -885,10 +911,11 @@ main() {
         msg "  5. Set up /var/log/devbox/allow-for (root-owned harvest log dir; sudo prompt)"
         msg "  6. Create devbox-agent OS user + add $USER to that group (agent-browser feature; sudo prompt)"
         msg "  7. Stage agent-browser Python helpers to /usr/local/lib/devbox (sudo prompt)"
-        msg "  8. Install agent-browser allowlist example to \$HOME/.config/devbox"
-        msg "  9. Install 'devbox' command to $SYMLINK_PATH"
-        msg " 10. Optionally generate Claude Code token for containers"
-        msg " 11. Check Docker availability"
+        msg "  8. Install upstream vercel-labs/agent-browser skill via 'npx skills add' (network)"
+        msg "  9. Install agent-browser allowlist example to \$HOME/.config/devbox"
+        msg " 10. Install 'devbox' command to $SYMLINK_PATH"
+        msg " 11. Optionally generate Claude Code token for containers"
+        msg " 12. Check Docker availability"
         echo ""
         if ! confirm "Continue?"; then
             msg "Aborted."
@@ -919,6 +946,9 @@ main() {
 
     echo ""
     stage_agent_browser_helpers
+
+    echo ""
+    setup_upstream_agent_browser_skill
 
     echo ""
     setup_agent_allowlist_example

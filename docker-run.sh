@@ -1805,6 +1805,15 @@ if [ "$MODE" = "update" ]; then
         "$DEVBOX_DIR/scripts/ensure-agent-browser-host-state.sh" --quiet-if-noop || true
     fi
 
+    # Upstream agent-browser skill self-heal (ADR 0011). Refreshes the
+    # vercel-labs/agent-browser skill in ~/.agents/skills/agent-browser/ so
+    # `devbox update` is the single seam through which upstream skill
+    # revisions land. Soft-fails (npx missing, network down) surface as
+    # warnings and do not break the update.
+    if [ -x "$DEVBOX_DIR/scripts/ensure-upstream-agent-browser-skill.sh" ]; then
+        "$DEVBOX_DIR/scripts/ensure-upstream-agent-browser-skill.sh" --quiet-if-noop || true
+    fi
+
     if [ "${DEVBOX_UPDATE_PULLED:-}" = "1" ]; then
         # Install or refresh zsh completion file (no .zshrc modifications here)
         _completion_src="$DEVBOX_DIR/completions/_devbox"

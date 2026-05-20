@@ -328,9 +328,20 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _send_403(self, host: str) -> None:
         body = (
-            "blocked by devbox agent-browser default mode; open a network "
-            "window with `devbox agent-browser allow-for N`. "
-            f"target: {host}\n"
+            f"devbox agent-browser blocked: {host}\n"
+            "\n"
+            "Default mode only allows the configured agent-browser allowlist;\n"
+            "everything else is denied at the host proxy.\n"
+            "\n"
+            "To temporarily allow ALL domains for this session, on host run:\n"
+            "  devbox agent-browser allow-for <minutes> [project]\n"
+            "\n"
+            "Or add this host durably to the agent-browser allowlist:\n"
+            "  ~/.config/devbox/agent-browser-allowed-domains.conf\n"
+            "\n"
+            "Note: for HTTPS the browser renders ERR_TUNNEL_CONNECTION_FAILED\n"
+            "instead of this message because Chrome discards the proxy response\n"
+            "body for CONNECT failures. Same denial reason applies.\n"
         ).encode("utf-8")
         try:
             self.send_response(403, "Forbidden")

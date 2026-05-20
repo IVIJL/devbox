@@ -88,6 +88,45 @@ Inside the container, the agent-browser CLI always sees a single
 endpoint: `AGENT_BROWSER_CDP_URL=ws://127.0.0.1:9222/...`. Platform
 differences are entirely on the host side.
 
+#### Container-side firewall slot (Docker Desktop)
+
+The default-deny OUTPUT chain (ADR 0001) only accepts traffic to
+`172.18.0.0/24` (the Docker bridge subnet) and the DNS-driven
+allowed-domains ipset. On Docker Desktop (WSL2, macOS),
+`host.docker.internal` resolves to a magic IP (typically
+`192.168.65.254`) outside both — the in-container socat above would
+hit "No route to host" (ICMP admin-prohibited rendered as
+`EHOSTUNREACH`) and the CDP smoke test would roll the session back.
+
+The broker opens a session-scoped exception that mirrors the
+`allow-for` window pattern (ADR 0009, `start-allow-for-window.sh`):
+`start-agent-browser-host-allow <IP> <PORT>` runs in the container via
+`docker exec -u root` — no NOPASSWD sudoers added (ADR 0003) — and
+inserts `ACCEPT -p tcp -d <IP> --dport <PORT>` immediately before the
+final OUTPUT REJECT. Scoping to a single TCP port (the per-session
+random CDP port) keeps the firewall hole as narrow as the bridge
+actually needs — arbitrary host services on the same magic IP remain
+firewalled for the duration of the session. `cmd_stop` and every
+rollback path in `cmd_start` close the slot via the matching
+`stop-agent-browser-host-allow` helper.
+
+The IP is resolved with `getent ahostsv4 host.docker.internal` (not
+`getent hosts`): Docker Desktop on WSL2 returns a dual-stack record,
+glibc per RFC 6724 picks IPv6 first, but Docker Desktop only forwards
+the IPv4 magic IP and the helper validates dotted IPv4. Forcing v4
+here keeps the three consumers — host relay bind, firewall ACCEPT,
+in-container `TCP4:` socat upstream — pinned to the same address.
+
+On native Linux + Docker CE the resolved IP is the Docker bridge
+gateway, already inside the pre-existing `ACCEPT -d 172.18.0.0/24`
+rule — the session-scoped insert is then a harmless idempotent
+redundancy. The same code path therefore covers both platforms.
+
+The IP is persisted as `host_allow_ip` in the session state JSON so
+`cmd_stop` knows exactly which slot to release even across host
+broker restarts; the port is read from the already-persisted
+`cdp_port_host` field.
+
 ### Actor 3: Agent-browser proxy
 
 A small daemon (Python or Go, ~150 LoC) run as `devbox-agent`,

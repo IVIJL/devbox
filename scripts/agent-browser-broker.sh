@@ -518,7 +518,7 @@ _sweep_if_stale() {
     file="$(_state_file "$container")"
     [ -f "$file" ] || return 0
 
-    local chrome_pid bridge_pid relay_pid proxy_pid profile_dir download_dir cdp_port proxy_port
+    local chrome_pid bridge_pid relay_pid proxy_pid profile_dir download_dir cdp_port proxy_port host_allow_ip
     chrome_pid="$(_state_get "$file" chrome_pid || true)"
     bridge_pid="$(_state_get "$file" bridge_pid_in_container || true)"
     relay_pid="$(_state_get "$file" relay_pid_host || true)"
@@ -527,6 +527,7 @@ _sweep_if_stale() {
     download_dir="$(_state_get "$file" download_dir || true)"
     cdp_port="$(_state_get "$file" cdp_port_host || true)"
     proxy_port="$(_state_get "$file" proxy_port_host || true)"
+    host_allow_ip="$(_state_get "$file" host_allow_ip || true)"
 
     # Identity markers: cmdline substrings unique to this session. PID
     # reuse after reboot would otherwise make an unrelated process look
@@ -582,6 +583,21 @@ _sweep_if_stale() {
         && sudo test -d "$download_dir"; then
         _warn "Cleaning up stale session resources from ${download_dir}..."
         sudo rm -rf -- "$download_dir" || _warn "Failed to remove stale download dir ${download_dir}."
+    fi
+
+    # Close any container-side firewall slot the crashed session left
+    # behind. The next start picks a fresh random CDP port, so without
+    # this the old ACCEPT for `host_allow_ip:cdp_port` would linger
+    # until a container restart (init-firewall flushes iptables on
+    # boot). The stop helper is idempotent — a no-op if the rule is
+    # already gone, harmless if the container restarted between crash
+    # and sweep.
+    if [ -n "$host_allow_ip" ] && [ "$host_allow_ip" != "null" ] \
+        && [ -n "$cdp_port" ] && [ "$cdp_port" != "null" ] \
+        && _container_running "$container"; then
+        _warn "Releasing stale container firewall slot for ${host_allow_ip}:${cdp_port}..."
+        docker exec -u root "$container" \
+            /usr/local/bin/stop-agent-browser-host-allow "$host_allow_ip" "$cdp_port" 2>/dev/null || true
     fi
 
     rm -f -- "$file"
@@ -797,8 +813,16 @@ EOF
     # we treat that as "no relay needed".
     local relay_pid=""
     local resolved_hdi
+    # `getent ahostsv4` (vs `getent hosts`) forces IPv4-only resolution. On
+    # Docker Desktop dual-stack setups host.docker.internal carries both an
+    # IPv4 (192.168.65.254) and an IPv6 ULA; glibc per RFC 6724 returns the
+    # IPv6 first, but Docker Desktop only forwards the IPv4 magic IP, the
+    # in-container bridge below uses `TCP4:`, and the firewall slot helper
+    # rejects anything that isn't dotted IPv4. Pinning to v4 here keeps all
+    # three consumers (relay bind, firewall ACCEPT, socat upstream) on the
+    # same address.
     resolved_hdi="$(docker exec "$container" \
-        getent hosts host.docker.internal 2>/dev/null | awk '{print $1}' | head -1 || true)"
+        getent ahostsv4 host.docker.internal 2>/dev/null | awk '{print $1}' | head -1 || true)"
 
     if [ -n "$resolved_hdi" ] && [ "$resolved_hdi" != "127.0.0.1" ]; then
         # Host-side socat is required for the relay. On native Linux /
@@ -847,6 +871,39 @@ EOF
         fi
     fi
 
+    # Container-side firewall slot for the CDP target IP+port. ADR 0001's
+    # default-deny OUTPUT chain only accepts traffic to 172.18.0.0/24 (the
+    # Docker bridge subnet) and the DNS-driven allowed-domains ipset. On
+    # Docker Desktop, host.docker.internal resolves to 192.168.65.254 — a
+    # magic IP outside both — so the in-container socat bridge below would
+    # hit "No route to host" (ICMP admin-prohibited rendered as
+    # EHOSTUNREACH) and the CDP smoke test would time out. Open a
+    # session-scoped exception mirroring the allow-for window pattern
+    # (start-allow-for-window.sh): insert ACCEPT for tcp/$cdp_port to
+    # $resolved_hdi just before the final OUTPUT REJECT, and remove it in
+    # cmd_stop / on rollback. Scoping to a single TCP port keeps the hole
+    # as narrow as the bridge needs — arbitrary host services on the same
+    # magic IP remain firewalled. On native Linux this is a no-op
+    # redundancy — resolved_hdi is the bridge gateway, already covered by
+    # the 172.18.0.0/24 ACCEPT — but the rule add is idempotent so we
+    # don't branch on platform.
+    local host_allow_ip=""
+    if [ -n "$resolved_hdi" ] && [ "$resolved_hdi" != "127.0.0.1" ]; then
+        if ! docker exec -u root "$container" \
+                /usr/local/bin/start-agent-browser-host-allow "$resolved_hdi" "$cdp_port"; then
+            _warn "Failed to open container firewall slot for ${resolved_hdi}:${cdp_port}; rolling back Chrome, relay, and proxy."
+            _warn "  (If you just pulled new devbox code, run 'devbox update' to rebuild the container with the new helper script.)"
+            sudo -u devbox-agent kill "$chrome_pid" 2>/dev/null || true
+            if [ -n "$relay_pid" ]; then
+                sudo -u devbox-agent kill "$relay_pid" 2>/dev/null || true
+            fi
+            sudo -u devbox-agent kill "$proxy_pid" 2>/dev/null || true
+            _cleanup_session_dirs "$profile_dir" "$download_dir" "${container}-"
+            exit 1
+        fi
+        host_allow_ip="$resolved_hdi"
+    fi
+
     # In-container bridge: socat inside the container's netns, listening on
     # 127.0.0.1:9222, forwarding to host.docker.internal:<cdp_port>.
     # --add-host=host.docker.internal:host-gateway (added unconditionally
@@ -870,6 +927,10 @@ EOF
             "TCP-LISTEN:${BRIDGE_CONTAINER_PORT},bind=127.0.0.1,fork,reuseaddr" \
             "TCP4:host.docker.internal:${cdp_port}"; then
         _warn "docker exec -d socat failed in ${container}; rolling back Chrome, relay, and proxy."
+        if [ -n "$host_allow_ip" ]; then
+            docker exec -u root "$container" \
+                /usr/local/bin/stop-agent-browser-host-allow "$host_allow_ip" "$cdp_port" 2>/dev/null || true
+        fi
         sudo -u devbox-agent kill "$chrome_pid" 2>/dev/null || true
         if [ -n "$relay_pid" ]; then
             sudo -u devbox-agent kill "$relay_pid" 2>/dev/null || true
@@ -891,6 +952,10 @@ EOF
     done
     if [ -z "$bridge_pid" ]; then
         _warn "Bridge socat did not register inside ${container}; rolling back Chrome, relay, and proxy."
+        if [ -n "$host_allow_ip" ]; then
+            docker exec -u root "$container" \
+                /usr/local/bin/stop-agent-browser-host-allow "$host_allow_ip" "$cdp_port" 2>/dev/null || true
+        fi
         sudo -u devbox-agent kill "$chrome_pid" 2>/dev/null || true
         if [ -n "$relay_pid" ]; then
             sudo -u devbox-agent kill "$relay_pid" 2>/dev/null || true
@@ -915,6 +980,8 @@ EOF
     # `netlog_path` convention.
     local relay_pid_json="null"
     [ -n "$relay_pid" ] && relay_pid_json="$relay_pid"
+    local host_allow_ip_json="null"
+    [ -n "$host_allow_ip" ] && host_allow_ip_json="\"${host_allow_ip}\""
     local state_file
     state_file="$(_state_file "$container")"
     cat > "$state_file" <<EOF
@@ -930,6 +997,7 @@ EOF
   "download_dir": "${download_dir}",
   "netlog_path": "${netlog_path}",
   "proxy_log_path": "${proxy_log_live}",
+  "host_allow_ip": ${host_allow_ip_json},
   "created_at": "${created_at}",
   "active_network_window": null
 }
@@ -1676,6 +1744,7 @@ cmd_stop() {
 
     local chrome_pid bridge_pid relay_pid proxy_pid profile_dir download_dir
     local netlog_path proxy_log_path cdp_port proxy_port session_created_at
+    local host_allow_ip
     chrome_pid="$(_state_get "$state_file" chrome_pid || true)"
     bridge_pid="$(_state_get "$state_file" bridge_pid_in_container || true)"
     relay_pid="$(_state_get "$state_file" relay_pid_host || true)"
@@ -1687,6 +1756,7 @@ cmd_stop() {
     cdp_port="$(_state_get "$state_file" cdp_port_host || true)"
     proxy_port="$(_state_get "$state_file" proxy_port_host || true)"
     session_created_at="$(_state_get "$state_file" created_at || true)"
+    host_allow_ip="$(_state_get "$state_file" host_allow_ip || true)"
 
     # Captured-on-success paths threaded into the post-archive summary
     # call below. Empty when the corresponding archive did not happen
@@ -1778,6 +1848,21 @@ PY
         docker exec "$container" kill "$bridge_pid" 2>/dev/null || true
     else
         _log "Bridge PID ${bridge_pid:-?} already gone, reused, or container stopped."
+    fi
+
+    # Close the container-side firewall slot that cmd_start opened for the
+    # CDP host IP+port. Idempotent — the stop helper removes all matching
+    # ACCEPT rules. Skipped if the container is no longer running
+    # (init-firewall flushes iptables on the next start anyway) or if the
+    # CDP port is unknown (older state file from before port-scoping —
+    # init-firewall has flushed the rule across any container restart, so
+    # nothing to clean).
+    if [ -n "$host_allow_ip" ] && [ "$host_allow_ip" != "null" ] \
+        && [ -n "$cdp_port" ] && [ "$cdp_port" != "null" ] \
+        && _container_running "$container"; then
+        _log "Releasing container firewall slot for ${host_allow_ip}:${cdp_port}..."
+        docker exec -u root "$container" \
+            /usr/local/bin/stop-agent-browser-host-allow "$host_allow_ip" "$cdp_port" 2>/dev/null || true
     fi
 
     # Archive netlog before removing the profile dir. Extract the ISO

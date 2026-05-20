@@ -344,6 +344,8 @@ COPY scripts/start-allow-for-window.sh /usr/local/bin/start-allow-for-window
 COPY scripts/teardown-allow-for-window.sh /usr/local/bin/teardown-allow-for-window
 COPY scripts/show-allow-for-status.sh /usr/local/bin/show-allow-for-status
 COPY scripts/closeout-allow-for-on-restart.sh /usr/local/bin/closeout-allow-for-on-restart
+COPY scripts/start-agent-browser-host-allow.sh /usr/local/bin/start-agent-browser-host-allow
+COPY scripts/stop-agent-browser-host-allow.sh /usr/local/bin/stop-agent-browser-host-allow
 
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/n /usr/local/bin/nx /usr/local/bin/start-rootless-docker.sh \
@@ -352,7 +354,9 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/start-allow-for-window \
     /usr/local/bin/teardown-allow-for-window \
     /usr/local/bin/show-allow-for-status \
-    /usr/local/bin/closeout-allow-for-on-restart
+    /usr/local/bin/closeout-allow-for-on-restart \
+    /usr/local/bin/start-agent-browser-host-allow \
+    /usr/local/bin/stop-agent-browser-host-allow
 
 # Sudo with password — prevents AI agents from modifying firewall rules
 # Password is injected via --mount=type=secret (never stored in image layers/metadata)

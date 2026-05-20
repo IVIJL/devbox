@@ -261,7 +261,63 @@ Each session leaves three files on the host, owned by `devbox-agent:devbox-agent
 
 ### Per-OS prerequisites
 
-Chrome must be installed on the host (on WSL2 that means inside the Linux distro, not Windows). Cross-platform parity for the broker (per-OS user creation, Chrome detection, notification dispatch) is tracked separately and not yet documented here. See ADR 0010 § "Cross-platform abstraction" for the design.
+Chrome must be installed on the host. The **Agent-browser proxy** + **Host agent Chrome** + notification dispatcher each have an OS-specific path, all gated through `lib/host-platform.sh`.
+
+#### WSL2 (validated)
+
+The reference platform. Chrome runs as a Linux binary inside the WSL2 distro — *not* the Windows Chrome on the host. WSLg renders the window onto the Windows desktop, so the visual-audit story is identical to native Linux.
+
+Setup checklist:
+
+1. Install Chrome (or Chromium) inside the WSL2 distro:
+   ```
+   sudo apt-get install -y chromium                          # Debian/Ubuntu
+   # or Google Chrome:
+   wget -qO- https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+   echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+   sudo apt-get update && sudo apt-get install -y google-chrome-stable
+   ```
+2. Run `bash install.sh` (or `devbox update` if upgrading) — this creates the `devbox-agent` OS user + group, adds you to that group, and stages the Python helpers under `/usr/local/lib/devbox/agent-browser/`.
+3. **Re-login (or `newgrp devbox-agent`)** so the group membership applies in your current shell. Without this, you cannot read `summary.md` / netlog / proxy log artefacts at `/var/log/devbox/agent-browser/` (mode `0640`, group-readable only).
+4. Notifications use the existing **allow-for** toast pipeline (BurntToast via `powershell.exe`). No extra setup beyond what `devbox allow-for` already needed.
+
+Common WSL2 gotchas:
+
+- **`chromium` from snap** doesn't work cleanly with `--user-data-dir` under `/var/lib/devbox-agent/`. Use the apt or .deb-distributed binary.
+- **WSLg not rendering**: requires WSL version `0.65.1+` and a Windows 11 / Windows 10 22H2+ host. Run `wsl --version` on the Windows side to check.
+- **`host.docker.internal` resolution**: Docker Desktop sets this automatically; on Docker-CE-inside-WSL2 (no Docker Desktop), `docker-run.sh` passes `--add-host=host.docker.internal:host-gateway` so the in-container socat bridge can still reach the host-side Chrome.
+
+#### Native Linux + macOS
+
+Both platforms are designed-for but not yet end-to-end validated by the maintainer. The platform-dispatch helper (`lib/host-platform.sh`) covers the differences.
+
+**Native Linux** (Ubuntu, Arch, Fedora, openSUSE, Alpine):
+
+1. Install Chrome via your package manager:
+   ```
+   sudo apt-get install -y chromium                # Debian/Ubuntu
+   sudo dnf install -y chromium                    # Fedora/RHEL
+   sudo pacman -S chromium                         # Arch
+   sudo zypper install chromium                    # openSUSE
+   sudo apk add chromium                           # Alpine
+   ```
+   …or Google Chrome from `https://www.google.com/chrome/`.
+2. `bash install.sh` (same as WSL2).
+3. **Re-login (or `newgrp devbox-agent`)** to pick up the group.
+4. Make sure `notify-send` (`libnotify-bin` / `libnotify`) is installed for click-to-open toasts.
+
+**macOS:**
+
+1. Install Chrome to `/Applications/`:
+   ```
+   brew install --cask google-chrome
+   ```
+   …or download from `https://www.google.com/chrome/`.
+2. `bash install.sh`. `sysadminctl` will prompt for an administrator password (GUI dialog) the first time — used to create `devbox-agent` and the matching `devbox-agent` group, and to bind your user to it.
+3. **Open a new terminal session** so the new group membership is picked up.
+4. Toast click-to-open uses `osascript`; no extra install.
+
+Full per-OS validation is pending — see ADR 0010 § "Cross-platform abstraction".
 
 ## Port Routing
 

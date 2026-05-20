@@ -27,20 +27,25 @@ set -euo pipefail
 # against vercel-labs/skills rather than a bug in this script.
 
 QUIET_IF_NOOP=false
+REFRESH=false
 for arg in "$@"; do
     case "$arg" in
         --quiet-if-noop) QUIET_IF_NOOP=true ;;
+        --refresh) REFRESH=true ;;
         -h|--help)
             cat <<EOF
-Usage: ensure-upstream-agent-browser-skill.sh [--quiet-if-noop]
+Usage: ensure-upstream-agent-browser-skill.sh [--quiet-if-noop] [--refresh]
 
-Installs (or refreshes) the upstream vercel-labs/agent-browser skill into
+Installs the upstream vercel-labs/agent-browser skill into
 ~/.agents/skills/agent-browser/ plus the per-agent symlinks for Claude Code
-and Codex. Idempotent: a second run is a no-op when the skill is already
-present and the upstream content has not changed.
+and Codex. By default, skips when the skill is already installed so 'devbox
+update' stays quiet on steady-state. Use --refresh to force re-running the
+upstream installer and pick up new releases.
 
 Options:
   --quiet-if-noop   Suppress output when nothing needed to be done.
+  --refresh         Force re-install even when the skill is already present
+                    (the path to pick up upstream releases).
 EOF
             exit 0 ;;
         *)
@@ -126,6 +131,17 @@ check_user_skill_conflict() {
     CONFLICT_DETECTED=true
 }
 
+# Skip-if-installed: the upstream `skills` CLI prints a multi-screen ASCII
+# banner + install summary every run, so unconditionally invoking it on
+# every `devbox update` floods the terminal. Default behaviour is now
+# skip-when-present; pass --refresh to opt into the upstream re-pull
+# (used to pick up new releases of the skill).
+agents_skill_md="$HOME/.agents/skills/agent-browser/SKILL.md"
+if [ -f "$agents_skill_md" ] && [ "$REFRESH" = false ]; then
+    log "Upstream agent-browser skill already installed at ~/.agents/skills/agent-browser/ (pass --refresh to re-pull)."
+    exit 0
+fi
+
 # Exit-code contract: 0 = skill installed (or already up to date), non-zero
 # = soft failure (npx missing, network down). install.sh uses the exit code
 # to categorise the step as CONFIGURED vs SKIPPED so the final summary stays
@@ -172,18 +188,25 @@ fi
 log "Installing upstream vercel-labs/agent-browser skill via 'skills' CLI..."
 
 # Inner --yes is the `skills` CLI's own confirmation; outer --yes is npx's
-# package-install prompt. The CLI handles "already installed" gracefully on
-# re-run, so this stays idempotent.
+# package-install prompt. We capture combined stdout+stderr because the
+# skills CLI's interactive-style banner (ASCII art, box-drawing summary)
+# is verbose enough to fill a terminal screen on every `devbox update`.
+# On success we drop the captured output and emit one line; on failure we
+# surface the captured output so the user has the failure context.
 install_status=0
-if npx --yes skills@latest add vercel-labs/agent-browser \
+install_log=$(npx --yes skills@latest add vercel-labs/agent-browser \
         --skill agent-browser \
         --agent claude-code codex \
         --global \
-        --yes; then
-    loud "Upstream agent-browser skill installed/refreshed at ~/.agents/skills/agent-browser/."
+        --yes 2>&1) || install_status=$?
+
+if [ "$install_status" -eq 0 ]; then
+    loud "Upstream agent-browser skill installed at ~/.agents/skills/agent-browser/."
 else
     WARNINGS+=("'npx skills add vercel-labs/agent-browser' failed (network down or upstream registry unreachable?). Re-run 'devbox update' once connectivity is restored.")
-    install_status=1
+    warn ""
+    warn "Captured installer output:"
+    printf '%s\n' "$install_log" >&2
 fi
 
 print_summary

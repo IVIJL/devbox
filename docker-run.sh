@@ -1563,6 +1563,7 @@ case "${1:-}" in
              AGENT_BROWSER_STOP=false
              AGENT_BROWSER_TARGET=""
              AGENT_BROWSER_URLS=()
+             AGENT_BROWSER_START_FLAGS=()
              if [ "$AGENT_BROWSER_SUB" = "allow-for" ]; then
                  # Position-disambiguated parse so a project name that
                  # happens to be all digits (`devbox-123`) is not
@@ -1628,6 +1629,31 @@ case "${1:-}" in
                      exit 2
                  fi
                  unset ab_expect_project
+             elif [ "$AGENT_BROWSER_SUB" = "start" ]; then
+                 # `start` shape: [--no-open] [project]. Single known
+                 # flag plus an optional project token; anything else
+                 # is an error so we don't silently forward typos to
+                 # the broker.
+                 for arg in "$@"; do
+                     case "$arg" in
+                         '') ;;
+                         --no-open)
+                             AGENT_BROWSER_START_FLAGS+=(--no-open)
+                             ;;
+                         -*)
+                             echo "Unknown flag for agent-browser start: $arg" >&2
+                             exit 2
+                             ;;
+                         *)
+                             if [ -z "$AGENT_BROWSER_TARGET" ]; then
+                                 AGENT_BROWSER_TARGET="$arg"
+                             else
+                                 echo "Unexpected positional for agent-browser start: $arg" >&2
+                                 exit 2
+                             fi
+                             ;;
+                     esac
+                 done
              else
                  AGENT_BROWSER_TARGET="${1:-}"
              fi
@@ -2837,6 +2863,18 @@ if [ "$MODE" = "agent-browser" ]; then
             exit 2
         fi
         exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" open "$container" "${AGENT_BROWSER_URLS[@]}"
+    fi
+
+    if [ "$AGENT_BROWSER_SUB" = "start" ]; then
+        # Assemble the full argv first so the conditional flag block
+        # stays out of the exec line. Avoids the `${arr[@]+...}` guard
+        # gymnastics that `set -u` otherwise demands for empty arrays.
+        agent_start_argv=(start)
+        if [ "${#AGENT_BROWSER_START_FLAGS[@]}" -gt 0 ]; then
+            agent_start_argv+=("${AGENT_BROWSER_START_FLAGS[@]}")
+        fi
+        agent_start_argv+=("$container")
+        exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" "${agent_start_argv[@]}"
     fi
 
     exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" "$AGENT_BROWSER_SUB" "$container"

@@ -631,8 +631,21 @@ _sweep_if_stale() {
 # --- subcommand: start -------------------------------------------------------
 
 cmd_start() {
-    local container
-    container="$(_require_container_arg "${1:-}")"
+    # `--no-open` suppresses the post-startup auto-open of listening
+    # ports. Default is on: most start invocations want the URLs in
+    # tabs, and users who don't can opt out per-session or alias the
+    # flag in their shell.
+    local container="" no_open=false
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --no-open) no_open=true; shift ;;
+            --)        shift; break ;;
+            -*)        _die "Unknown flag for start: $1" ;;
+            *)         [ -z "$container" ] || _die "Unexpected positional: $1"
+                       container="$1"; shift ;;
+        esac
+    done
+    container="$(_require_container_arg "$container")"
 
     _container_exists "$container" \
         || _die "Container '${container}' does not exist. Start it first: devbox ${container#devbox-}"
@@ -1133,6 +1146,10 @@ EOF
     _log "  Proxy log (live):          ${proxy_log_live}"
     _log "  State:                     ${state_file}"
     _log "  CDP reachable from container: yes"
+
+    if [ "$no_open" = false ]; then
+        _auto_open_listening_ports "$container" "$cdp_port"
+    fi
 }
 
 # --- Network window helpers --------------------------------------------------
@@ -2160,6 +2177,60 @@ PY
         session_hint="${AGENT_NETLOG_ARCHIVE_DIR}/${container}-${session_ts}.summary.md"
         _emit_pending_event "agent-browser-session-close" "$container" "$session_ts" \
             "explicit-stop" "$duration_secs" "$session_hint"
+    fi
+}
+
+# --- URL auto-open helpers ---------------------------------------------------
+
+# Pull the listening-port URLs for `$container` from `devbox ports -m`
+# and push each into the running session as a new tab. Auto-open is a
+# convenience, not an acceptance criterion: any failure (no `devbox`
+# wrapper on PATH, machine-readable parser misbehaving, individual CDP
+# call timing out) warns but does not roll back the session. Called
+# after the CDP smoke-test in cmd_start; safe to no-op when the
+# container has no listening ports yet.
+_auto_open_listening_ports() {
+    local container="$1" cdp_port="$2"
+    [ -n "$container" ] || return 0
+    [ -n "$cdp_port" ]  || return 0
+
+    local ports_output=""
+    if ! ports_output="$("$DEVBOX_DIR/docker-run.sh" ports -m 2>/dev/null)"; then
+        _warn "Auto-open: failed to query 'devbox ports -m'; skipping."
+        return 0
+    fi
+    if [ -z "$ports_output" ]; then
+        _log "Auto-open: no listening ports on ${container}; skipping."
+        return 0
+    fi
+
+    local urls=() row_container row_port row_url
+    while IFS=$'\t' read -r row_container row_port row_url; do
+        [ "$row_container" = "$container" ] || continue
+        [ -n "$row_url" ] || continue
+        urls+=("$row_url")
+    done <<< "$ports_output"
+    : "${row_port:-}"
+
+    if [ "${#urls[@]}" -eq 0 ]; then
+        _log "Auto-open: no listening ports on ${container}; skipping."
+        return 0
+    fi
+
+    local opened=0 failed=0 url
+    for url in "${urls[@]}"; do
+        if _open_url_via_cdp "$cdp_port" "$url"; then
+            opened=$((opened + 1))
+            _log "Auto-opened: ${url}"
+        else
+            failed=$((failed + 1))
+            _warn "Auto-open failed: ${url}"
+        fi
+    done
+    if [ "$opened" -eq 0 ]; then
+        _warn "Auto-open: 0/${#urls[@]} URLs opened; session is still up — use 'devbox agent-browser open' to retry."
+    elif [ "$failed" -gt 0 ]; then
+        _warn "Auto-open: ${failed}/${#urls[@]} URL(s) failed; session is still up."
     fi
 }
 

@@ -153,7 +153,15 @@ _devbox() {
                         _describe 'agent-browser subcommands' subs
                     elif (( CURRENT == 4 )); then
                         case $words[3] in
-                            start|stop|status)
+                            start)
+                                local -a flags
+                                flags=(
+                                    '--no-open:Skip auto-opening listening-port tabs'
+                                )
+                                _describe 'start flags' flags
+                                _devbox_containers
+                                ;;
+                            stop|status)
                                 _devbox_containers
                                 ;;
                             open)
@@ -183,6 +191,13 @@ _devbox() {
                         case $words[3] in
                             allow-for)
                                 _devbox_containers
+                                ;;
+                            start)
+                                # After `--no-open`, the next positional
+                                # is the project.
+                                if [ "$words[4]" = "--no-open" ]; then
+                                    _devbox_containers
+                                fi
                                 ;;
                             open)
                                 # Container picker only after explicit

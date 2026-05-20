@@ -1098,22 +1098,29 @@ EOF
 EOF
 
     # End-to-end smoke test of the CDP path from inside the container.
-    # Chrome's CDP HTTP listener is ready a few moments after process
-    # spawn; poll for up to ~3s so we don't false-positive on a slow
-    # cold start. This is acceptance criterion #3 and the most reliable
-    # way to detect both relay misconfig (host.docker.internal pointing
-    # to a non-host-owned IP without Docker Desktop magic) and Chrome
-    # CDP listener bring-up failures.
-    local cdp_check=""
-    local cdp_retry
-    for cdp_retry in 1 2 3 4 5 6 7 8 9 10; do
-        : "$cdp_retry"
+    # Detects both relay misconfig (host.docker.internal pointing to a
+    # non-host-owned IP without Docker Desktop magic) and Chrome CDP
+    # listener bring-up failures.
+    #
+    # 15s wallclock budget. Cold-start CDP bringup occasionally needs
+    # several seconds even though Chrome is healthy and already pushing
+    # HTTP traffic via the proxy. Bail immediately if the Chrome PID is
+    # gone — no point waiting on a listener that will never come up.
+    local cdp_check="" cdp_deadline cdp_now
+    cdp_deadline=$(($(date +%s) + 15))
+    while :; do
         if cdp_check="$(docker exec "$container" \
             curl -sf --max-time 1 "http://127.0.0.1:${BRIDGE_CONTAINER_PORT}/json/version" 2>/dev/null)" \
             && [ -n "$cdp_check" ]; then
             break
         fi
         cdp_check=""
+        if ! _pid_alive_on_host "$chrome_pid"; then
+            _warn "Chrome PID ${chrome_pid} exited before CDP became reachable; aborting smoke-test wait."
+            break
+        fi
+        cdp_now="$(date +%s)"
+        [ "$cdp_now" -ge "$cdp_deadline" ] && break
         sleep 0.3
     done
 

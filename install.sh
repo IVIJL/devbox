@@ -445,18 +445,69 @@ setup_agent_user() {
         return
     fi
 
-    # Subshell so the sourced functions don't leak into the rest of install.sh.
+    local user_created=false
     if id devbox-agent >/dev/null 2>&1; then
         SKIPPED+=("devbox-agent user (already exists)")
+        user_created=true
+    else
+        # shellcheck source=lib/host-platform.sh disable=SC1091
+        if ( . "$lib" && host_platform::ensure_agent_user ); then
+            CONFIGURED+=("devbox-agent user (created)")
+            user_created=true
+        else
+            warn "Failed to create devbox-agent user — devbox agent-browser commands will not work until this is fixed."
+            SKIPPED+=("devbox-agent user (creation failed; see warnings above)")
+        fi
+    fi
+
+    if [ "$user_created" != true ]; then
         return
     fi
 
-    # shellcheck source=lib/host-platform.sh disable=SC1091
-    if ( . "$lib" && host_platform::ensure_agent_user ); then
-        CONFIGURED+=("devbox-agent user (created)")
+    # Delegate group provisioning + invoker membership to the dedicated
+    # host-state script — the same one `devbox update` self-heals
+    # through, so install-time and upgrade-time paths stay in lockstep.
+    # ADR 0010 documents the group-read path for the developer; without
+    # it the forensic output (netlog, proxy log, summary) the CLI
+    # advertises is locked behind sudo.
+    local host_state_script="$DEVBOX_DIR/scripts/ensure-agent-browser-host-state.sh"
+    if [ ! -x "$host_state_script" ]; then
+        warn "scripts/ensure-agent-browser-host-state.sh missing or non-executable; group provisioning skipped."
+        SKIPPED+=("devbox-agent group provisioning (script missing)")
+        return
+    fi
+
+    if "$host_state_script"; then
+        CONFIGURED+=("devbox-agent group provisioned ($USER membership configured)")
+        if ! id -nG "$USER" 2>/dev/null | tr ' ' '\n' | grep -qx devbox-agent; then
+            warn "Re-login (or run 'newgrp devbox-agent') so the new group membership takes effect in your current shell."
+        fi
     else
-        warn "Failed to create devbox-agent user — devbox agent-browser commands will not work until this is fixed."
-        SKIPPED+=("devbox-agent user (creation failed; see warnings above)")
+        warn "Failed to provision devbox-agent group state — agent-browser artefacts will not be readable without sudo."
+        SKIPPED+=("devbox-agent group provisioning (failed; see warnings above)")
+    fi
+}
+
+# --- Agent-browser Python helpers (ADR 0010) ---------------------------------
+# Delegates to scripts/ensure-agent-browser-helpers.sh — the same script
+# `devbox update` self-heals existing installs through, so install-time
+# and upgrade-time paths stay in lockstep.
+
+stage_agent_browser_helpers() {
+    info "Staging agent-browser Python helpers..."
+
+    local provisioner="$DEVBOX_DIR/scripts/ensure-agent-browser-helpers.sh"
+    if [ ! -x "$provisioner" ]; then
+        warn "scripts/ensure-agent-browser-helpers.sh missing or non-executable; skipping."
+        SKIPPED+=("agent-browser helpers (provisioner missing)")
+        return
+    fi
+
+    if "$provisioner"; then
+        CONFIGURED+=("agent-browser helpers staged (/usr/local/lib/devbox/agent-browser)")
+    else
+        warn "Failed to stage agent-browser helpers — devbox agent-browser will not start."
+        SKIPPED+=("agent-browser helpers (stage failed; see warnings above)")
     fi
 }
 
@@ -832,11 +883,12 @@ main() {
         msg "  3. Clone devbox to $DEVBOX_DIR"
         msg "  4. Install mkcert v$MKCERT_VERSION (HTTPS dev certs; CA install deferred to dns-install)"
         msg "  5. Set up /var/log/devbox/allow-for (root-owned harvest log dir; sudo prompt)"
-        msg "  6. Create devbox-agent OS user (agent-browser feature; sudo prompt)"
-        msg "  7. Install agent-browser allowlist example to \$HOME/.config/devbox"
-        msg "  8. Install 'devbox' command to $SYMLINK_PATH"
-        msg "  9. Optionally generate Claude Code token for containers"
-        msg " 10. Check Docker availability"
+        msg "  6. Create devbox-agent OS user + add $USER to that group (agent-browser feature; sudo prompt)"
+        msg "  7. Stage agent-browser Python helpers to /usr/local/lib/devbox (sudo prompt)"
+        msg "  8. Install agent-browser allowlist example to \$HOME/.config/devbox"
+        msg "  9. Install 'devbox' command to $SYMLINK_PATH"
+        msg " 10. Optionally generate Claude Code token for containers"
+        msg " 11. Check Docker availability"
         echo ""
         if ! confirm "Continue?"; then
             msg "Aborted."
@@ -864,6 +916,9 @@ main() {
 
     echo ""
     setup_agent_user
+
+    echo ""
+    stage_agent_browser_helpers
 
     echo ""
     setup_agent_allowlist_example

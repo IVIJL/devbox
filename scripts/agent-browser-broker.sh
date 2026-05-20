@@ -99,14 +99,16 @@ AGENT_ALLOWLIST_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/devbox/agent-browser-all
 # scheme (ADR 0007 + the wildcard rules in user CLAUDE.md).
 AGENT_PROXY_BYPASS_LIST="127.0.0.1;localhost;*.test;*.127.0.0.1.sslip.io"
 
-# Path to the proxy daemon. Relative to the broker's own directory so
-# it works regardless of how the broker was invoked.
-AGENT_PROXY_BIN="${DEVBOX_DIR}/scripts/agent-browser-proxy.py"
+# Path to the proxy daemon. install.sh stages a root-owned copy under
+# /usr/local/lib/devbox/agent-browser/ so the devbox-agent user can exec
+# it regardless of the developer's $HOME perms (0700/0750 homes block
+# traversal into the repo checkout). Override via env var for development
+# against an unstaged checkout.
+AGENT_HELPERS_STAGE_DIR="/usr/local/lib/devbox/agent-browser"
+AGENT_PROXY_BIN="${DEVBOX_AGENT_PROXY_BIN:-${AGENT_HELPERS_STAGE_DIR}/agent-browser-proxy.py}"
 
-# Path to the summary generator. Invoked from `cmd_stop` after the
-# netlog and proxy log are archived so the resulting summary.md sits
-# next to its inputs under `/var/log/devbox/agent-browser/`.
-AGENT_SUMMARIZE_BIN="${DEVBOX_DIR}/scripts/agent-browser-summarize.py"
+# Path to the summary generator. Same staging rationale as AGENT_PROXY_BIN.
+AGENT_SUMMARIZE_BIN="${DEVBOX_AGENT_SUMMARIZE_BIN:-${AGENT_HELPERS_STAGE_DIR}/agent-browser-summarize.py}"
 
 # Container-side CDP endpoint exposed by the bridge socat. Stable so the
 # agent-browser CLI always sees the same URL regardless of which random

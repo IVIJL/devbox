@@ -1725,6 +1725,22 @@ if [ "$MODE" = "update" ]; then
         "$DEVBOX_DIR/scripts/ensure-allow-for-host-state.sh" --quiet-if-noop || true
     fi
 
+    # Agent-browser self-heals (ADR 0010). Two scripts, same shape as the
+    # allow-for self-heal above:
+    #  - helpers: stage agent-browser-proxy.py + summarize.py under
+    #    /usr/local/lib/devbox so devbox-agent can exec them regardless
+    #    of the developer's $HOME perms.
+    #  - host-state: provision the devbox-agent group + add the invoking
+    #    user to it. Notably brings macOS installs (which used to leave
+    #    devbox-agent in primary group `staff` with no matching group)
+    #    forward to the documented read path.
+    if [ -x "$DEVBOX_DIR/scripts/ensure-agent-browser-helpers.sh" ]; then
+        "$DEVBOX_DIR/scripts/ensure-agent-browser-helpers.sh" --quiet-if-noop || true
+    fi
+    if [ -x "$DEVBOX_DIR/scripts/ensure-agent-browser-host-state.sh" ]; then
+        "$DEVBOX_DIR/scripts/ensure-agent-browser-host-state.sh" --quiet-if-noop || true
+    fi
+
     if [ "${DEVBOX_UPDATE_PULLED:-}" = "1" ]; then
         # Install or refresh zsh completion file (no .zshrc modifications here)
         _completion_src="$DEVBOX_DIR/completions/_devbox"

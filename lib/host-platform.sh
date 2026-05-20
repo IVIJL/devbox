@@ -170,6 +170,53 @@ host_platform::ensure_agent_user() {
     esac
 }
 
+# Idempotently add a developer user to the `devbox-agent` group so they can
+# read group-owned artefacts (netlog, proxy log, summary) at mode 0640. ADR
+# 0010 § Tamper-proof property documents this read path; without the
+# membership the user cannot open the files the CLI/toasts advertise.
+host_platform::ensure_agent_user_in_group() {
+    local user="$1"
+    [ -n "$user" ] || { printf 'host_platform::ensure_agent_user_in_group: user arg required\n' >&2; return 1; }
+
+    if id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -qx devbox-agent; then
+        return 0
+    fi
+
+    local platform
+    if ! platform="$(host_platform::detect)"; then
+        printf 'host_platform::ensure_agent_user_in_group: unknown OS (%s)\n' "$(uname -s)" >&2
+        return 1
+    fi
+
+    case "$platform" in
+        linux|wsl2)
+            # `usermod -aG` works on shadow systems; BusyBox `adduser
+            # devbox-agent <user>` adds an existing user to a group on
+            # Alpine. Pick by tool availability.
+            if command -v usermod >/dev/null 2>&1; then
+                sudo usermod -aG devbox-agent "$user"
+            elif command -v addgroup >/dev/null 2>&1; then
+                sudo addgroup "$user" devbox-agent
+            else
+                printf 'host_platform::ensure_agent_user_in_group: no usermod or addgroup\n' >&2
+                return 1
+            fi
+            ;;
+        macos)
+            # Defensive: ensure the group exists. ensure_agent_user_macos
+            # creates it on fresh installs, but a pre-existing devbox-agent
+            # user from an older install may predate the group provisioning.
+            if ! dseditgroup -o read devbox-agent >/dev/null 2>&1; then
+                if ! sudo dseditgroup -o create devbox-agent; then
+                    printf 'host_platform::ensure_agent_user_in_group: failed to create devbox-agent group\n' >&2
+                    return 1
+                fi
+            fi
+            sudo dseditgroup -o edit -a "$user" -t user devbox-agent
+            ;;
+    esac
+}
+
 # --- Internal helpers --------------------------------------------------------
 
 _host_platform::ensure_agent_user_linux() {
@@ -230,6 +277,27 @@ _host_platform::ensure_agent_user_macos() {
         return 0
     fi
 
+    # On macOS, `sysadminctl -addUser` does not create a matching group, and
+    # the new account's primary group defaults to `staff`. We need a real
+    # `devbox-agent` group for the broker's `chown devbox-agent:devbox-agent`
+    # + 0640 read path to work, paralleling the Linux `useradd --user-group`
+    # shape. Create the group first (idempotent via `dseditgroup -o read`),
+    # then create the user with that group as primary.
+    if ! dseditgroup -o read devbox-agent >/dev/null 2>&1; then
+        if ! sudo dseditgroup -o create devbox-agent; then
+            printf 'host_platform::ensure_agent_user: failed to create devbox-agent group\n' >&2
+            return 1
+        fi
+    fi
+
+    local group_gid
+    group_gid="$(dscl . -read /Groups/devbox-agent PrimaryGroupID 2>/dev/null \
+        | awk '/PrimaryGroupID:/ {print $2}')"
+    if [ -z "$group_gid" ]; then
+        printf 'host_platform::ensure_agent_user: failed to resolve devbox-agent group GID\n' >&2
+        return 1
+    fi
+
     # sysadminctl needs admin; sudo prompts the GUI for an admin password
     # (matches mkcert -install UX on macOS).
     #
@@ -237,7 +305,8 @@ _host_platform::ensure_agent_user_macos() {
     # omitted. The account is never logged into interactively, so we
     # assign a random one-shot password; sudo from an admin account does
     # not need this password to launch Chrome as devbox-agent. The shell
-    # is `/usr/bin/false` to additionally block `su devbox-agent`.
+    # is `/usr/bin/false` to additionally block `su devbox-agent`. `-GID`
+    # binds the account to the `devbox-agent` group we just created.
     local one_shot_password
     one_shot_password="$(openssl rand -base64 24 2>/dev/null \
         || dd if=/dev/urandom bs=18 count=1 2>/dev/null | base64)"
@@ -245,6 +314,7 @@ _host_platform::ensure_agent_user_macos() {
     if ! sudo sysadminctl -addUser devbox-agent \
             -fullName "Devbox Agent" \
             -password "$one_shot_password" \
+            -GID "$group_gid" \
             -shell /usr/bin/false 2>&1 \
             | grep -v -E 'Creating user record|Setting up home directory|done' \
             >&2; then

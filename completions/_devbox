@@ -42,6 +42,7 @@ _devbox() {
                 'deny:Remove allowed domain (interactive)'
                 'blocked:Show blocked DNS queries, allow interactively'
                 'allow-for:Open a time-bounded Allow-for window (default 15 min)'
+                'agent-browser:Control Host agent Chrome (start/stop/status/allow-for)'
                 'cursor:Open Cursor attached to running devbox'
                 'code:Open VS Code attached to running devbox'
                 'clip:Grab clipboard image for container use'
@@ -129,6 +130,43 @@ _devbox() {
                         '--external:Show sslip.io URL alongside the active URL'
                     )
                     _describe 'ports flags' flags
+                    ;;
+                agent-browser)
+                    # Layout: devbox agent-browser <sub> [args]
+                    #   CURRENT==3 → subcommand
+                    #   CURRENT==4 → container (start/stop/status) OR
+                    #                minutes/--stop (allow-for)
+                    #   CURRENT==5 → container (allow-for only)
+                    if (( CURRENT == 3 )); then
+                        local -a subs
+                        subs=(
+                            'start:Launch Host agent Chrome bound to container'
+                            'stop:Stop session and clean up resources'
+                            'status:Show session state (Chrome/proxy/watchdog PIDs)'
+                            'allow-for:Open time-bounded network window (default mode)'
+                            'help:Show agent-browser help'
+                        )
+                        _describe 'agent-browser subcommands' subs
+                    elif (( CURRENT == 4 )); then
+                        case $words[3] in
+                            start|stop|status)
+                                _devbox_containers
+                                ;;
+                            allow-for)
+                                # First positional is minutes (numeric)
+                                # or --stop. Container resolution happens
+                                # at CURRENT==5 below.
+                                local -a flags
+                                flags=('--stop:Close the active window immediately')
+                                _describe 'allow-for flags' flags
+                                _devbox_containers
+                                ;;
+                        esac
+                    elif (( CURRENT == 5 )); then
+                        if [ "$words[3]" = "allow-for" ]; then
+                            _devbox_containers
+                        fi
+                    fi
                     ;;
             esac
             ;;

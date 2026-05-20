@@ -45,17 +45,29 @@ log() { $QUIET_IF_NOOP || printf '%s\n' "$*"; }
 loud() { printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 
-if ! id devbox-agent >/dev/null 2>&1; then
-    log "devbox-agent user not present; run 'bash install.sh' to create it."
-    exit 0
-fi
-
 # shellcheck source=../lib/host-platform.sh disable=SC1091
 . "$DEVBOX_DIR/lib/host-platform.sh"
 
 platform="$(host_platform::detect)" || { warn "unknown platform"; exit 1; }
 
 actions=0
+
+# Active migration for break-fix: when an existing install pulled the
+# agent-browser feature but never ran `bash install.sh`, the devbox-agent
+# OS user is missing entirely. Without this branch, `devbox update`
+# self-heal would silently skip user provisioning and the next
+# `devbox agent-browser start` would fail with "user does not exist".
+# Per the feedback_active_migration_for_breakfix rule, break-fix lives
+# in `devbox update`, not in warn-only output.
+if ! id devbox-agent >/dev/null 2>&1; then
+    loud "Creating devbox-agent OS user (sudo may prompt)..."
+    if ! host_platform::ensure_agent_user; then
+        warn "Failed to create devbox-agent user. Run 'bash install.sh' for full setup with diagnostics."
+        exit 1
+    fi
+    loud "Created devbox-agent user"
+    actions=$((actions + 1))
+fi
 
 # macOS self-heal: group existence + primary group binding on the user.
 if [ "$platform" = "macos" ]; then

@@ -353,6 +353,16 @@ COPY scripts/stop-agent-browser-host-allow.sh /usr/local/bin/stop-agent-browser-
 # at its absolute path for the wrapper's exec.
 COPY scripts/agent-browser-cdp-bridge.sh /usr/local/bin/agent-browser
 
+# Container-only agent identity context (ADR 0011 Layer 3). Hook fires
+# from Claude Code SessionStart and Codex UserPromptSubmit; the script
+# guards on /etc/devbox/identity.json so the same managed-settings
+# fragments are inert if ever read on host.
+COPY scripts/hooks/devbox-identity-context.sh /usr/local/bin/
+COPY managed-settings/claude-code/50-devbox-identity.json \
+     /etc/claude-code/managed-settings.d/50-devbox-identity.json
+COPY managed-settings/codex/managed_config.toml \
+     /etc/codex/managed_config.toml
+
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/n /usr/local/bin/nx /usr/local/bin/start-rootless-docker.sh \
     /usr/local/bin/devbox-entrypoint.sh /usr/local/bin/devbox-firewall-reload \
@@ -363,7 +373,8 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/closeout-allow-for-on-restart \
     /usr/local/bin/start-agent-browser-host-allow \
     /usr/local/bin/stop-agent-browser-host-allow \
-    /usr/local/bin/agent-browser
+    /usr/local/bin/agent-browser \
+    /usr/local/bin/devbox-identity-context.sh
 
 # Sudo with password — prevents AI agents from modifying firewall rules
 # Password is injected via --mount=type=secret (never stored in image layers/metadata)

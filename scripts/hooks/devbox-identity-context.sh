@@ -1,0 +1,57 @@
+#!/bin/sh
+# Devbox container identity context for agents (ADR 0011 Layer 3).
+# Fires from Claude Code SessionStart and Codex UserPromptSubmit hooks.
+# Emits a JSON hook response with `additionalContext` so the host agent
+# injects our identity block into the conversation. The same managed-
+# settings files are bind-mounted shared, so we guard on the identity
+# file's presence to keep this a deliberate no-op on host. Exiting 0
+# with empty stdout on missing identity is the intended host-vs-
+# container branch, not a suppressed error: both Claude Code and Codex
+# treat empty stdout as "no additional context", which is exactly the
+# desired host behaviour.
+#
+# Hook output format matches the shared Claude Code / Codex schema:
+#   {"hookSpecificOutput": {"hookEventName": "...", "additionalContext": "..."}}
+# `hookEventName` is read from the per-hook stdin payload Claude Code
+# and Codex both feed us; we echo it back so the same script services
+# both SessionStart (Claude Code) and UserPromptSubmit (Codex 0.128).
+[ -f /etc/devbox/identity.json ] || exit 0
+
+project=$(jq -r .project /etc/devbox/identity.json 2>/dev/null) || exit 0
+[ -n "$project" ] && [ "$project" != "null" ] || exit 0
+
+# Read the hook event name from stdin payload. Both Claude Code and
+# Codex feed a JSON object on stdin with `hook_event_name`; we echo it
+# back in the response so each agent treats the output as belonging to
+# the hook it triggered. Fall back to SessionStart if stdin is empty
+# or malformed (defensive; should not happen in production paths).
+event=$(jq -r '.hook_event_name // empty' 2>/dev/null)
+[ -n "$event" ] || event="SessionStart"
+
+context=$(cat <<EOF
+You are inside a devbox container for project "$project".
+
+Boundaries:
+- The 'devbox' CLI lives on the host, not in this container. To start
+  or stop containers, open allow-for windows, manage the allowlist, or
+  drive the host Agent-browser Chrome, ask the user to run the
+  corresponding 'devbox …' command on host.
+- Network is default-deny. Only ~15 allowlisted domains resolve;
+  everything else is REJECTed at the firewall. If curl/npm/pip/fetch
+  fails with a connection error, the most likely cause is that the
+  host is not in the allowlist. Ask the user to run on host:
+    devbox allow <domain>          (durable allowlist entry)
+    devbox allow-for <minutes>     (time-bounded harvest window)
+- Dev URLs bypass the firewall via built-in routes. Both forms resolve
+  locally: http(s)://<port>.${project}.test and
+  http(s)://<port>.${project}.127.0.0.1.sslip.io
+
+For full guidance (agent-browser, ports, host/container bridging),
+invoke the 'devbox' skill.
+EOF
+)
+
+jq -n \
+    --arg event "$event" \
+    --arg context "$context" \
+    '{hookSpecificOutput: {hookEventName: $event, additionalContext: $context}}'

@@ -135,6 +135,15 @@ sanitized basename of its host path (see ADR 0005).
 The Docker container `devbox-<project>` that runs the project's dev
 environment. Each project gets exactly one container at a time.
 
+**Container identity**:
+A root-owned JSON file at `/etc/devbox/identity.json` inside the
+**Container**, written by the entrypoint, recording the active
+**Project** name. Its mere presence is the deterministic signal "we
+are inside a devbox container"; absence means "we are on the host".
+Consumed by agent-side hooks and the `devbox` skill for host/container
+branching. See ADR 0011.
+_Avoid_: identity sentinel, container marker, devbox marker file
+
 ## Relationships
 
 - A **Project** has exactly one **Container** at a time.

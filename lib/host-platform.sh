@@ -335,3 +335,197 @@ _host_platform::ensure_agent_user_macos() {
         return 1
     fi
 }
+
+# --- devbox-agent mkcert root-CA trust ---------------------------------------
+
+# Idempotently import the developer's mkcert root CA into the devbox-agent
+# user's NSS DB (~/.pki/nssdb), so Host agent Chrome — which runs as
+# devbox-agent — trusts HTTPS certs issued by the developer's local CA.
+#
+# Why a separate trust seed is needed: `mkcert -install` seeds the
+# *invoking* user's NSS DB. Host agent Chrome runs as devbox-agent (a
+# separate system user with its own home), so it never inherits that
+# trust and silently rejects every mkcert-signed devbox project URL.
+#
+# Idempotence: compares fingerprint of the existing nick against the
+# source rootCA.pem. Re-imports only on missing/mismatched fingerprint
+# (CA rotation, fresh install). No-op on match — safe to call from
+# every `devbox update`.
+#
+# Platforms:
+#   - linux/wsl2: NSS DB at ~devbox-agent/.pki/nssdb, certutil required
+#     (libnss3-tools on Debian, nss-tools on Fedora/Alpine).
+#   - macOS: Chrome reads the System/login Keychain; devbox-agent has
+#     no login keychain (system user, no GUI session), so Chrome falls
+#     back to the System Keychain. Seeding that needs admin every run
+#     and conflicts with the developer's own `mkcert -install`. Skipped
+#     here; tracked for a later dedicated macOS slice.
+#
+# Soft-fails (returns 0 with a warning on stderr) when:
+#   - mkcert binary unavailable (HTTPS rollout not bootstrapped yet)
+#   - CAROOT/rootCA.pem missing (mkcert -install never run)
+#   - certutil unavailable (developer opted out of NSS tooling)
+# These are all developer-driven states; the failure mode is "Chrome
+# shows cert warning" which the developer can self-diagnose. Hard-fail
+# (returns 1) only for sudo / user-existence problems that indicate a
+# broken devbox install.
+#
+# Requires lib/mkcert.sh sourced by the caller for _mkcert::caroot and
+# _mkcert::ca_fingerprint. Soft-fails with a clear diagnostic if either
+# helper is missing.
+host_platform::ensure_agent_mkcert_trust() {
+    local platform
+    if ! platform="$(host_platform::detect)"; then
+        printf 'host_platform::ensure_agent_mkcert_trust: unknown OS (%s)\n' "$(uname -s)" >&2
+        return 1
+    fi
+    case "$platform" in
+        linux|wsl2)
+            _host_platform::ensure_agent_mkcert_trust_linux
+            ;;
+        macos)
+            # See header comment; pending separate macOS slice.
+            return 0
+            ;;
+    esac
+}
+
+_host_platform::ensure_agent_mkcert_trust_linux() {
+    if ! id devbox-agent >/dev/null 2>&1; then
+        printf 'host_platform::ensure_agent_mkcert_trust: devbox-agent user missing; run ensure_agent_user first\n' >&2
+        return 1
+    fi
+
+    if ! command -v _mkcert::caroot >/dev/null 2>&1; then
+        printf 'host_platform::ensure_agent_mkcert_trust: lib/mkcert.sh not sourced; skipping NSS seed\n' >&2
+        return 0
+    fi
+
+    local caroot
+    caroot="$(_mkcert::caroot 2>/dev/null || true)"
+    if [ -z "$caroot" ] || [ ! -f "$caroot/rootCA.pem" ]; then
+        printf 'host_platform::ensure_agent_mkcert_trust: no mkcert rootCA.pem yet; run install-mkcert.sh first (HTTPS for devbox-agent Chrome will fail until then)\n' >&2
+        return 0
+    fi
+
+    if ! command -v certutil >/dev/null 2>&1; then
+        printf 'host_platform::ensure_agent_mkcert_trust: certutil missing; install libnss3-tools (Debian) / nss-tools (Fedora/Alpine) or rerun: bash scripts/install-mkcert.sh --with-nss\n' >&2
+        return 0
+    fi
+    if ! command -v openssl >/dev/null 2>&1; then
+        printf 'host_platform::ensure_agent_mkcert_trust: openssl missing; cannot compare cert fingerprints\n' >&2
+        return 0
+    fi
+
+    # DER-encoded fingerprint of the source rootCA. PEM-of-PEM hashing
+    # would be fragile (line wrapping / header variants across exporters
+    # change the byte stream without changing the cert itself); converting
+    # to DER first normalises to the canonical X.509 bytes. This is
+    # independent of _mkcert::ca_fingerprint (file-content SHA, used by
+    # lib/cert.sh for leaf-cert invalidation against CA churn) — different
+    # invariant, different consumer.
+    local src_fp
+    src_fp="$(sudo cat "$caroot/rootCA.pem" 2>/dev/null \
+        | openssl x509 -outform DER 2>/dev/null \
+        | sha256sum 2>/dev/null | awk '{print $1}')"
+    if [ -z "$src_fp" ]; then
+        printf 'host_platform::ensure_agent_mkcert_trust: cannot compute DER fingerprint of rootCA.pem at %s\n' "$caroot" >&2
+        return 0
+    fi
+
+    # Resolve devbox-agent's home dir from /etc/passwd. `getent` is
+    # available everywhere we care about; bypasses NSS module quirks
+    # that occasionally bite `~devbox-agent` shell expansion.
+    local agent_home
+    agent_home="$(getent passwd devbox-agent 2>/dev/null | cut -d: -f6)"
+    if [ -z "$agent_home" ]; then
+        printf 'host_platform::ensure_agent_mkcert_trust: cannot resolve devbox-agent home dir\n' >&2
+        return 1
+    fi
+
+    local nssdb_dir="$agent_home/.pki/nssdb"
+    # Create + initialise the NSS DB as devbox-agent if missing. The
+    # mkdir and `certutil -N` are independent gates: a prior aborted
+    # run (mkdir succeeded, certutil -N failed) leaves the directory
+    # without `cert9.db`, and a directory-only check would skip init
+    # forever, causing every subsequent `certutil -A` to fail. Probe
+    # the actual DB presence via `certutil -L` (returns non-zero on
+    # uninitialised dir) instead of stat'ing the directory.
+    #
+    # `-N --empty-password` creates a passwordless SQL-backed DB (the
+    # `sql:` prefix on the path is the new-style DB; certutil falls
+    # back to the legacy DBM format without it, which Chrome 50+ ignores).
+    if ! sudo test -d "$nssdb_dir"; then
+        if ! sudo -u devbox-agent mkdir -p "$nssdb_dir"; then
+            printf 'host_platform::ensure_agent_mkcert_trust: mkdir %s failed\n' "$nssdb_dir" >&2
+            return 1
+        fi
+    fi
+    if ! sudo -u devbox-agent certutil -L -d "sql:$nssdb_dir" >/dev/null 2>&1; then
+        if ! sudo -u devbox-agent certutil -d "sql:$nssdb_dir" -N --empty-password >/dev/null 2>&1; then
+            printf 'host_platform::ensure_agent_mkcert_trust: certutil -N failed for devbox-agent NSS DB at %s\n' "$nssdb_dir" >&2
+            return 1
+        fi
+    fi
+
+    # Probe the current trust state. The nick is repo-namespaced so it
+    # cannot collide with whatever `mkcert -install` writes when run as
+    # devbox-agent directly (developer escape hatch, not used by us).
+    local nick="devbox mkcert root"
+    local current_fp=""
+    if sudo -u devbox-agent certutil -L -d "sql:$nssdb_dir" -n "$nick" >/dev/null 2>&1; then
+        current_fp="$(sudo -u devbox-agent certutil -L -d "sql:$nssdb_dir" -n "$nick" -a 2>/dev/null \
+            | openssl x509 -outform DER 2>/dev/null \
+            | sha256sum 2>/dev/null | awk '{print $1}')"
+    fi
+    if [ -n "$current_fp" ] && [ "$current_fp" = "$src_fp" ]; then
+        return 0
+    fi
+
+    # Stage rootCA.pem in /tmp where devbox-agent can read it (CAROOT
+    # is 0700 owned by the developer). The staging file is short-lived
+    # and contains only the public cert. Trap on EXIT for cleanup —
+    # local trap (subshell isolation would require RETURN trap with set
+    # +e gymnastics; the function is short enough to scope an EXIT trap
+    # via an inner subshell).
+    local rc=0
+    (
+        set -e
+        staged="$(mktemp /tmp/devbox-agent-rootca.XXXXXX.pem)"
+        trap 'rm -f -- "$staged"' EXIT
+        # The redirect target ($staged) is in /tmp and owned by the
+        # invoking user from mktemp — sudo elevation is needed only for
+        # the read side (CAROOT is 0700 owned by the developer). SC2024
+        # warns about sudo-write-redirect, which we deliberately avoid:
+        # only the read is elevated.
+        # shellcheck disable=SC2024
+        if ! sudo cat "$caroot/rootCA.pem" > "$staged"; then
+            printf 'host_platform::ensure_agent_mkcert_trust: cannot stage rootCA.pem from %s\n' "$caroot" >&2
+            exit 1
+        fi
+        chmod 0644 "$staged"
+
+        if [ -n "$current_fp" ]; then
+            # Stale entry — fingerprint differs from source. Remove
+            # before re-adding (certutil -A would error on duplicate nick).
+            sudo -u devbox-agent certutil -D -d "sql:$nssdb_dir" -n "$nick" >/dev/null 2>&1 || true
+        fi
+        # `-t C,,` = trust for SSL CA only (no email, no code-signing).
+        # Matches the trust bits mkcert -install uses for its own nick.
+        if ! sudo -u devbox-agent certutil -A -d "sql:$nssdb_dir" \
+                -n "$nick" -t "C,," -i "$staged" >/dev/null 2>&1; then
+            printf 'host_platform::ensure_agent_mkcert_trust: certutil -A failed\n' >&2
+            exit 1
+        fi
+    ) || rc=$?
+
+    if [ "$rc" -ne 0 ]; then
+        return "$rc"
+    fi
+
+    if [ -n "$current_fp" ]; then
+        printf 'Refreshed mkcert root CA in devbox-agent NSS DB (CA rotated)\n'
+    else
+        printf 'Imported mkcert root CA into devbox-agent NSS DB (Host agent Chrome now trusts devbox HTTPS)\n'
+    fi
+}

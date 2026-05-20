@@ -33,7 +33,7 @@ set -euo pipefail
 
 DEVBOX_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 
-# shellcheck source=../lib/host-platform.sh
+# shellcheck source-path=SCRIPTDIR source=../lib/host-platform.sh disable=SC1091
 source "$DEVBOX_DIR/lib/host-platform.sh"
 
 # --- Constants ---------------------------------------------------------------
@@ -109,6 +109,15 @@ AGENT_PROXY_BIN="${DEVBOX_AGENT_PROXY_BIN:-${AGENT_HELPERS_STAGE_DIR}/agent-brow
 
 # Path to the summary generator. Same staging rationale as AGENT_PROXY_BIN.
 AGENT_SUMMARIZE_BIN="${DEVBOX_AGENT_SUMMARIZE_BIN:-${AGENT_HELPERS_STAGE_DIR}/agent-browser-summarize.py}"
+
+# Chrome-death watchdog (poll Chrome PID; on exit, invoke broker stop).
+# Lives next to the broker in the same scripts/ dir; we point at the
+# repo copy because the broker itself runs from the same dir (DEVBOX_DIR
+# resolved above via readlink -f on $0). The broker-self path is what
+# the watchdog re-invokes with `stop`.
+AGENT_WATCHDOG_SCRIPT="${DEVBOX_DIR}/scripts/agent-browser-watchdog.sh"
+AGENT_BROKER_SELF="${DEVBOX_DIR}/scripts/agent-browser-broker.sh"
+AGENT_WATCHDOG_INTERVAL_DEFAULT=10
 
 # Container-side CDP endpoint exposed by the bridge socat. Stable so the
 # agent-browser CLI always sees the same URL regardless of which random
@@ -518,16 +527,19 @@ _sweep_if_stale() {
     file="$(_state_file "$container")"
     [ -f "$file" ] || return 0
 
-    local chrome_pid bridge_pid relay_pid proxy_pid profile_dir download_dir cdp_port proxy_port host_allow_ip
+    local chrome_pid bridge_pid relay_pid proxy_pid watchdog_pid profile_dir download_dir cdp_port proxy_port host_allow_ip container_name
     chrome_pid="$(_state_get "$file" chrome_pid || true)"
     bridge_pid="$(_state_get "$file" bridge_pid_in_container || true)"
     relay_pid="$(_state_get "$file" relay_pid_host || true)"
     proxy_pid="$(_state_get "$file" proxy_pid || true)"
+    watchdog_pid="$(_state_get "$file" watchdog_pid || true)"
     profile_dir="$(_state_get "$file" profile_dir || true)"
     download_dir="$(_state_get "$file" download_dir || true)"
     cdp_port="$(_state_get "$file" cdp_port_host || true)"
     proxy_port="$(_state_get "$file" proxy_port_host || true)"
     host_allow_ip="$(_state_get "$file" host_allow_ip || true)"
+    container_name="$(_state_get "$file" container || true)"
+    [ -n "$container_name" ] || container_name="$container"
 
     # Identity markers: cmdline substrings unique to this session. PID
     # reuse after reboot would otherwise make an unrelated process look
@@ -537,8 +549,9 @@ _sweep_if_stale() {
     local relay_marker="TCP-LISTEN:${cdp_port}"
     local bridge_marker="socat TCP-LISTEN:${BRIDGE_CONTAINER_PORT}"
     local proxy_marker="--listen 127.0.0.1:${proxy_port}"
+    local watchdog_marker="agent-browser-watchdog.sh $container_name"
 
-    local chrome_alive=false bridge_alive=false relay_alive=false proxy_alive=false
+    local chrome_alive=false bridge_alive=false relay_alive=false proxy_alive=false watchdog_alive=false
     if [ -n "$chrome_pid" ] && _pid_matches_marker "$chrome_pid" "$chrome_marker"; then
         chrome_alive=true
     fi
@@ -556,13 +569,18 @@ _sweep_if_stale() {
         && _pid_matches_marker "$proxy_pid" "$proxy_marker"; then
         proxy_alive=true
     fi
+    if [ -n "$watchdog_pid" ] && [ "$watchdog_pid" != "null" ] \
+        && _pid_matches_marker "$watchdog_pid" "$watchdog_marker"; then
+        watchdog_alive=true
+    fi
 
     if [ "$chrome_alive" = true ] || [ "$bridge_alive" = true ] \
-        || [ "$relay_alive" = true ] || [ "$proxy_alive" = true ]; then
+        || [ "$relay_alive" = true ] || [ "$proxy_alive" = true ] \
+        || [ "$watchdog_alive" = true ]; then
         return 1
     fi
 
-    _warn "Sweeping stale session file for ${container} (Chrome=${chrome_pid:-?}, bridge=${bridge_pid:-?}, relay=${relay_pid:-?}, proxy=${proxy_pid:-?} all gone or reused)."
+    _warn "Sweeping stale session file for ${container} (Chrome=${chrome_pid:-?}, bridge=${bridge_pid:-?}, relay=${relay_pid:-?}, proxy=${proxy_pid:-?}, watchdog=${watchdog_pid:-?} all gone or reused)."
 
     # Cleaning up stale session resources from the prior crash: the
     # session-scoped profile/download dirs would otherwise accumulate
@@ -599,6 +617,11 @@ _sweep_if_stale() {
         docker exec -u root "$container" \
             /usr/local/bin/stop-agent-browser-host-allow "$host_allow_ip" "$cdp_port" 2>/dev/null || true
     fi
+
+    # Watchdog log + pidfile cleanup. Same SESSIONS_DIR sibling layout
+    # cmd_stop uses; harmless if the prior session never wrote them.
+    rm -f -- "$SESSIONS_DIR/${container}.watchdog.pid" \
+             "$SESSIONS_DIR/${container}.watchdog.log" 2>/dev/null || true
 
     rm -f -- "$file"
     return 0
@@ -968,6 +991,60 @@ EOF
     local created_at
     created_at="$(_iso_utc_now)"
 
+    # Spawn the Chrome-death watchdog. Polls Chrome PID every
+    # AGENT_WATCHDOG_INTERVAL_DEFAULT seconds; on Chrome exit (user
+    # closed the window, crash, OOM) it invokes `broker stop` for
+    # graceful proxy/relay/firewall teardown. Without it the user
+    # closing the Chrome window leaves the session in a half-alive
+    # state — proxy/relay still running, state file claiming the
+    # session is up, and `devbox agent-browser status` reporting
+    # Chrome `(dead)` with no automatic remediation. Best-effort:
+    # if the watchdog cannot be spawned (script missing, fork failure)
+    # we proceed without it — the user can still manually `stop`.
+    #
+    # Runs as the invoking developer (NOT under sudo -u devbox-agent)
+    # so the watchdog's exec-of-broker-stop resolves SESSIONS_DIR /
+    # state file paths against the developer's XDG_STATE_HOME — the
+    # same paths cmd_start wrote into. Watchdog needs no elevated
+    # privileges: ps -p / /proc reads work cross-user, and broker
+    # stop will sudo where needed.
+    #
+    # PID capture is via pidfile written by the watchdog itself
+    # (first line in agent-browser-watchdog.sh). pgrep against the
+    # script name would race with the spawn wrapper's own cmdline
+    # (`setsid`/`nohup`/`sh -c` all carry the watchdog script path as
+    # an arg), occasionally returning the wrapper PID instead.
+    local watchdog_pid=""
+    if [ -x "$AGENT_WATCHDOG_SCRIPT" ]; then
+        local watchdog_detach
+        watchdog_detach="$(_detach_prefix)"
+        local watchdog_log="$SESSIONS_DIR/${container}.watchdog.log"
+        local watchdog_pidfile="$SESSIONS_DIR/${container}.watchdog.pid"
+        # Stale pidfile cleanup from any prior session that crashed
+        # before pidfile removal. The sweep above already covered
+        # the prior session's processes; this just removes the file.
+        rm -f -- "$watchdog_pidfile" 2>/dev/null || true
+        $watchdog_detach "$AGENT_WATCHDOG_SCRIPT" \
+            "$container" "$chrome_pid" "$AGENT_BROKER_SELF" "$watchdog_pidfile" \
+            </dev/null >>"$watchdog_log" 2>&1 &
+        disown 2>/dev/null || true
+
+        # Poll the pidfile for ~1s. Watchdog writes it as its very
+        # first action, so missing pidfile after 1s = spawn failure.
+        local wd_retry
+        for wd_retry in 1 2 3 4 5; do
+            : "$wd_retry"
+            if [ -s "$watchdog_pidfile" ]; then
+                watchdog_pid="$(cat "$watchdog_pidfile" 2>/dev/null || true)"
+                [ -n "$watchdog_pid" ] && break
+            fi
+            sleep 0.2
+        done
+        if [ -z "$watchdog_pid" ]; then
+            _warn "Watchdog spawn failed (Chrome exit will not auto-trigger stop; manual 'devbox agent-browser stop' required if you close the window)."
+        fi
+    fi
+
     # Write state JSON. `active_network_window` stays null until slice 05
     # adds the network-window machinery. `relay_pid_host` is an addition
     # over the ADR's listed shape — host-side relay PID for native Linux
@@ -982,6 +1059,8 @@ EOF
     [ -n "$relay_pid" ] && relay_pid_json="$relay_pid"
     local host_allow_ip_json="null"
     [ -n "$host_allow_ip" ] && host_allow_ip_json="\"${host_allow_ip}\""
+    local watchdog_pid_json="null"
+    [ -n "$watchdog_pid" ] && watchdog_pid_json="$watchdog_pid"
     local state_file
     state_file="$(_state_file "$container")"
     cat > "$state_file" <<EOF
@@ -991,6 +1070,7 @@ EOF
   "bridge_pid_in_container": ${bridge_pid},
   "relay_pid_host": ${relay_pid_json},
   "proxy_pid": ${proxy_pid},
+  "watchdog_pid": ${watchdog_pid_json},
   "cdp_port_host": ${cdp_port},
   "proxy_port_host": ${proxy_port},
   "profile_dir": "${profile_dir}",
@@ -1043,6 +1123,7 @@ EOF
     _log "  Chrome PID (host):         ${chrome_pid}"
     [ -n "$relay_pid" ] && _log "  Relay PID (host):          ${relay_pid}"
     _log "  Proxy PID (host):          ${proxy_pid}"
+    [ -n "$watchdog_pid" ] && _log "  Watchdog PID (host):       ${watchdog_pid} (Chrome poll ${AGENT_WATCHDOG_INTERVAL_DEFAULT}s)"
     _log "  Bridge PID (in container): ${bridge_pid}"
     _log "  CDP (host):                127.0.0.1:${cdp_port}"
     _log "  Proxy (host):              127.0.0.1:${proxy_port} (default mode)"
@@ -1742,13 +1823,14 @@ cmd_stop() {
         return 0
     fi
 
-    local chrome_pid bridge_pid relay_pid proxy_pid profile_dir download_dir
+    local chrome_pid bridge_pid relay_pid proxy_pid watchdog_pid profile_dir download_dir
     local netlog_path proxy_log_path cdp_port proxy_port session_created_at
     local host_allow_ip
     chrome_pid="$(_state_get "$state_file" chrome_pid || true)"
     bridge_pid="$(_state_get "$state_file" bridge_pid_in_container || true)"
     relay_pid="$(_state_get "$state_file" relay_pid_host || true)"
     proxy_pid="$(_state_get "$state_file" proxy_pid || true)"
+    watchdog_pid="$(_state_get "$state_file" watchdog_pid || true)"
     profile_dir="$(_state_get "$state_file" profile_dir || true)"
     download_dir="$(_state_get "$state_file" download_dir || true)"
     netlog_path="$(_state_get "$state_file" netlog_path || true)"
@@ -1768,6 +1850,28 @@ cmd_stop() {
     local relay_marker="TCP-LISTEN:${cdp_port}"
     local bridge_marker="socat TCP-LISTEN:${BRIDGE_CONTAINER_PORT}"
     local proxy_marker="--listen 127.0.0.1:${proxy_port}"
+    local watchdog_marker="agent-browser-watchdog.sh $container"
+
+    # Kill the Chrome-death watchdog first so it can't observe Chrome
+    # dying (we're about to SIGTERM it below) and race with us by
+    # re-invoking `broker stop` mid-teardown. Re-entry guard: when stop
+    # is itself called from the watchdog (DEVBOX_AGENT_BROWSER_FROM_WATCHDOG=1),
+    # skip the kill — the watchdog's PID is this process's parent and
+    # signalling it would terminate the cleanup mid-flight.
+    # Watchdog runs as the invoking user, so `kill` without sudo is the
+    # right signal source.
+    if [ "${DEVBOX_AGENT_BROWSER_FROM_WATCHDOG:-0}" != "1" ] \
+        && [ -n "$watchdog_pid" ] && [ "$watchdog_pid" != "null" ] \
+        && _pid_matches_marker "$watchdog_pid" "$watchdog_marker"; then
+        _log "Stopping watchdog PID ${watchdog_pid}..."
+        kill "$watchdog_pid" 2>/dev/null || true
+    fi
+    # Clean up watchdog log + pidfile alongside the state file removal.
+    # Best-effort: a leftover log is not a correctness issue, just a
+    # minor sessions-dir clutter that the next start's stale-sweep
+    # would also miss (it only sweeps the state file itself).
+    rm -f -- "$SESSIONS_DIR/${container}.watchdog.pid" \
+             "$SESSIONS_DIR/${container}.watchdog.log" 2>/dev/null || true
 
     # Close any active network window first: kill the host-side timer so
     # it can't race with the proxy shutdown below (the proxy is about to
@@ -2072,11 +2176,12 @@ cmd_status() {
         return 0
     fi
 
-    local chrome_pid bridge_pid relay_pid proxy_pid cdp_port proxy_port profile_dir created_at
+    local chrome_pid bridge_pid relay_pid proxy_pid watchdog_pid cdp_port proxy_port profile_dir created_at
     chrome_pid="$(_state_get "$state_file" chrome_pid || true)"
     bridge_pid="$(_state_get "$state_file" bridge_pid_in_container || true)"
     relay_pid="$(_state_get "$state_file" relay_pid_host || true)"
     proxy_pid="$(_state_get "$state_file" proxy_pid || true)"
+    watchdog_pid="$(_state_get "$state_file" watchdog_pid || true)"
     cdp_port="$(_state_get "$state_file" cdp_port_host || true)"
     proxy_port="$(_state_get "$state_file" proxy_port_host || true)"
     profile_dir="$(_state_get "$state_file" profile_dir || true)"
@@ -2086,6 +2191,7 @@ cmd_status() {
     local relay_marker="TCP-LISTEN:${cdp_port}"
     local bridge_marker="socat TCP-LISTEN:${BRIDGE_CONTAINER_PORT}"
     local proxy_marker="--listen 127.0.0.1:${proxy_port}"
+    local watchdog_marker="agent-browser-watchdog.sh $container"
 
     local chrome_status="dead"
     if [ -n "$chrome_pid" ] && _pid_matches_marker "$chrome_pid" "$chrome_marker"; then
@@ -2109,6 +2215,12 @@ cmd_status() {
         _pid_matches_marker "$proxy_pid" "$proxy_marker" && proxy_status="alive"
         proxy_line="  Proxy PID (host):          ${proxy_pid} (${proxy_status})"
     fi
+    local watchdog_line=""
+    if [ -n "$watchdog_pid" ] && [ "$watchdog_pid" != "null" ]; then
+        local watchdog_status="dead"
+        _pid_matches_marker "$watchdog_pid" "$watchdog_marker" && watchdog_status="alive"
+        watchdog_line="  Watchdog PID (host):       ${watchdog_pid} (${watchdog_status})"
+    fi
 
     cat <<EOF
 Agent-browser session for ${container}:
@@ -2117,6 +2229,7 @@ Agent-browser session for ${container}:
 EOF
     [ -n "$relay_line" ] && printf '%s\n' "$relay_line"
     [ -n "$proxy_line" ] && printf '%s\n' "$proxy_line"
+    [ -n "$watchdog_line" ] && printf '%s\n' "$watchdog_line"
     cat <<EOF
   Bridge PID (in container): ${bridge_pid:-?} (${bridge_status})
   CDP (host):                127.0.0.1:${cdp_port:-?}

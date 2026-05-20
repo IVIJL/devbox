@@ -48,6 +48,13 @@ warn() { printf '%s\n' "$*" >&2; }
 # shellcheck source=../lib/host-platform.sh disable=SC1091
 . "$DEVBOX_DIR/lib/host-platform.sh"
 
+# host_platform::ensure_agent_mkcert_trust below uses _mkcert::caroot
+# from lib/mkcert.sh to locate the developer's CAROOT before importing
+# into the devbox-agent NSS DB. Source it explicitly so the trust seed
+# step is self-contained from the caller's perspective.
+# shellcheck source=../lib/mkcert.sh disable=SC1091
+. "$DEVBOX_DIR/lib/mkcert.sh"
+
 platform="$(host_platform::detect)" || { warn "unknown platform"; exit 1; }
 
 actions=0
@@ -121,6 +128,26 @@ if ! id -nG "$invoker" 2>/dev/null | tr ' ' '\n' | grep -qx devbox-agent; then
         warn "Failed to add $invoker to devbox-agent group."
         exit 1
     fi
+fi
+
+# mkcert root-CA trust for devbox-agent. Idempotent: re-imports only
+# when fingerprint differs (fresh install or CA rotation). Per
+# feedback_active_migration_for_breakfix this lives inside the update
+# self-heal path, not warn-only output, because HTTPS-trust drift is
+# silent until the user hits an HTTPS URL in the agent Chrome.
+#
+# Output contract: stdout is non-empty iff a state change happened
+# (Imported / Refreshed). Soft-fail diagnostics (missing certutil,
+# missing rootCA) print on stderr and fall through to the terminal —
+# the developer self-remediates. Hard-fail (return 1) only on broken
+# install state (missing user, sudo refused, openssl/sha256 broken).
+if trust_msg="$(host_platform::ensure_agent_mkcert_trust)"; then
+    if [ -n "$trust_msg" ]; then
+        loud "$trust_msg"
+        actions=$((actions + 1))
+    fi
+else
+    warn "Agent-browser mkcert trust seed failed (HTTPS dev URLs will show cert warnings in agent Chrome)."
 fi
 
 if [ "$actions" -eq 0 ]; then

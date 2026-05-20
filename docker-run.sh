@@ -2022,14 +2022,19 @@ fi
 if [ "$MODE" = "ports" ]; then
     PORTS_SHOW_ALL=false
     PORTS_SHOW_EXTERNAL=false
+    PORTS_MACHINE=false
     for arg in "$@"; do
         case "$arg" in
             --all)      PORTS_SHOW_ALL=true ;;
             --external) PORTS_SHOW_EXTERNAL=true ;;
+            -m|--machine-readable) PORTS_MACHINE=true ;;
             -h|--help)
-                echo "Usage: devbox ports [--all] [--external]"
+                echo "Usage: devbox ports [--all] [--external] [-m|--machine-readable]"
                 echo "  --all       Include stopped containers and skip the listening filter."
                 echo "  --external  Show the external sslip.io URL alongside the active URL."
+                echo "  -m, --machine-readable"
+                echo "              Emit tab-separated rows (container<TAB>port<TAB>url[<TAB>external])"
+                echo "              with no headers, no separators, no column alignment."
                 exit 0
                 ;;
             *) echo "Unknown flag: $arg" >&2; exit 2 ;;
@@ -2037,7 +2042,7 @@ if [ "$MODE" = "ports" ]; then
     done
 
     if [ ! -d "$TRAEFIK_CONFIG_DIR" ] || [ -z "$(ls -A "$TRAEFIK_CONFIG_DIR" 2>/dev/null)" ]; then
-        echo "No active port routes."
+        [ "$PORTS_MACHINE" = false ] && echo "No active port routes."
         exit 0
     fi
 
@@ -2055,7 +2060,7 @@ if [ "$MODE" = "ports" ]; then
     done
 
     if [ "${#PORTS_BY_CONTAINER[@]}" -eq 0 ]; then
-        echo "No active port routes."
+        [ "$PORTS_MACHINE" = false ] && echo "No active port routes."
         exit 0
     fi
 
@@ -2106,6 +2111,21 @@ if [ "$MODE" = "ports" ]; then
         [ "${#routed_ports[@]}" -eq 0 ] && continue
 
         any_output=true
+        project="${container#devbox-}"
+
+        if [ "$PORTS_MACHINE" = true ]; then
+            for p in "${routed_ports[@]}"; do
+                local_url="${scheme}://$(devbox::route_host_display "$project" "$p")"
+                if [ "$PORTS_SHOW_EXTERNAL" = true ]; then
+                    ext_url="${scheme}://${p}.${project}.127.0.0.1.$(devbox::external_provider)"
+                    printf '%s\t%s\t%s\t%s\n' "$container" "$p" "$local_url" "$ext_url"
+                else
+                    printf '%s\t%s\t%s\n' "$container" "$p" "$local_url"
+                fi
+            done
+            continue
+        fi
+
         echo
         if [ "$running" = false ]; then
             echo "=== ${container} (not running) ==="
@@ -2115,7 +2135,6 @@ if [ "$MODE" = "ports" ]; then
             echo "=== ${container} ==="
         fi
 
-        project="${container#devbox-}"
         {
             if [ "$PORTS_SHOW_EXTERNAL" = true ]; then
                 printf 'PORT\tURL\tEXTERNAL URL\n'
@@ -2134,7 +2153,7 @@ if [ "$MODE" = "ports" ]; then
         } | column -t -s "$(printf '\t')"
     done
 
-    if [ "$any_output" = false ]; then
+    if [ "$any_output" = false ] && [ "$PORTS_MACHINE" = false ]; then
         if [ "$PORTS_SHOW_ALL" = false ]; then
             echo "No listening ports on running devbox containers."
             echo "Use 'devbox ports --all' to list every registered route."

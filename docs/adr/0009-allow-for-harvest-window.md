@@ -35,7 +35,14 @@ A new `devbox allow-for [minutes] [project]` command opens an
    restricted to `127.0.0.1` on UDP/TCP 53; DoT on TCP 853 is
    `REJECT`ed. This guarantees every name resolution flows through the
    audited resolver, which is the precondition that makes the harvest pool
-   complete.
+   complete. The rootless DinD inside the devbox container is a special
+   case: inner build/run containers live in a separate network namespace
+   where `127.0.0.1` resolves to their own (empty) loopback. The
+   slirp4netns gateway address `10.0.2.2`, set as the daemon-wide default
+   via `~/.config/docker/daemon.json` in `start-rootless-docker.sh`,
+   loopback-maps back to the devbox container's `127.0.0.1:53`, so inner
+   DNS still flows through dnsmasq and the audit invariant holds for
+   `docker build` and `docker run` too.
 3. **Sentinel state** in `/etc/devbox-shared/.allow-for.state` (root-owned
    inside the container, mode 0644). Holds `started_at`, `expires_at`,
    container name, and the teardown daemon's PID. The node user can read
@@ -186,6 +193,9 @@ feature has run in real use:
 - `scripts/start-allow-for-window` (new) — root-privileged window setup.
 - `scripts/teardown-allow-for-window` (new) — root-privileged window
   teardown + harvest log write + notification.
+- `scripts/start-rootless-docker.sh` — pins inner-DinD DNS to
+  `10.0.2.2` via `~/.config/docker/daemon.json` so the DNS-pinning rule
+  does not break `docker build`/`docker run` inside the container.
 - `docker-run.sh` — new `MODE=allow-for` subcommand.
 - ADR 0001 — the underlying dnsmasq/ipset model this feature extends.
 - ADR 0003 — the root/node privilege boundary this feature relies on.

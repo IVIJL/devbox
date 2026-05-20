@@ -1805,6 +1805,15 @@ if [ "$MODE" = "update" ]; then
         "$DEVBOX_DIR/scripts/ensure-agent-browser-host-state.sh" --quiet-if-noop || true
     fi
 
+    # Devbox agent skill self-heal (ADR 0011). Seeds/refreshes the
+    # host-shared 'devbox' skill at ~/.agents/skills/devbox/ plus the
+    # per-agent symlinks for Claude Code and Codex. install.sh is the
+    # canonical creator; this call brings existing pre-ADR-0011 installs
+    # forward and picks up skill body updates as the repo evolves.
+    if [ -x "$DEVBOX_DIR/scripts/ensure-devbox-skill.sh" ]; then
+        "$DEVBOX_DIR/scripts/ensure-devbox-skill.sh" --quiet-if-noop || true
+    fi
+
     if [ "${DEVBOX_UPDATE_PULLED:-}" = "1" ]; then
         # Install or refresh zsh completion file (no .zshrc modifications here)
         _completion_src="$DEVBOX_DIR/completions/_devbox"

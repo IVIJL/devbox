@@ -537,6 +537,32 @@ EOF
     CONFIGURED+=("agent-browser allowlist example ($example)")
 }
 
+# --- Devbox agent skill (ADR 0011) -------------------------------------------
+# Delegates to scripts/ensure-devbox-skill.sh — the same script
+# `devbox update` self-heals existing installs through, so install-time
+# and upgrade-time paths stay in lockstep. Seeds the host-shared
+# 'devbox' skill at ~/.agents/skills/devbox/ + per-agent symlinks for
+# Claude Code and Codex so every Container picks it up via the existing
+# host bind mounts (ADR 0002).
+
+setup_devbox_skill() {
+    info "Installing devbox agent skill..."
+
+    local provisioner="$DEVBOX_DIR/scripts/ensure-devbox-skill.sh"
+    if [ ! -x "$provisioner" ]; then
+        warn "scripts/ensure-devbox-skill.sh missing or non-executable; skipping."
+        SKIPPED+=("devbox agent skill (provisioner missing)")
+        return
+    fi
+
+    if "$provisioner"; then
+        CONFIGURED+=("devbox agent skill (~/.agents/skills/devbox + Claude/Codex symlinks)")
+    else
+        warn "Failed to seed devbox agent skill — agents will lack devbox-aware context."
+        SKIPPED+=("devbox agent skill (setup failed; see warnings above)")
+    fi
+}
+
 # --- SSH agent configuration -------------------------------------------------
 
 configure_ssh_agent() {
@@ -886,9 +912,10 @@ main() {
         msg "  6. Create devbox-agent OS user + add $USER to that group (agent-browser feature; sudo prompt)"
         msg "  7. Stage agent-browser Python helpers to /usr/local/lib/devbox (sudo prompt)"
         msg "  8. Install agent-browser allowlist example to \$HOME/.config/devbox"
-        msg "  9. Install 'devbox' command to $SYMLINK_PATH"
-        msg " 10. Optionally generate Claude Code token for containers"
-        msg " 11. Check Docker availability"
+        msg "  9. Install 'devbox' agent skill to \$HOME/.agents/skills/devbox (+ Claude/Codex symlinks)"
+        msg " 10. Install 'devbox' command to $SYMLINK_PATH"
+        msg " 11. Optionally generate Claude Code token for containers"
+        msg " 12. Check Docker availability"
         echo ""
         if ! confirm "Continue?"; then
             msg "Aborted."
@@ -922,6 +949,9 @@ main() {
 
     echo ""
     setup_agent_allowlist_example
+
+    echo ""
+    setup_devbox_skill
 
     echo ""
     install_command

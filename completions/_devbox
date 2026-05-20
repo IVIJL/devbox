@@ -42,7 +42,7 @@ _devbox() {
                 'deny:Remove allowed domain (interactive)'
                 'blocked:Show blocked DNS queries, allow interactively'
                 'allow-for:Open a time-bounded Allow-for window (default 15 min)'
-                'agent-browser:Control Host agent Chrome (start/stop/status/allow-for)'
+                'agent-browser:Control Host agent Chrome (start/stop/status/open/allow-for)'
                 'cursor:Open Cursor attached to running devbox'
                 'code:Open VS Code attached to running devbox'
                 'clip:Grab clipboard image for container use'
@@ -135,14 +135,18 @@ _devbox() {
                     # Layout: devbox agent-browser <sub> [args]
                     #   CURRENT==3 → subcommand
                     #   CURRENT==4 → container (start/stop/status) OR
-                    #                minutes/--stop (allow-for)
-                    #   CURRENT==5 → container (allow-for only)
+                    #                minutes/--stop (allow-for) OR
+                    #                --project flag / URL (open)
+                    #   CURRENT==5 → container (allow-for only) OR
+                    #                project value / URL (open)
+                    #   CURRENT>=6 → URL (open)
                     if (( CURRENT == 3 )); then
                         local -a subs
                         subs=(
                             'start:Launch Host agent Chrome bound to container'
                             'stop:Stop session and clean up resources'
                             'status:Show session state (Chrome/proxy/watchdog PIDs)'
+                            'open:Open URL(s) as new tabs in the running session'
                             'allow-for:Open time-bounded network window (default mode)'
                             'help:Show agent-browser help'
                         )
@@ -151,6 +155,19 @@ _devbox() {
                         case $words[3] in
                             start|stop|status)
                                 _devbox_containers
+                                ;;
+                            open)
+                                # All positionals are URLs; only
+                                # `--project`/`-p` overrides the CWD
+                                # default. Offer the flag plus a
+                                # container picker so tab works for
+                                # either path.
+                                local -a flags
+                                flags=(
+                                    '--project:Target a non-CWD container'
+                                    '-p:Target a non-CWD container'
+                                )
+                                _describe 'open flags' flags
                                 ;;
                             allow-for)
                                 # First positional is minutes (numeric)
@@ -163,9 +180,20 @@ _devbox() {
                                 ;;
                         esac
                     elif (( CURRENT == 5 )); then
-                        if [ "$words[3]" = "allow-for" ]; then
-                            _devbox_containers
-                        fi
+                        case $words[3] in
+                            allow-for)
+                                _devbox_containers
+                                ;;
+                            open)
+                                # Container picker only after explicit
+                                # --project/-p flag; bare positionals
+                                # are URLs and have no completion.
+                                if [ "$words[4]" = "--project" ] \
+                                    || [ "$words[4]" = "-p" ]; then
+                                    _devbox_containers
+                                fi
+                                ;;
+                        esac
                     fi
                     ;;
             esac

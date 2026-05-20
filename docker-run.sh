@@ -1553,13 +1553,16 @@ case "${1:-}" in
              AGENT_BROWSER_SUB="${1:-}"
              [ -n "$AGENT_BROWSER_SUB" ] && shift
              # `allow-for` carries an extra positional: either <minutes>
-             # or `--stop`, with an optional trailing project token. All
-             # other subcommands take just an optional project token in
-             # AGENT_BROWSER_TARGET. The broker performs final argument
-             # validation; this layer only collects the tokens.
+             # or `--stop`, with an optional trailing project token.
+             # `open` carries one or more URL positionals after an
+             # optional project token. All other subcommands take just
+             # an optional project token in AGENT_BROWSER_TARGET. The
+             # broker performs final argument validation; this layer
+             # only collects the tokens.
              AGENT_BROWSER_MINUTES=""
              AGENT_BROWSER_STOP=false
              AGENT_BROWSER_TARGET=""
+             AGENT_BROWSER_URLS=()
              if [ "$AGENT_BROWSER_SUB" = "allow-for" ]; then
                  # Position-disambiguated parse so a project name that
                  # happens to be all digits (`devbox-123`) is not
@@ -1590,6 +1593,41 @@ case "${1:-}" in
                      esac
                  done
                  unset ab_first_positional
+             elif [ "$AGENT_BROWSER_SUB" = "open" ]; then
+                 # `open` shape: [--project|-p NAME] <url> [<url>...].
+                 # All positionals are URLs — bare hostnames like
+                 # `localhost`, `example.com`, or `about:blank` are
+                 # valid browser targets and indistinguishable from a
+                 # project token by syntax alone. Explicit `--project`
+                 # (`-p`) overrides the default CWD-derived container.
+                 ab_expect_project=false
+                 for arg in "$@"; do
+                     case "$arg" in
+                         '') ;;
+                         --project|-p)
+                             ab_expect_project=true
+                             ;;
+                         --project=*)
+                             AGENT_BROWSER_TARGET="${arg#--project=}"
+                             ;;
+                         -p=*)
+                             AGENT_BROWSER_TARGET="${arg#-p=}"
+                             ;;
+                         *)
+                             if [ "$ab_expect_project" = true ]; then
+                                 AGENT_BROWSER_TARGET="$arg"
+                                 ab_expect_project=false
+                             else
+                                 AGENT_BROWSER_URLS+=("$arg")
+                             fi
+                             ;;
+                     esac
+                 done
+                 if [ "$ab_expect_project" = true ]; then
+                     echo "agent-browser open: --project/-p requires an argument" >&2
+                     exit 2
+                 fi
+                 unset ab_expect_project
              else
                  AGENT_BROWSER_TARGET="${1:-}"
              fi
@@ -2734,14 +2772,14 @@ fi
 
 if [ "$MODE" = "agent-browser" ]; then
     if [ -z "$AGENT_BROWSER_SUB" ]; then
-        echo "Usage: devbox agent-browser <start|stop|status|allow-for> [args]" >&2
+        echo "Usage: devbox agent-browser <start|stop|status|open|allow-for> [args]" >&2
         exit 2
     fi
     case "$AGENT_BROWSER_SUB" in
-        start|stop|status|allow-for|-h|--help|help) ;;
+        start|stop|status|open|allow-for|-h|--help|help) ;;
         *)
             echo "Unknown agent-browser subcommand: $AGENT_BROWSER_SUB" >&2
-            echo "Usage: devbox agent-browser <start|stop|status|allow-for> [args]" >&2
+            echo "Usage: devbox agent-browser <start|stop|status|open|allow-for> [args]" >&2
             exit 2
             ;;
     esac
@@ -2791,6 +2829,14 @@ if [ "$MODE" = "agent-browser" ]; then
             exit 2
         fi
         exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" "$AGENT_BROWSER_SUB" "$AGENT_BROWSER_MINUTES" "$container"
+    fi
+
+    if [ "$AGENT_BROWSER_SUB" = "open" ]; then
+        if [ "${#AGENT_BROWSER_URLS[@]}" -eq 0 ]; then
+            echo "Usage: devbox agent-browser open [--project|-p NAME] <url> [<url>...]" >&2
+            exit 2
+        fi
+        exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" open "$container" "${AGENT_BROWSER_URLS[@]}"
     fi
 
     exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" "$AGENT_BROWSER_SUB" "$container"

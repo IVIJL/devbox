@@ -138,6 +138,7 @@ Usage:
   agent-browser-broker.sh start      <container>
   agent-browser-broker.sh stop       <container>
   agent-browser-broker.sh status     <container>
+  agent-browser-broker.sh open       <container> <url> [<url>...]
   agent-browser-broker.sh allow-for  <minutes> <container>
   agent-browser-broker.sh allow-for  --stop    <container>
 EOF
@@ -2162,6 +2163,86 @@ PY
     fi
 }
 
+# --- subcommand: open --------------------------------------------------------
+
+# Push one URL into the running session as a new tab via Chrome DevTools
+# Protocol's HTTP endpoint `PUT /json/new?<url>`. The endpoint creates a
+# top-level target in the default browser context — no WebSocket
+# handshake, no extra Python dep. Chrome's anti-DNS-rebinding guard
+# requires the Host header to be `localhost` (not `127.0.0.1`), so the
+# call sets it explicitly. The 5s cap mirrors the cmd_start smoke-test
+# pattern so a hung tab cannot stall the rest of the batch.
+_open_url_via_cdp() {
+    local cdp_port="$1" url="$2"
+    [ -n "$cdp_port" ] || return 2
+    [ -n "$url" ]      || return 2
+    local encoded
+    if command -v jq >/dev/null 2>&1; then
+        encoded="$(jq -rn --arg u "$url" '$u|@uri')"
+    else
+        encoded="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$url")"
+    fi
+    curl -sS -X PUT \
+        -H "Host: localhost" \
+        --max-time 5 \
+        --fail \
+        --output /dev/null \
+        "http://127.0.0.1:${cdp_port}/json/new?${encoded}"
+}
+
+cmd_open() {
+    local container
+    container="$(_require_container_arg "${1:-}")"
+    shift
+    if [ "$#" -eq 0 ]; then
+        _warn "Usage: agent-browser-broker.sh open <container> <url> [<url>...]"
+        exit 2
+    fi
+
+    local state_file
+    state_file="$(_state_file "$container")"
+    [ -f "$state_file" ] \
+        || _die "No active session for ${container}. Run 'devbox agent-browser start ${container}' first."
+
+    local cdp_port chrome_pid profile_dir
+    cdp_port="$(_state_get "$state_file" cdp_port_host || true)"
+    chrome_pid="$(_state_get "$state_file" chrome_pid || true)"
+    profile_dir="$(_state_get "$state_file" profile_dir || true)"
+    { [ -n "$cdp_port" ]    && [ "$cdp_port" != "null" ];    } \
+        || _die "State file ${state_file} is missing cdp_port_host."
+    { [ -n "$chrome_pid" ]  && [ "$chrome_pid" != "null" ];  } \
+        || _die "State file ${state_file} is missing chrome_pid."
+    { [ -n "$profile_dir" ] && [ "$profile_dir" != "null" ]; } \
+        || _die "State file ${state_file} is missing profile_dir."
+
+    # Liveness check matches cmd_status: the recorded PID must still
+    # carry the --user-data-dir marker. Refuses to push URLs into a
+    # stale session whose Chrome was killed externally.
+    local chrome_marker="--user-data-dir=$profile_dir"
+    if ! _pid_matches_marker "$chrome_pid" "$chrome_marker"; then
+        _die "Chrome for ${container} is not alive (pid ${chrome_pid} no longer matches profile marker). Restart the session."
+    fi
+
+    local opened=0 failed=0 url
+    for url in "$@"; do
+        if _open_url_via_cdp "$cdp_port" "$url"; then
+            opened=$((opened + 1))
+            _log "Opened: ${url}"
+        else
+            failed=$((failed + 1))
+            _warn "Failed to open: ${url}"
+        fi
+    done
+
+    if [ "$opened" -eq 0 ]; then
+        _warn "No URLs opened (${failed} failed)."
+        exit 1
+    fi
+    if [ "$failed" -gt 0 ]; then
+        _warn "${failed} URL(s) failed to open; ${opened} succeeded."
+    fi
+}
+
 # --- subcommand: status ------------------------------------------------------
 
 cmd_status() {
@@ -2282,6 +2363,7 @@ main() {
         start)     cmd_start     "$@" ;;
         stop)      cmd_stop      "$@" ;;
         status)    cmd_status    "$@" ;;
+        open)      cmd_open      "$@" ;;
         allow-for) cmd_allow_for "$@" ;;
         -h|--help|help) _usage ;;
         *) _usage >&2; exit 2 ;;

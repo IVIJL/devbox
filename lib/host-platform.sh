@@ -305,8 +305,12 @@ _host_platform::ensure_agent_user_macos() {
     # omitted. The account is never logged into interactively, so we
     # assign a random one-shot password; sudo from an admin account does
     # not need this password to launch Chrome as devbox-agent. The shell
-    # is `/usr/bin/false` to additionally block `su devbox-agent`. `-GID`
-    # binds the account to the `devbox-agent` group we just created.
+    # is `/usr/bin/false` to additionally block `su devbox-agent`.
+    #
+    # sysadminctl does NOT support setting the primary group at creation
+    # time (no -GID flag in the documented arg list). Primary group is
+    # set immediately after via dscl — same shape ensure-agent-browser-
+    # host-state.sh uses for the upgrade path.
     local one_shot_password
     one_shot_password="$(openssl rand -base64 24 2>/dev/null \
         || dd if=/dev/urandom bs=18 count=1 2>/dev/null | base64)"
@@ -314,7 +318,6 @@ _host_platform::ensure_agent_user_macos() {
     if ! sudo sysadminctl -addUser devbox-agent \
             -fullName "Devbox Agent" \
             -password "$one_shot_password" \
-            -GID "$group_gid" \
             -shell /usr/bin/false 2>&1 \
             | grep -v -E 'Creating user record|Setting up home directory|done' \
             >&2; then
@@ -324,6 +327,11 @@ _host_platform::ensure_agent_user_macos() {
 
     if ! id devbox-agent >/dev/null 2>&1; then
         printf 'host_platform::ensure_agent_user: sysadminctl did not create devbox-agent\n' >&2
+        return 1
+    fi
+
+    if ! sudo dscl . -create /Users/devbox-agent PrimaryGroupID "$group_gid"; then
+        printf 'host_platform::ensure_agent_user: failed to set devbox-agent primary group to %s\n' "$group_gid" >&2
         return 1
     fi
 }

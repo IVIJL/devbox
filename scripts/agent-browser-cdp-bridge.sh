@@ -124,33 +124,62 @@ case "$op" in
         ;;
 esac
 
-# Idempotent pre-flight. Skip the probe entirely on subsequent calls
-# in the same container instance; the upstream CLI keeps its CDP
-# binding in its own session state once `connect` lands.
+# Idempotent pre-flight with stale-state detection.
 #
-# Forward all of the user's global flags (e.g. `--state`, `--profile`,
-# `--config`) into the preflight connect so the bridge gets recorded
-# under the SAME state the real command will read from. Without this
-# forwarding the connect would land in the default state and the
-# named-state command would still fall back to local-Chrome launch.
-if [ ! -f "$SENTINEL" ]; then
-    if curl -sf --max-time 1 "$BRIDGE_URL" >/dev/null 2>&1; then
-        # Ensure `--session` is present even when the user relied on
-        # AGENT_BROWSER_SESSION or the upstream default — the sentinel
-        # is keyed on that resolved name, so the connect must match.
-        connect_args=("${preargs[@]+"${preargs[@]}"}")
-        case " ${connect_args[*]} " in
-            *" --session "*|*" --session="*) ;;
-            *) connect_args+=(--session "$session_name") ;;
-        esac
-        if "$REAL" "${connect_args[@]}" connect 9222 >/dev/null 2>&1; then
-            : > "$SENTINEL"
-        fi
-        # Best-effort: if connect failed, fall through to the real
-        # binary so its own "Chrome not found" message reaches the
-        # user with the canonical install hint — better than masking
-        # the failure here.
+# Each Chrome process emits a unique `webSocketDebuggerUrl` of the form
+# `ws://127.0.0.1:9222/devtools/browser/<uuid>`. The upstream CLI caches
+# that exact URL in its own state on `connect`; if the user restarts
+# the session (`devbox agent-browser stop` → `start`, or the watchdog
+# tears down a closed window and a new session comes up), the cached
+# URL targets a dead Chrome process and every subsequent command fails
+# even though port 9222 is up again with a different UUID.
+#
+# The sentinel therefore stores the WS URL we connected to, not just a
+# yes/no marker. Before skipping connect we re-probe the bridge and
+# compare: matching UUID = same Chrome, skip cheaply; mismatch =
+# Chrome restarted under us, drop the sentinel and reconnect.
+#
+# Pre-verb global flags (`--state`, `--profile`, etc.) are forwarded
+# into the connect call so the bridge gets recorded under the SAME
+# state the real command will read from.
+current_ws=""
+if curl_out="$(curl -sf --max-time 1 "$BRIDGE_URL" 2>/dev/null)"; then
+    # Extract the `"webSocketDebuggerUrl": "<url>"` snippet without
+    # adding a jq dependency to the devbox image. Chrome pretty-prints
+    # `/json/version` with whitespace around the colon, so the pattern
+    # has to tolerate `:`, `: `, `:\t`, etc. The `|| true` on the
+    # pipeline keeps `set -euo pipefail` from killing the wrapper when
+    # the field is absent (older Chrome builds, partial responses) —
+    # we degrade to "no UUID known", which the caller handles by
+    # falling through to the upstream binary unchanged.
+    current_ws="$(printf '%s' "$curl_out" \
+        | grep -oE '"webSocketDebuggerUrl"[[:space:]]*:[[:space:]]*"[^"]*"' \
+        | head -1 || true)"
+fi
+
+if [ -f "$SENTINEL" ] && [ -n "$current_ws" ]; then
+    cached_ws="$(cat "$SENTINEL" 2>/dev/null || true)"
+    if [ "$cached_ws" != "$current_ws" ]; then
+        rm -f "$SENTINEL"
     fi
+fi
+
+if [ ! -f "$SENTINEL" ] && [ -n "$current_ws" ]; then
+    # Ensure `--session` is present even when the user relied on
+    # AGENT_BROWSER_SESSION or the upstream default — the sentinel
+    # is keyed on that resolved name, so the connect must match.
+    connect_args=("${preargs[@]+"${preargs[@]}"}")
+    case " ${connect_args[*]} " in
+        *" --session "*|*" --session="*) ;;
+        *) connect_args+=(--session "$session_name") ;;
+    esac
+    if "$REAL" "${connect_args[@]}" connect 9222 >/dev/null 2>&1; then
+        printf '%s\n' "$current_ws" > "$SENTINEL"
+    fi
+    # Best-effort: if connect failed, fall through to the real
+    # binary so its own "Chrome not found" message reaches the
+    # user with the canonical install hint — better than masking
+    # the failure here.
 fi
 
 exec "$REAL" "$@"

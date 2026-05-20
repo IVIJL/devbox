@@ -38,6 +38,8 @@ Do not reach for it for: pure HTTP testing (use `curl`), API contract checks (us
 - Closed by `devbox agent-browser allow-for --stop <project>`, timer expiry, or session stop.
 - Default duration 15 min, capped at 24 h.
 
+**CDP bridge plumbing.** Inside the container, the `agent-browser` CLI is shadowed by a thin devbox wrapper that auto-issues `connect 9222` against the Agent-browser session bridge on the first Chrome-bound call after `devbox agent-browser start`. You do not need to run `agent-browser connect 9222` yourself. Power-user invocations that put global flags after the verb or use uncommon options like `--state` may bypass auto-connect — in those edge cases, run `agent-browser <global-flags> connect 9222` once and the upstream CLI takes it from there.
+
 **Decision rule.** Before any navigation, ask: "Is the target URL a project dev URL (`*.test`, `*.127.0.0.1.sslip.io`, `localhost`)?"
 
 - **Yes** — proceed. No window needed; the bypass list lets the request through directly.

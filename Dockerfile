@@ -346,6 +346,12 @@ COPY scripts/show-allow-for-status.sh /usr/local/bin/show-allow-for-status
 COPY scripts/closeout-allow-for-on-restart.sh /usr/local/bin/closeout-allow-for-on-restart
 COPY scripts/start-agent-browser-host-allow.sh /usr/local/bin/start-agent-browser-host-allow
 COPY scripts/stop-agent-browser-host-allow.sh /usr/local/bin/stop-agent-browser-host-allow
+# Shadow the npm-installed `agent-browser` CLI with a thin wrapper that
+# auto-connects to the in-container CDP bridge on :9222. /usr/local/bin
+# sits ahead of /usr/local/share/npm-global/bin in PATH, so this layer
+# alone is enough to take precedence; the real binary stays reachable
+# at its absolute path for the wrapper's exec.
+COPY scripts/agent-browser-cdp-bridge.sh /usr/local/bin/agent-browser
 
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/n /usr/local/bin/nx /usr/local/bin/start-rootless-docker.sh \
@@ -356,7 +362,8 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/show-allow-for-status \
     /usr/local/bin/closeout-allow-for-on-restart \
     /usr/local/bin/start-agent-browser-host-allow \
-    /usr/local/bin/stop-agent-browser-host-allow
+    /usr/local/bin/stop-agent-browser-host-allow \
+    /usr/local/bin/agent-browser
 
 # Sudo with password — prevents AI agents from modifying firewall rules
 # Password is injected via --mount=type=secret (never stored in image layers/metadata)

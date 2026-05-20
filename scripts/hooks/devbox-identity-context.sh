@@ -36,13 +36,20 @@ Boundaries:
   or stop containers, open allow-for windows, manage the allowlist, or
   drive the host Agent-browser Chrome, ask the user to run the
   corresponding 'devbox …' command on host.
-- Network is default-deny. Only ~15 allowlisted domains resolve;
-  everything else is REJECTed at the firewall. If curl/npm/pip/fetch
-  fails with a connection error, the most likely cause is that the
-  host is not in the allowlist. Ask the user to run on host:
+- Container network is default-deny. Only ~15 allowlisted domains
+  resolve; everything else is REJECTed at the firewall. If
+  curl/npm/pip/fetch (container-side traffic) fails with a connection
+  error, the most likely cause is that the host is not in the
+  Allowlist. Ask the user to run on host:
     devbox allow <domain>          (durable allowlist entry)
     devbox allow-for <minutes>     (time-bounded harvest window)
-- Dev URLs bypass the firewall via built-in routes. Both forms resolve
+- Agent-browser is a SEPARATE gate. Host Chrome browses through its
+  own forward proxy with its own allowlist. Browser failures like
+  ERR_TUNNEL_CONNECTION_FAILED or 'proxy denied' do NOT come from the
+  container firewall; 'devbox allow' / 'devbox allow-for' will NOT fix
+  them. Ask the user to run on host instead:
+    devbox agent-browser allow-for <minutes> ${project}
+- Dev URLs bypass both gates via built-in routes. Both forms resolve
   locally: http(s)://<port>.${project}.test and
   http(s)://<port>.${project}.127.0.0.1.sslip.io
 

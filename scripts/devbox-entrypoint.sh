@@ -54,6 +54,21 @@ if [ "$(id -u)" = "0" ]; then
 
     /usr/local/bin/init-firewall.sh
 
+    # Container identity file (ADR 0011 Layer 1). Single source of truth
+    # for "am I inside a devbox container, and which project?" — read by
+    # the agent-context hook and the devbox skill's identity check. The
+    # file's presence is the signal; the project field is consumed to
+    # construct host-side command examples. Root-owned, world-readable.
+    # Idempotent across container restarts: the redirect truncates the
+    # existing file in place, so no orphan tmp files accumulate. `jq -n`
+    # guarantees valid JSON regardless of project-name content (the value
+    # is LDH-sanitised upstream per ADR 0005, but defence-in-depth keeps
+    # any future relaxation of the sanitiser from producing malformed JSON).
+    mkdir -p /etc/devbox
+    jq -n --arg project "${DEVBOX_PROJECT_NAME:-unknown}" '{project: $project}' \
+        > /etc/devbox/identity.json
+    chmod 0644 /etc/devbox/identity.json
+
     exec setpriv --reuid=node --regid=node --init-groups -- "$0" "$@"
 fi
 

@@ -294,6 +294,176 @@ s.close()
 PY
 }
 
+_windows_primary_work_area() {
+    powershell.exe -NoProfile -Command '
+Add-Type -AssemblyName System.Windows.Forms
+$wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+"$($wa.X) $($wa.Y) $($wa.Width) $($wa.Height)"
+' 2>/dev/null | tr -d '\r' | tail -1
+}
+
+_fit_chrome_window_to_work_area() {
+    local cdp_port="$1" work_area="$2" bottom_margin="${AGENT_BROWSER_WSLG_WORKAREA_MARGIN:-24}"
+    [ -n "$cdp_port" ] && [ -n "$work_area" ] || return 1
+
+    python3 - "$cdp_port" "$work_area" "$bottom_margin" <<'PY'
+import base64
+import http.client
+import json
+import os
+import socket
+import struct
+import sys
+
+
+def http_get(port, path):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8")
+    conn.close()
+    return json.loads(body)
+
+
+def ws_connect(url):
+    rest = url[len("ws://") :]
+    host_port, path = rest.split("/", 1)
+    host, port_s = host_port.split(":")
+    port = int(port_s)
+    sock = socket.create_connection((host, port), timeout=3)
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    req = (
+        f"GET /{path} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+    sock.sendall(req.encode("ascii"))
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("websocket handshake aborted")
+        buf += chunk
+    if b"101" not in buf.split(b"\r\n", 1)[0]:
+        raise RuntimeError("websocket handshake refused")
+    return sock
+
+
+def ws_send(sock, payload):
+    data = payload.encode("utf-8")
+    header = bytearray([0x81])
+    mask = os.urandom(4)
+    if len(data) < 126:
+        header.append(0x80 | len(data))
+    elif len(data) < 65536:
+        header.append(0x80 | 126)
+        header += struct.pack(">H", len(data))
+    else:
+        header.append(0x80 | 127)
+        header += struct.pack(">Q", len(data))
+    header += mask
+    sock.sendall(bytes(header) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+
+def ws_recv(sock):
+    def must(n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise RuntimeError("websocket closed")
+            buf += chunk
+        return buf
+
+    while True:
+        b0, b1 = must(2)
+        opcode = b0 & 0x0F
+        plen = b1 & 0x7F
+        if plen == 126:
+            (plen,) = struct.unpack(">H", must(2))
+        elif plen == 127:
+            (plen,) = struct.unpack(">Q", must(8))
+        mask = must(4) if (b1 & 0x80) else None
+        data = must(plen)
+        if mask:
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        if opcode == 0x1:
+            return data.decode("utf-8")
+        if opcode == 0x8:
+            raise RuntimeError("websocket closed by remote")
+
+
+def main():
+    port = int(sys.argv[1])
+    wa_x, wa_y, wa_w, wa_h = [int(part) for part in sys.argv[2].split()]
+    margin = max(0, int(sys.argv[3]))
+    work_bottom = wa_y + wa_h
+
+    version = http_get(port, "/json/version")
+    targets = http_get(port, "/json")
+    page = next((t for t in targets if t.get("type") == "page"), None)
+    if page is None:
+        print("no page target", file=sys.stderr)
+        return 2
+
+    sock = ws_connect(version["webSocketDebuggerUrl"])
+    next_id = 0
+
+    def call(method, params=None):
+        nonlocal next_id
+        next_id += 1
+        msg = {"id": next_id, "method": method}
+        if params is not None:
+            msg["params"] = params
+        ws_send(sock, json.dumps(msg))
+        while True:
+            resp = json.loads(ws_recv(sock))
+            if resp.get("id") == next_id:
+                if "error" in resp:
+                    raise RuntimeError(resp["error"])
+                return resp.get("result", {})
+
+    window_id = call("Browser.getWindowForTarget", {"targetId": page["id"]})["windowId"]
+    bounds = call("Browser.getWindowBounds", {"windowId": window_id})["bounds"]
+    if bounds.get("windowState") not in (None, "normal"):
+        print(f"unchanged state={bounds.get('windowState')}")
+        return 0
+
+    left = int(bounds.get("left", wa_x))
+    top = int(bounds.get("top", wa_y))
+    width = int(bounds.get("width", min(1280, wa_w)))
+    height = int(bounds.get("height", min(900, wa_h)))
+
+    new_top = max(top, wa_y)
+    max_height = work_bottom - new_top - margin
+    if max_height < 480:
+        print(f"unchanged bounds={bounds} work_area={sys.argv[2]}")
+        return 0
+
+    new_height = min(height, max_height)
+    if new_top == top and new_height == height and top + height <= work_bottom - margin:
+        print(f"unchanged bounds={bounds} work_area={sys.argv[2]}")
+        return 0
+
+    new_bounds = {
+        "left": left,
+        "top": new_top,
+        "width": width,
+        "height": new_height,
+        "windowState": "normal",
+    }
+    call("Browser.setWindowBounds", {"windowId": window_id, "bounds": new_bounds})
+    print(f"adjusted from={bounds} to={new_bounds} work_area={sys.argv[2]} margin={margin}")
+
+
+if __name__ == "__main__":
+    main()
+PY
+}
+
 # --- Detach helper -----------------------------------------------------------
 
 # Echo the literal command used to detach a child from the broker's session.
@@ -814,7 +984,9 @@ EOF
     # WSL2 + WSLg (the user's primary platform): WAYLAND_DISPLAY +
     # XDG_RUNTIME_DIR point at /mnt/wslg, world-readable by default so
     # devbox-agent can use them as-is. DISPLAY=:0 + WSLg's Xwayland
-    # socket are equally accessible.
+    # socket are equally accessible. PULSE_SERVER points Chrome at WSLg's
+    # audio socket; without preserving it, GUI works but media is silent
+    # under sudo-launched devbox-agent Chrome.
     #
     # Native Linux X11: DISPLAY + XAUTHORITY. The user's Xauthority cookie
     # must be readable by devbox-agent — outside the scope of this slice
@@ -827,7 +999,7 @@ EOF
     # devbox-agent session; that work also lives in slice 03.
     local detach
     detach="$(_detach_prefix)"
-    sudo --preserve-env=DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR,XDG_SESSION_TYPE \
+    sudo --preserve-env=DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR,XDG_SESSION_TYPE,PULSE_SERVER \
         -u devbox-agent "$detach" sh -c '
         exec "$1" \
             --remote-debugging-port="$2" \
@@ -844,6 +1016,7 @@ EOF
             --log-net-log="$5" \
             --proxy-server="http://127.0.0.1:$6" \
             --proxy-bypass-list="$7" \
+            --ozone-platform=x11 \
             --test-type \
             </dev/null \
             >"$3/chrome.stdout.log" \
@@ -1183,6 +1356,22 @@ EOF
         # the three processes, remove the state file).
         cmd_stop "$container"
         exit 1
+    fi
+
+    local platform
+    platform="$(host_platform::detect 2>/dev/null || true)"
+    if [ "$platform" = "wsl2" ]; then
+        local work_area fit_result
+        work_area="$(_windows_primary_work_area || true)"
+        if [ -n "$work_area" ]; then
+            if fit_result="$(_fit_chrome_window_to_work_area "$cdp_port" "$work_area" 2>&1)"; then
+                _log "  WSLg window fit:           ${fit_result}"
+            else
+                _warn "WSLg window fit failed: ${fit_result}"
+            fi
+        else
+            _warn "WSLg window fit skipped: could not read Windows primary screen working area."
+        fi
     fi
 
     _log "Agent-browser session started."

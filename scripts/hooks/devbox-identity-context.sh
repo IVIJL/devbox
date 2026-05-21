@@ -1,6 +1,6 @@
 #!/bin/sh
 # Devbox container identity context for agents (ADR 0011 Layer 3).
-# Fires from Claude Code SessionStart and Codex UserPromptSubmit hooks.
+# Fires from Claude Code and Codex SessionStart hooks.
 # Emits a JSON hook response with `additionalContext` so the host agent
 # injects our identity block into the conversation. The same managed-
 # settings files are bind-mounted shared, so we guard on the identity
@@ -14,7 +14,7 @@
 #   {"hookSpecificOutput": {"hookEventName": "...", "additionalContext": "..."}}
 # `hookEventName` is read from the per-hook stdin payload Claude Code
 # and Codex both feed us; we echo it back so the same script services
-# both SessionStart (Claude Code) and UserPromptSubmit (Codex 0.128).
+# both Claude Code and Codex SessionStart.
 [ -f /etc/devbox/identity.json ] || exit 0
 
 project=$(jq -r .project /etc/devbox/identity.json 2>/dev/null) || exit 0

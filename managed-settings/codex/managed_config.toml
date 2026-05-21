@@ -1,10 +1,8 @@
 # Codex CLI managed config — registers the container-only identity
-# context hook (ADR 0011 Layer 3). Uses UserPromptSubmit because Codex
-# 0.128 does not yet document a SessionStart event; the script's
-# identity-file guard keeps the per-turn cost zero on host and minimal
-# inside the container. Future work: migrate to SessionStart once Codex
-# publishes it (see ADR 0011 § Future work).
+# context hook (ADR 0011 Layer 3). SessionStart keeps the identity
+# reminder to one injection per Codex session; the script's identity-file
+# guard keeps the same managed config a no-op on host.
 [hooks]
-UserPromptSubmit = [
+SessionStart = [
     { hooks = [{ type = "command", command = "bash /usr/local/bin/devbox-identity-context.sh" }] }
 ]

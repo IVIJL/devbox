@@ -146,9 +146,7 @@ layer**, not the user-owned config files:
   registering a `SessionStart` hook. Claude Code merges managed
   settings additively with `~/.claude/settings.json`.
 - Codex CLI: TOML at `/etc/codex/managed_config.toml` registering
-  a `UserPromptSubmit` hook (Codex 0.128 does not yet document a
-  `SessionStart` event; `UserPromptSubmit` fires on every turn,
-  the script's identity guard keeps cost zero on host).
+  a `SessionStart` hook.
 
 Both `/etc/claude-code/` and `/etc/codex/` are baked into the
 container image via `Dockerfile COPY`. They are container-only paths
@@ -159,9 +157,8 @@ Claude/Codex installs are not touched.
 The hook output is ~12 lines: identity (project name), the three
 boundary facts (host-only CLI, default-deny network, dev URL
 bypass), and a pointer to the `devbox` skill for full guidance.
-Cost is fixed per session for Claude Code (`SessionStart` fires
-once); per turn for Codex (negligible — `cat`-ing a 12-line
-heredoc).
+Cost is fixed per session for Claude Code and Codex (`SessionStart`
+fires once).
 
 ### Upstream agent-browser skill
 
@@ -307,10 +304,8 @@ install always runs host-side.
   (`/etc/devbox/identity.json`); one more host-side install step in
   `install.sh` (the `npx skills add` call) which requires `npx` to
   be available on the host.
-- The container hook fires on every Codex turn (Codex 0.128 lacks
-  `SessionStart`). Cost is the script's stdout (~12 lines of static
-  text after the identity guard), but it does add a small per-turn
-  shell exec. If Codex later adds `SessionStart`, we should migrate.
+- The container hook adds one small session-start shell exec and
+  emits ~12 lines of static context after the identity guard.
 - The `devbox` skill description must remain accurate as the CLI
   surface evolves; routine `devbox <subcommand>` additions don't
   require updates (the skill points to `devbox --help`), but
@@ -324,8 +319,6 @@ install always runs host-side.
 
 ## Future work
 
-- **Codex SessionStart hook** once the event is published. Drops the
-  per-turn cost to zero for Codex.
 - **Optional `agent-browser` skill audit** in `devbox update` —
   detect that the upstream skill matches a known-good version,
   surface "upstream version X differs from devbox-tested version Y"

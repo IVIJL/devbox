@@ -354,7 +354,7 @@ COPY scripts/stop-agent-browser-host-allow.sh /usr/local/bin/stop-agent-browser-
 COPY scripts/agent-browser-cdp-bridge.sh /usr/local/bin/agent-browser
 
 # Container-only agent identity context (ADR 0011 Layer 3). Hook fires
-# from Claude Code SessionStart and Codex UserPromptSubmit; the script
+# from Claude Code and Codex SessionStart; the script
 # guards on /etc/devbox/identity.json so the same managed-settings
 # fragments are inert if ever read on host.
 COPY scripts/hooks/devbox-identity-context.sh /usr/local/bin/

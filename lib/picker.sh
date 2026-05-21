@@ -8,12 +8,18 @@
 # shortcuts and comma-separated multi-select (`1,3,5`).
 #
 # Public API:
-#   picker::one  --prompt "<p>" [--first-option "<s>"]
-#   picker::many --prompt "<p>" [--first-option "<s>"]
+#   picker::one  --prompt "<p>" [--header "<h>"] [--first-option "<s>"]
+#   picker::many --prompt "<p>" [--header "<h>"] [--first-option "<s>"]
 #
 # When --first-option is set, the option string is prepended to the list and
 # `a)` becomes a shortcut for it. Caller string-compares the returned value
 # against its first-option to detect "expand all".
+#
+# When --header is set, the text is shown above the choices: fzf renders it
+# via its --header option (survives full-screen mode); the numbered fallback
+# prints it to stderr just above the option list. Use it for context the
+# user needs to see while picking — fzf otherwise hides everything that was
+# on the terminal before launch.
 #
 # Override fzf detection (for tests): export DEVBOX_PICKER_FZF=0
 # See docs/adr/0006-interactive-picker-conventions.md.
@@ -35,10 +41,11 @@ picker::many() {
 
 _picker::run() {
     local mode="$1"; shift
-    local prompt="" first_option=""
+    local prompt="" first_option="" header=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --prompt)       prompt="$2"; shift 2 ;;
+            --header)       header="$2"; shift 2 ;;
             --first-option) first_option="$2"; shift 2 ;;
             *) echo "picker: unknown arg: $1" >&2; return 1 ;;
         esac
@@ -58,9 +65,9 @@ _picker::run() {
     done <<< "$raw_items"
 
     if _picker::fzf_available; then
-        _picker::fzf "$mode" "$prompt" "${items[@]}"
+        _picker::fzf "$mode" "$prompt" "$header" "${items[@]}"
     else
-        _picker::fallback "$mode" "$prompt" "$first_option" "${items[@]}"
+        _picker::fallback "$mode" "$prompt" "$header" "$first_option" "${items[@]}"
     fi
 }
 
@@ -69,14 +76,16 @@ _picker::fzf_available() {
 }
 
 _picker::fzf() {
-    local mode="$1" prompt="$2"; shift 2
+    local mode="$1" prompt="$2" header="$3"; shift 3
     local args=(--prompt="$prompt")
+    [ -n "$header" ] && args+=(--header="$header")
     [ "$mode" = many ] && args+=(--multi)
     printf '%s\n' "$@" | fzf "${args[@]}" || return 1
 }
 
 _picker::fallback() {
-    local mode="$1" prompt="$2" first_option="$3"; shift 3
+    local mode="$1" prompt="$2" header="$3" first_option="$4"; shift 4
+    [ -n "$header" ] && printf '%s\n' "$header" >&2
     local -a items=("$@")
     local has_first=0
     if [ -n "$first_option" ] && [ "${items[0]:-}" = "$first_option" ]; then

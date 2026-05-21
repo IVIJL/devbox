@@ -132,6 +132,21 @@ assert_fail "e2e: empty stdin returns 1" \
              source "'"$SCRIPT_DIR"'/../lib/picker.sh"; \
              : | picker::one --prompt "P:"'
 
+# --header: stdout is unchanged (just the selection), header lands on stderr
+# in the fallback path. fzf path's header is exercised by fzf itself; we only
+# need to verify it isn't passed through to the selection output.
+header_stdout="$(run_e2e 1 picker::one --prompt "P:" --header "no session for X")"
+assert_eq "e2e one+header: stdout unchanged" "alpha" "$header_stdout"
+header_stderr="$(DEVBOX_PICKER_FZF=0 DEVBOX_PICKER_TEST_CHOICE=1 \
+    bash -c 'source "'"$SCRIPT_DIR"'/../lib/picker.sh"; \
+             printf "%s\n" alpha beta \
+                 | picker::one --prompt "P:" --header "no session for X" 2>&1 1>/dev/null')"
+case "$header_stderr" in
+    *"no session for X"*) printf 'PASS  e2e one+header: header on stderr\n' ;;
+    *) printf 'FAIL  e2e one+header: header on stderr\n      stderr: %q\n' "$header_stderr"
+       fail_count=$((fail_count + 1)) ;;
+esac
+
 unset DEVBOX_PICKER_FZF
 
 # --- summary -----------------------------------------------------------------

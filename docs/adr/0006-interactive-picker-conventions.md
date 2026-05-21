@@ -30,8 +30,8 @@ Introduce `lib/picker.sh` as the single owner of interactive selection.
 switch is verbose and error-prone; a separate name is cheap.
 
 ```bash
-picker::one  --prompt "<p>" [--first-option "<s>"]   # single
-picker::many --prompt "<p>" [--first-option "<s>"]   # multi
+picker::one  --prompt "<p>" [--header "<h>"] [--first-option "<s>"]   # single
+picker::many --prompt "<p>" [--header "<h>"] [--first-option "<s>"]   # multi
 ```
 
 **Stdin = items, stdout = selection.** Items arrive as one-per-line on
@@ -49,6 +49,16 @@ domain".
 **Unified fallback UX:** numbered list, `a` shortcut for first-option,
 `q` to cancel. `picker::many` accepts comma-separated indices (`1,3,5`,
 spaces tolerated). fzf, when present, gets `--multi` for `picker::many`.
+
+**`--header` for caller context.** fzf takes over the full screen and
+clears everything that was on it, so any error or status line the caller
+wrote to stderr just before launching the picker is invisible by the time
+the user is choosing. `--header` threads that context inside the picker:
+fzf renders it via its own `--header` option (sticky above the prompt);
+the numbered fallback prints it to stderr just above the option list.
+Added 2026-05-21 for `agent-browser-broker.sh`'s missing-session fallback
+(ADR 0010), but generally applicable to any picker site that needs the
+user to see *why* they're picking.
 
 **Pure-logic core (`_picker::select`).** The selection parser is split out
 from the I/O-rendering wrapper so it can be exercised by `tests/picker.sh`

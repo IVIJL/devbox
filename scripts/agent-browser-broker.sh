@@ -35,6 +35,8 @@ DEVBOX_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 
 # shellcheck source-path=SCRIPTDIR source=../lib/host-platform.sh disable=SC1091
 source "$DEVBOX_DIR/lib/host-platform.sh"
+# shellcheck source-path=SCRIPTDIR source=../lib/picker.sh disable=SC1091
+source "$DEVBOX_DIR/lib/picker.sh"
 
 # --- Constants ---------------------------------------------------------------
 
@@ -172,6 +174,49 @@ _container_running() {
 
 _container_exists() {
     docker ps -a --filter "name=^${1}$" --format '{{.Names}}' | grep -q .
+}
+
+# --- Missing-session picker --------------------------------------------------
+
+# Offer an interactive picker over OTHER live sessions when the caller's
+# token does not resolve to a state file (typical cause: history-completion
+# or a typo against a co-resident project that does have a session).
+#
+# Behaviour:
+#   - Silent return 1 when stdin or stderr is not a TTY (preserves script
+#     and hook semantics — callers see the original error / no-op path).
+#   - Silent return 1 when no sibling session exists.
+#   - On TTY with at least one sibling: prints a one-line header to stderr,
+#     pipes the session list into picker::one (fzf or numbered fallback),
+#     prints the chosen container on stdout and returns 0. Esc/q/empty
+#     returns 1 so the caller can fall through to its existing error or
+#     idempotent-no-op message.
+#
+# Explicit-token semantics are preserved: this never silently rewrites the
+# caller's argument. The user must confirm by selecting an entry.
+_offer_session_picker() {
+    local missing="$1"
+    [ -t 0 ] || return 1
+    [ -t 2 ] || return 1
+    [ -d "$SESSIONS_DIR" ] || return 1
+    local -a others=()
+    local f base
+    shopt -s nullglob
+    for f in "$SESSIONS_DIR"/*.json; do
+        base="$(basename "$f" .json)"
+        [ "$base" = "$missing" ] && continue
+        others+=("$base")
+    done
+    shopt -u nullglob
+    [ "${#others[@]}" -gt 0 ] || return 1
+    local header
+    header="agent-browser: no session for ${missing}. Pick another (Esc/q cancels)."
+    local chosen
+    chosen="$(printf '%s\n' "${others[@]}" \
+        | picker::one --prompt "switch to> " --header "$header")" \
+        || return 1
+    [ -n "$chosen" ] || return 1
+    printf '%s\n' "$chosen"
 }
 
 # --- Session state -----------------------------------------------------------
@@ -1675,8 +1720,15 @@ cmd_allow_for() {
 
     local state_file
     state_file="$(_state_file "$container")"
-    [ -f "$state_file" ] \
-        || _die "No Agent-browser session for '${container}'. Start one first: devbox agent-browser start ${container}"
+    if [ ! -f "$state_file" ]; then
+        local replacement
+        if replacement="$(_offer_session_picker "$container")"; then
+            container="$replacement"
+            state_file="$(_state_file "$container")"
+        else
+            _die "No Agent-browser session for '${container}'. Start one first: devbox agent-browser start ${container}"
+        fi
+    fi
 
     local proxy_pid proxy_port profile_dir
     proxy_pid="$(_state_get "$state_file" proxy_pid || true)"
@@ -1766,8 +1818,16 @@ cmd_allow_for_stop() {
 
     local state_file
     state_file="$(_state_file "$container")"
-    [ -f "$state_file" ] \
-        || { _log "No Agent-browser session for ${container}."; return 0; }
+    if [ ! -f "$state_file" ]; then
+        local replacement
+        if replacement="$(_offer_session_picker "$container")"; then
+            container="$replacement"
+            state_file="$(_state_file "$container")"
+        else
+            _log "No Agent-browser session for ${container}."
+            return 0
+        fi
+    fi
 
     local proxy_pid proxy_port profile_dir
     proxy_pid="$(_state_get "$state_file" proxy_pid || true)"
@@ -1844,8 +1904,14 @@ cmd_stop() {
     state_file="$(_state_file "$container")"
 
     if [ ! -f "$state_file" ]; then
-        _log "No Agent-browser session for ${container} (idempotent no-op)."
-        return 0
+        local replacement
+        if replacement="$(_offer_session_picker "$container")"; then
+            container="$replacement"
+            state_file="$(_state_file "$container")"
+        else
+            _log "No Agent-browser session for ${container} (idempotent no-op)."
+            return 0
+        fi
     fi
 
     local chrome_pid bridge_pid relay_pid proxy_pid watchdog_pid profile_dir download_dir
@@ -2279,8 +2345,15 @@ cmd_open() {
 
     local state_file
     state_file="$(_state_file "$container")"
-    [ -f "$state_file" ] \
-        || _die "No active session for ${container}. Run 'devbox agent-browser start ${container}' first."
+    if [ ! -f "$state_file" ]; then
+        local replacement
+        if replacement="$(_offer_session_picker "$container")"; then
+            container="$replacement"
+            state_file="$(_state_file "$container")"
+        else
+            _die "No active session for ${container}. Run 'devbox agent-browser start ${container}' first."
+        fi
+    fi
 
     local cdp_port chrome_pid profile_dir
     cdp_port="$(_state_get "$state_file" cdp_port_host || true)"
@@ -2331,8 +2404,14 @@ cmd_status() {
     state_file="$(_state_file "$container")"
 
     if [ ! -f "$state_file" ]; then
-        _log "No Agent-browser session for ${container}."
-        return 0
+        local replacement
+        if replacement="$(_offer_session_picker "$container")"; then
+            container="$replacement"
+            state_file="$(_state_file "$container")"
+        else
+            _log "No Agent-browser session for ${container}."
+            return 0
+        fi
     fi
 
     local chrome_pid bridge_pid relay_pid proxy_pid watchdog_pid cdp_port proxy_port profile_dir created_at

@@ -231,6 +231,37 @@ At any `devbox agent-browser start`, the broker first sweeps for
 orphan processes from a stale session file (Chrome PID dead, bridge
 container gone, etc.) and cleans up before launching the new one.
 
+### Missing-session UX — interactive picker
+
+When `devbox agent-browser {allow-for,stop,status,open}` is given a token
+that does not resolve to an existing state file, the broker offers an
+interactive picker over the OTHER live sessions before falling through to
+its original error / idempotent-no-op path. Driven by `lib/picker.sh`
+(see ADR 0006 — interactive picker conventions), so fzf is used when
+present and a numbered fallback handles the no-fzf case.
+
+Constraints:
+
+- **Explicit-token semantics are preserved.** The picker never silently
+  rewrites the caller's argument. A choice from the picker is an
+  affirmative user action; cancel (Esc/`q`/empty) falls through to the
+  command's existing missing-session behaviour.
+- **TTY-gated.** The picker only fires when both stdin and stderr are
+  TTYs. Non-interactive callers (hooks, cron, scripted pipelines) see
+  the original error or idempotent no-op, unchanged.
+- **`start` is exempt.** Start has no "wrong session" case — when no
+  state file exists, the right answer is to launch a new one, not pick
+  an unrelated session. Start retains its existing container-running
+  picker (over `docker ps`) for the unrelated case of an unspecified
+  target.
+
+Rationale: shell history-completion routinely substitutes
+`<project>-<suffix>` tokens between sibling projects (e.g. autocompleted
+`easyjukebox-eu` against a session for `easyjukebox`); silently failing
+the command sends the user on a state-file-and-process scavenger hunt.
+Offering them the live alternatives turns the typo into a one-keystroke
+correction without compromising the explicit-token principle.
+
 ## Considered options
 
 **Chrome inside the devbox container (DinD).** Tempting because the
@@ -362,5 +393,7 @@ session leaks, revisit.
   browser layer.
 - ADR 0003 — the privilege-boundary discipline (no sudo in container,
   setup runs from host) this ADR continues.
+- ADR 0006 — interactive picker conventions used by the missing-session
+  fallback in `agent-browser-broker.sh`.
 - ADR 0009 — `allow-for` window pattern this ADR parallels at the
   browser network layer.

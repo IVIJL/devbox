@@ -369,6 +369,34 @@ session leaks, revisit.
   per-session CA trusted only inside the agent profile. Separate
   project, materially heavier; defer until the host-granularity gate
   proves insufficient.
+- Deny visibility for HTTPS denials in **manual Chrome navigation**.
+  When an agent calls `agent-browser open https://blocked`, the
+  in-container wrapper (`scripts/agent-browser-cdp-bridge.sh`,
+  shipped 2026-05-21) detects `net::ERR_TUNNEL_CONNECTION_FAILED`
+  on the upstream CLI's stderr and re-invokes the CLI with a
+  `data:text/html,…` URL that renders a styled denial page inline —
+  blocked host, recovery commands, original URL. This wrapper-redirect
+  is out-of-band of the proxy/CONNECT protocol entirely, so it sidesteps
+  Chromium's hard rule that any non-2xx response to a `CONNECT` request
+  (and any `Location:` header on such a response) is discarded — there
+  is no proxy-side fix for that path.
+  The wrapper does NOT cover manual user navigation (address bar,
+  link clicks): those requests never traverse the wrapper, so Chrome
+  shows the bare `ERR_TUNNEL_CONNECTION_FAILED` error page. Two
+  paths to close that gap, both deferred:
+  1. **MITM with per-host certificate** signed by the mkcert CA — the
+     proxy would `200 Connection Established` on a denied CONNECT,
+     handshake as the requested host, and serve the denial HTML over
+     HTTPS. Same machinery the URL-path granularity entry above would
+     need. Materially heavier; only revisit if denial visibility for
+     manual nav becomes a real complaint.
+  2. **Chrome extension via `webRequest.onErrorOccurred`** baked into
+     the agent-browser spawn (the upstream CLI already accepts
+     `--extension <path>`). Listens for `ERR_TUNNEL_CONNECTION_FAILED`
+     on main-frame navigation and calls `chrome.tabs.update()` to
+     redirect the tab to a local denial page. Lighter than MITM (no
+     cert ops, no proxy changes) but adds a manifest v3 service worker
+     to the surface area.
 - Status-line integration showing active session + remaining network
   window time.
 - Replay tool that reconstructs an agent's browsing path from the

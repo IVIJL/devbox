@@ -37,6 +37,8 @@ DEVBOX_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 source "$DEVBOX_DIR/lib/host-platform.sh"
 # shellcheck source-path=SCRIPTDIR source=../lib/picker.sh disable=SC1091
 source "$DEVBOX_DIR/lib/picker.sh"
+# shellcheck source-path=SCRIPTDIR source=../lib/allowlist.sh disable=SC1091
+source "$DEVBOX_DIR/lib/allowlist.sh"
 
 # --- Constants ---------------------------------------------------------------
 
@@ -143,6 +145,13 @@ Usage:
   agent-browser-broker.sh open       <container> <url> [<url>...]
   agent-browser-broker.sh allow-for  <minutes> <container>
   agent-browser-broker.sh allow-for  --stop    <container>
+  agent-browser-broker.sh allow      [<domain>]
+  agent-browser-broker.sh deny       <domain>
+
+Allowlist edits write to ~/.config/devbox/agent-browser-allowed-domains.conf
+and SIGHUP every live agent-browser proxy. Unlike the firewall allowlist,
+an entry matches ONLY the literal host — quote a glob for subdomains
+(e.g. '*.example.com').
 EOF
 }
 
@@ -195,7 +204,7 @@ _container_exists() {
 # Explicit-token semantics are preserved: this never silently rewrites the
 # caller's argument. The user must confirm by selecting an entry.
 _offer_session_picker() {
-    local missing="$1"
+    local missing_token="$1"
     [ -t 0 ] || return 1
     [ -t 2 ] || return 1
     [ -d "$SESSIONS_DIR" ] || return 1
@@ -204,13 +213,13 @@ _offer_session_picker() {
     shopt -s nullglob
     for f in "$SESSIONS_DIR"/*.json; do
         base="$(basename "$f" .json)"
-        [ "$base" = "$missing" ] && continue
+        [ "$base" = "$missing_token" ] && continue
         others+=("$base")
     done
     shopt -u nullglob
     [ "${#others[@]}" -gt 0 ] || return 1
     local header
-    header="agent-browser: no session for ${missing}. Pick another (Esc/q cancels)."
+    header="agent-browser: no session for ${missing_token}. Pick another (Esc/q cancels)."
     local chosen
     chosen="$(printf '%s\n' "${others[@]}" \
         | picker::one --prompt "switch to> " --header "$header")" \
@@ -1860,6 +1869,121 @@ _session_proxy_log_live() {
     _state_get "$state_file" proxy_log_path 2>/dev/null || true
 }
 
+# --- subcommand: allow / deny (per-host allowlist round-trip) ----------------
+#
+# Round-trip CLI for the Agent-browser allowlist file at
+# $AGENT_ALLOWLIST_PATH. Mirrors the firewall `devbox allow` / `deny` shape
+# but writes to the agent-browser-specific path and SIGHUPs every live
+# proxy so edits land without restarting Chrome.
+#
+# Validation mirrors what the proxy's `_read_allowlist` accepts: bare
+# hostnames (`api.openai.com`) and `*` globs (`*.openai.com`). The proxy
+# does NOT do implicit subdomain matching, so the user must write the
+# `*.` prefix explicitly — this asymmetry vs the firewall side is
+# surfaced in --help.
+
+# Reject inputs the proxy would later skip as malformed. Whitespace,
+# slashes, scheme prefixes, and control chars are all proxy-side
+# rejection rules; catching them at the CLI gives the user immediate
+# feedback rather than a silent "added to file, ignored at runtime".
+_validate_ab_domain() {
+    local domain="$1"
+    [ -n "$domain" ] || { _warn "agent-browser: domain must not be empty"; return 1; }
+    case "$domain" in
+        *[[:space:]]*) _warn "agent-browser: domain must not contain whitespace: '${domain}'"; return 1 ;;
+        *://*)         _warn "agent-browser: domain must not include a scheme: '${domain}'"; return 1 ;;
+        */*)           _warn "agent-browser: domain must not contain '/': '${domain}'"; return 1 ;;
+        \#*)           _warn "agent-browser: domain must not start with '#': '${domain}'"; return 1 ;;
+    esac
+    # Reject control chars (ASCII < 32) the proxy would also drop.
+    case "$domain" in
+        *[[:cntrl:]]*) _warn "agent-browser: domain must not contain control characters"; return 1 ;;
+    esac
+}
+
+# Fan SIGHUP out to every live agent-browser proxy and re-stage the
+# user-side allowlist into each session's profile dir first (the proxy
+# reads the staged copy, not $AGENT_ALLOWLIST_PATH directly — see the
+# comment on AGENT_ALLOWLIST_PATH for the perms reason).
+#
+# Sessions whose proxy_pid is dead or recycled are skipped silently —
+# cleanup of stale state files is owned by `_sweep_if_stale` on the
+# next start/stop, not by this command.
+_sighup_all_proxies() {
+    [ -d "$SESSIONS_DIR" ] || return 0
+    local f proxy_pid profile_dir proxy_port marker
+    shopt -s nullglob
+    for f in "$SESSIONS_DIR"/*.json; do
+        proxy_pid="$(_state_get "$f" proxy_pid 2>/dev/null || true)"
+        profile_dir="$(_state_get "$f" profile_dir 2>/dev/null || true)"
+        proxy_port="$(_state_get "$f" proxy_port_host 2>/dev/null || true)"
+        [ -n "$proxy_pid" ]    || continue
+        [ "$proxy_pid" != "null" ]    || continue
+        [ -n "$profile_dir" ]         || continue
+        [ "$profile_dir" != "null" ]  || continue
+        # Guard against PID reuse: only signal a process that still
+        # carries the proxy's listen-port marker.
+        if [ -n "$proxy_port" ] && [ "$proxy_port" != "null" ]; then
+            marker="--listen 127.0.0.1:${proxy_port}"
+            _pid_matches_marker "$proxy_pid" "$marker" || continue
+        else
+            _pid_alive_on_host "$proxy_pid" || continue
+        fi
+        _is_managed_path "$profile_dir" "$AGENT_PROFILES_DIR" || continue
+        _restage_allowlist_only "$profile_dir"
+        sudo -u devbox-agent kill -HUP "$proxy_pid" 2>/dev/null || true
+    done
+    shopt -u nullglob
+}
+
+cmd_agent_allow() {
+    # No-arg → list current entries. Mirrors `devbox allow` (no arg)
+    # behaviour from docker-run.sh so the two namespaces feel symmetric.
+    if [ "$#" -eq 0 ]; then
+        _log "Agent-browser allowlist (${AGENT_ALLOWLIST_PATH}):"
+        local entries
+        entries="$(allowlist::read "$AGENT_ALLOWLIST_PATH" | sort)"
+        if [ -n "$entries" ]; then
+            printf '%s\n' "$entries" | while IFS= read -r d; do printf '  %s\n' "$d"; done
+        else
+            _log "  (none)"
+        fi
+        _log ""
+        _log "Usage: devbox agent-browser allow <domain>  |  devbox agent-browser deny <domain>"
+        _log "Note: Unlike the firewall allowlist, an entry matches ONLY the literal"
+        _log "      host. For subdomains, quote a glob: devbox agent-browser allow '*.example.com'"
+        return 0
+    fi
+
+    [ "$#" -eq 1 ] || _die "Usage: devbox agent-browser allow <domain>"
+    local domain="$1"
+    _validate_ab_domain "$domain" || exit 2
+
+    if allowlist::add "$AGENT_ALLOWLIST_PATH" "$domain"; then
+        _log "Allowed (agent-browser): ${domain}"
+    else
+        _log "Already in agent-browser allowlist: ${domain}"
+        return 0
+    fi
+
+    _sighup_all_proxies
+}
+
+cmd_agent_deny() {
+    [ "$#" -eq 1 ] || _die "Usage: devbox agent-browser deny <domain>"
+    local domain="$1"
+    _validate_ab_domain "$domain" || exit 2
+
+    if allowlist::remove "$AGENT_ALLOWLIST_PATH" "$domain"; then
+        _log "Removed (agent-browser): ${domain}"
+    else
+        _log "Not in agent-browser allowlist: ${domain}"
+        return 0
+    fi
+
+    _sighup_all_proxies
+}
+
 # --- subcommand: allow-for ---------------------------------------------------
 
 cmd_allow_for() {
@@ -2706,11 +2830,13 @@ main() {
     [ -n "$sub" ] || { _usage >&2; exit 2; }
     shift
     case "$sub" in
-        start)     cmd_start     "$@" ;;
-        stop)      cmd_stop      "$@" ;;
-        status)    cmd_status    "$@" ;;
-        open)      cmd_open      "$@" ;;
-        allow-for) cmd_allow_for "$@" ;;
+        start)     cmd_start       "$@" ;;
+        stop)      cmd_stop        "$@" ;;
+        status)    cmd_status      "$@" ;;
+        open)      cmd_open        "$@" ;;
+        allow-for) cmd_allow_for   "$@" ;;
+        allow)     cmd_agent_allow "$@" ;;
+        deny)      cmd_agent_deny  "$@" ;;
         -h|--help|help) _usage ;;
         *) _usage >&2; exit 2 ;;
     esac

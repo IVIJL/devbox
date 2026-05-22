@@ -52,13 +52,23 @@ Usage:
   devbox agent-browser <cmd> [name]
                                    Manage the Agent-browser session for a
                                    container. <cmd> is start | stop | status
-                                   | allow-for. Launches Host agent Chrome on
-                                   the host and the in-container CDP bridge.
+                                   | open | allow-for | allow | deny.
+                                   Launches Host agent Chrome on the host
+                                   and the in-container CDP bridge.
                                    See ADR 0010.
   devbox agent-browser allow-for <N> [name]
                                    Open a network window for N minutes (proxy
                                    in harvest mode + JSONL log). Pass --stop
                                    to close immediately.
+  devbox agent-browser allow [domain]
+                                   List or add an Agent-browser allowlist
+                                   entry. Unlike `devbox allow`, matches
+                                   ONLY the literal host — quote a glob for
+                                   subdomains (e.g. '*.example.com').
+                                   SIGHUPs every live proxy.
+  devbox agent-browser deny <domain>
+                                   Remove an Agent-browser allowlist entry;
+                                   SIGHUPs every live proxy.
   devbox cursor [name]             Open Cursor attached to running devbox
   devbox code [name]               Open VS Code attached to running devbox
   devbox clip                      Grab clipboard image for container use
@@ -1564,6 +1574,8 @@ case "${1:-}" in
              AGENT_BROWSER_TARGET=""
              AGENT_BROWSER_URLS=()
              AGENT_BROWSER_START_FLAGS=()
+             AGENT_BROWSER_DOMAIN=""
+             AGENT_BROWSER_DOMAIN_SET=false
              if [ "$AGENT_BROWSER_SUB" = "allow-for" ]; then
                  # Position-disambiguated parse so a project name that
                  # happens to be all digits (`devbox-123`) is not
@@ -1629,6 +1641,24 @@ case "${1:-}" in
                      exit 2
                  fi
                  unset ab_expect_project
+             elif [ "$AGENT_BROWSER_SUB" = "allow" ] || [ "$AGENT_BROWSER_SUB" = "deny" ]; then
+                 # `allow [<domain>]` / `deny <domain>`. No container
+                 # resolution: edits are global (one Agent-browser
+                 # allowlist file shared across containers). Accept at
+                 # most one positional; broker validates the shape.
+                 for arg in "$@"; do
+                     case "$arg" in
+                         '') ;;
+                         *)
+                             if [ "$AGENT_BROWSER_DOMAIN_SET" = true ]; then
+                                 echo "Unexpected positional for agent-browser ${AGENT_BROWSER_SUB}: $arg" >&2
+                                 exit 2
+                             fi
+                             AGENT_BROWSER_DOMAIN="$arg"
+                             AGENT_BROWSER_DOMAIN_SET=true
+                             ;;
+                     esac
+                 done
              elif [ "$AGENT_BROWSER_SUB" = "start" ]; then
                  # `start` shape: [--no-open] [project]. Single known
                  # flag plus an optional project token; anything else
@@ -2816,14 +2846,14 @@ fi
 
 if [ "$MODE" = "agent-browser" ]; then
     if [ -z "$AGENT_BROWSER_SUB" ]; then
-        echo "Usage: devbox agent-browser <start|stop|status|open|allow-for> [args]" >&2
+        echo "Usage: devbox agent-browser <start|stop|status|open|allow-for|allow|deny> [args]" >&2
         exit 2
     fi
     case "$AGENT_BROWSER_SUB" in
-        start|stop|status|open|allow-for|-h|--help|help) ;;
+        start|stop|status|open|allow-for|allow|deny|-h|--help|help) ;;
         *)
             echo "Unknown agent-browser subcommand: $AGENT_BROWSER_SUB" >&2
-            echo "Usage: devbox agent-browser <start|stop|status|open|allow-for> [args]" >&2
+            echo "Usage: devbox agent-browser <start|stop|status|open|allow-for|allow|deny> [args]" >&2
             exit 2
             ;;
     esac
@@ -2834,6 +2864,20 @@ if [ "$MODE" = "agent-browser" ]; then
             exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" "$AGENT_BROWSER_SUB"
             ;;
     esac
+
+    # `allow [<domain>]` / `deny <domain>` are global — no container
+    # resolution. Edits write to the single shared Agent-browser
+    # allowlist file; the broker SIGHUPs every live proxy.
+    if [ "$AGENT_BROWSER_SUB" = "allow" ] || [ "$AGENT_BROWSER_SUB" = "deny" ]; then
+        if [ "$AGENT_BROWSER_SUB" = "deny" ] && [ "$AGENT_BROWSER_DOMAIN_SET" != true ]; then
+            echo "Usage: devbox agent-browser deny <domain>" >&2
+            exit 2
+        fi
+        if [ "$AGENT_BROWSER_DOMAIN_SET" = true ]; then
+            exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" "$AGENT_BROWSER_SUB" "$AGENT_BROWSER_DOMAIN"
+        fi
+        exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" "$AGENT_BROWSER_SUB"
+    fi
 
     if [ -n "$AGENT_BROWSER_TARGET" ]; then
         devbox::names_from_token "$AGENT_BROWSER_TARGET"

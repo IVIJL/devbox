@@ -569,6 +569,71 @@ _pid_matches_marker_in_container() {
     " _ "$marker" 2>/dev/null
 }
 
+# --- UFW / host firewall hint ------------------------------------------------
+
+# Print an actionable ufw hint when CDP smoke-test failed on a host whose
+# ufw default-deny is dropping the container→host SYN. Common gotcha on
+# native Ubuntu: `ufw allow in on docker0` looks correct but is a no-op
+# because the devbox container sits on a custom bridge (`devproxy`, name
+# `br-<hash>`) and packets arrive with `-i br-<hash>`. Suggesting the
+# IPAM subnet of the actual network is bridge-name-stable and as narrow
+# as the relay needs.
+#
+# Soft-detection: only fires when /etc/ufw/ufw.conf reports ENABLED=yes,
+# so non-ufw hosts (most macOS / WSL2 + Docker Desktop setups) see no
+# extra noise. Skips macOS entirely — Docker Desktop's VM forwarding
+# bypasses host-side pf, ufw isn't a Mac concept anyway. On WSL2 we DO
+# show the hint because Docker-CE-inside-WSL-distro hits the same kernel
+# path as native Linux; if the user is on Docker Desktop the conf file
+# is absent and the function returns silently.
+_maybe_warn_ufw_block() {
+    local container="$1"
+    [ -n "$container" ] || return 0
+
+    local platform
+    platform="$(host_platform::detect 2>/dev/null || true)"
+    case "$platform" in
+        linux|wsl2) ;;
+        *) return 0 ;;
+    esac
+
+    # /etc/ufw/ufw.conf is world-readable (0644) on Ubuntu/Debian
+    # defaults — silently grep instead of `sudo ufw status` which would
+    # prompt for a password and produce stderr noise on every CDP
+    # failure even when ufw is not installed.
+    [ -r /etc/ufw/ufw.conf ] || return 0
+    grep -q '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null || return 0
+
+    # Resolve the container's primary network and its IPAM subnet. A
+    # devbox container is typically on exactly one user network
+    # (devproxy); if multiple are attached we take the first one Docker
+    # reports — there's no robust way to know which one the CDP path
+    # used without re-resolving host.docker.internal, and the first
+    # network is overwhelmingly the right answer in practice.
+    local net_name net_subnet=""
+    net_name="$(docker inspect "$container" \
+        --format '{{range $n, $c := .NetworkSettings.Networks}}{{$n}}{{"\n"}}{{end}}' \
+        2>/dev/null | head -n1)"
+    if [ -n "$net_name" ]; then
+        net_subnet="$(docker network inspect "$net_name" \
+            --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null \
+            | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9].*\//) {print $i; exit}}')"
+    fi
+
+    _warn ""
+    _warn "  Host firewall (ufw) is active — this is a common cause on Linux."
+    _warn "  The container's bridge is NOT docker0, so 'ufw allow in on docker0' is a no-op."
+    if [ -n "$net_subnet" ]; then
+        _warn "  Container '${container}' is on Docker network '${net_name}' (${net_subnet})."
+        _warn "  Allow it on host (idempotent, ufw applies immediately):"
+        _warn "    sudo ufw allow from ${net_subnet}"
+    else
+        _warn "  Could not auto-detect the container's bridge subnet. Find it with:"
+        _warn "    docker inspect ${container} --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}/{{.IPPrefixLen}} {{end}}'"
+        _warn "  Then on host: sudo ufw allow from <subnet>"
+    fi
+}
+
 # --- Session-dir cleanup -----------------------------------------------------
 
 # Reject any path that doesn't sit directly under one of the agent-owned
@@ -1381,6 +1446,20 @@ EOF
         _warn "  Diagnose with:"
         _warn "    docker exec ${container} curl -v http://127.0.0.1:${BRIDGE_CONTAINER_PORT}/json/version"
         _warn "    docker exec ${container} getent hosts host.docker.internal"
+        # Common failure on native Linux with ufw: the container sits on a
+        # custom Docker bridge (devproxy, br-<hash>) rather than docker0,
+        # so the SYN from container to host.docker.internal arrives on
+        # `br-<hash>` and ufw's default-deny INPUT drops it before it
+        # reaches any user rule keyed to `-i docker0`. We surface the
+        # actual network's IPAM subnet so the user can copy/paste the
+        # exact `ufw allow from <subnet>` instead of guessing. Only fires
+        # when Chrome is still alive (Chrome death is a different failure
+        # mode whose stderr was already dumped above; ufw hint would
+        # mislead). Skipped on macOS because Docker Desktop's VM
+        # forwarding magic bypasses host-side pf for container→host.
+        if _pid_alive_on_host "$chrome_pid"; then
+            _maybe_warn_ufw_block "$container"
+        fi
         # Inline rollback: cmd_stop expects the state file to exist; we
         # just wrote it, so delegate to it for the heavy lifting (kill
         # the three processes, remove the state file).

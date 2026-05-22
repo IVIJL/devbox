@@ -2664,79 +2664,151 @@ fi
 
 if [ "$MODE" = "blocked" ]; then
     containers=$(docker ps --filter "name=^devbox-" --format '{{.Names}}' | filter_user_containers)
-    if [ -z "$containers" ]; then
-        echo "No running devbox containers."
-        exit 0
-    fi
+    # NOTE: even when no containers are running, agent-browser denials may
+    # still exist in the archived proxy logs (ADR 0012 § Data source —
+    # archived logs survive teardown). Only short-circuit on "no running
+    # containers" if the agent-browser side also has nothing.
+    declare -a fw_domains=()
+    if [ -n "$containers" ]; then
+        # Collect queried domains from dnsmasq logs across all containers
+        # then filter out domains that are already allowed (have ipset rules)
+        all_queried=""
+        while IFS= read -r container; do
+            queried=$(docker exec -u root "$container" bash -c '
+                [ -f /var/log/dnsmasq-queries.log ] || exit 0
+                grep "^.*query\[A\]" /var/log/dnsmasq-queries.log \
+                    | grep -oP "query\[A\] \K[^ ]+" \
+                    | sort -u
+            ' 2>/dev/null || true)
+            [ -n "$queried" ] && all_queried=$(printf '%s\n%s' "$all_queried" "$queried")
+        done <<< "$containers"
+        all_queried=$(echo "$all_queried" | grep -v '^$' | sort -u)
 
-    # Collect queried domains from dnsmasq logs across all containers
-    # then filter out domains that are already allowed (have ipset rules)
-    all_queried=""
-    while IFS= read -r container; do
-        queried=$(docker exec -u root "$container" bash -c '
-            [ -f /var/log/dnsmasq-queries.log ] || exit 0
-            grep "^.*query\[A\]" /var/log/dnsmasq-queries.log \
-                | grep -oP "query\[A\] \K[^ ]+" \
-                | sort -u
-        ' 2>/dev/null || true)
-        [ -n "$queried" ] && all_queried=$(printf '%s\n%s' "$all_queried" "$queried")
-    done <<< "$containers"
-    all_queried=$(echo "$all_queried" | grep -v '^$' | sort -u)
+        if [ -n "$all_queried" ]; then
+            # Get list of allowed domains from dnsmasq ipset config (inside
+            # first container). Allowlist is identical across containers
+            # (rendered from the same allowed-domains.conf).
+            first_container=$(echo "$containers" | head -1)
+            allowed_domains=$(docker exec -u node "$first_container" bash -c '
+                grep "^ipset=" /etc/dnsmasq.d/*.conf 2>/dev/null \
+                    | grep -oP "ipset=/\K[^/]+" \
+                    | sort -u
+            ' 2>/dev/null || true)
 
-    if [ -z "$all_queried" ]; then
-        echo "No DNS queries in the log."
-        exit 0
-    fi
+            # Filter: show only domains NOT covered by allowed list
+            blocked=""
+            while IFS= read -r domain; do
+                [ -z "$domain" ] && continue
+                is_allowed=false
+                while IFS= read -r allowed; do
+                    [ -z "$allowed" ] && continue
+                    # Check exact match or subdomain match (queried is *.allowed)
+                    if [ "$domain" = "$allowed" ] || [[ "$domain" == *."$allowed" ]]; then
+                        is_allowed=true
+                        break
+                    fi
+                done <<< "$allowed_domains"
+                if [ "$is_allowed" = false ]; then
+                    blocked=$(printf '%s\n%s' "$blocked" "$domain")
+                fi
+            done <<< "$all_queried"
+            blocked=$(echo "$blocked" | grep -v '^$' | sort -u)
 
-    # Get list of allowed domains from dnsmasq ipset config (inside first container)
-    first_container=$(echo "$containers" | head -1)
-    allowed_domains=$(docker exec -u node "$first_container" bash -c '
-        grep "^ipset=" /etc/dnsmasq.d/*.conf 2>/dev/null \
-            | grep -oP "ipset=/\K[^/]+" \
-            | sort -u
-    ' 2>/dev/null || true)
-
-    # Filter: show only domains NOT covered by allowed list
-    blocked=""
-    while IFS= read -r domain; do
-        [ -z "$domain" ] && continue
-        is_allowed=false
-        while IFS= read -r allowed; do
-            [ -z "$allowed" ] && continue
-            # Check exact match or subdomain match (queried is *.allowed)
-            if [ "$domain" = "$allowed" ] || [[ "$domain" == *."$allowed" ]]; then
-                is_allowed=true
-                break
-            fi
-        done <<< "$allowed_domains"
-        if [ "$is_allowed" = false ]; then
-            blocked=$(printf '%s\n%s' "$blocked" "$domain")
+            while IFS= read -r d; do
+                [ -z "$d" ] && continue
+                fw_domains+=("$d")
+            done <<< "$blocked"
         fi
-    done <<< "$all_queried"
-    blocked=$(echo "$blocked" | grep -v '^$' | sort -u)
-
-    if [ -z "$blocked" ]; then
-        echo "No blocked domains."
-        exit 0
     fi
 
-    declare -a domains=()
-    while IFS= read -r d; do
-        [ -z "$d" ] && continue
-        domains+=("$d")
-    done <<< "$blocked"
+    # Agent-browser side: globally denied hosts across (live ∪ archived).
+    # The broker emits nothing when no proxy logs exist anywhere, which is
+    # the silent-fallback property ADR 0012 § acceptance #4 requires.
+    declare -a browser_domains=()
+    browser_global=$("$DEVBOX_DIR/scripts/agent-browser-broker.sh" denied-hosts-global 2>/dev/null || true)
+    if [ -n "$browser_global" ]; then
+        while IFS= read -r d; do
+            [ -z "$d" ] && continue
+            browser_domains+=("$d")
+        done <<< "$browser_global"
+    fi
 
-    selected=$(printf '%s\n' "${domains[@]}" \
-        | picker::many --prompt "Allow domain:" --first-option "* Allow all") || exit 1
-
-    while IFS= read -r sel; do
-        if [ "$sel" = "* Allow all" ]; then
-            for d in "${domains[@]}"; do
-                "$0" allow "$d"
-            done
+    if [ "${#fw_domains[@]}" -eq 0 ] && [ "${#browser_domains[@]}" -eq 0 ]; then
+        if [ -z "$containers" ]; then
+            # Preserve today's behaviour: nothing to scan, nothing to show.
+            echo "No running devbox containers."
         else
-            "$0" allow "$sel"
+            echo "No blocked domains."
         fi
+        exit 0
+    fi
+
+    # Build the unified row set: `[fw]     <host>` and `[browser] <host>`.
+    # Fixed-width tag column so the two layers line up — `[browser]` is
+    # 9 chars, `[fw]` pads to the same width via printf's `%-9s`. The
+    # tag prefix renders even when only one layer has rows (it's part of
+    # the unified-view design); the silent-fallback property required by
+    # ADR 0012 § acceptance #4 is satisfied by NOT emitting an empty
+    # browser section or a "agent-browser: none" header — never by
+    # changing per-row formatting.
+    declare -a unified_rows=()
+    for d in "${fw_domains[@]}"; do
+        unified_rows+=("$(printf '%-9s %s' '[fw]' "$d")")
+    done
+    for d in "${browser_domains[@]}"; do
+        unified_rows+=("$(printf '%-9s %s' '[browser]' "$d")")
+    done
+
+    # Sort tag-then-host: the fixed-width prefix means a plain sort already
+    # clusters by layer (`[browser]` < `[fw]` lexically), then by host
+    # within each cluster.
+    mapfile -t unified_rows < <(printf '%s\n' "${unified_rows[@]}" | sort)
+
+    # First-options are per-layer (ADR 0012 § acceptance #3): only render
+    # `* Allow all firewall` when fw has rows, only render
+    # `* Allow all browser` when browser has rows. Both render when both
+    # do; one when one does; neither in the both-empty case (already
+    # short-circuited above).
+    declare -a first_opts=()
+    [ "${#fw_domains[@]}"     -gt 0 ] && first_opts+=(--first-option "* Allow all firewall")
+    [ "${#browser_domains[@]}" -gt 0 ] && first_opts+=(--first-option "* Allow all browser")
+
+    selected=$(printf '%s\n' "${unified_rows[@]}" \
+        | picker::many \
+            --prompt "Allow domain:" \
+            --header "Tab/Shift-Tab to mark · Enter to confirm   (or \"1,3,5\" without fzf)" \
+            "${first_opts[@]}") || exit 1
+
+    # Route each pick by its tag. Mixed multi-pick is fine — each row
+    # invokes the broker for its own layer (ADR 0012 § acceptance #2).
+    while IFS= read -r sel; do
+        [ -z "$sel" ] && continue
+        case "$sel" in
+            "* Allow all firewall")
+                for d in "${fw_domains[@]}"; do
+                    "$0" allow "$d"
+                done
+                ;;
+            "* Allow all browser")
+                for d in "${browser_domains[@]}"; do
+                    "$0" agent-browser allow "$d"
+                done
+                ;;
+            "[fw]"*)
+                # Strip the tag + padding whitespace; the remainder is the host.
+                host="${sel#"[fw]"}"
+                host="${host#"${host%%[![:space:]]*}"}"
+                "$0" allow "$host"
+                ;;
+            "[browser]"*)
+                host="${sel#"[browser]"}"
+                host="${host#"${host%%[![:space:]]*}"}"
+                "$0" agent-browser allow "$host"
+                ;;
+            *)
+                echo "blocked: unrecognised picker selection: $sel" >&2
+                ;;
+        esac
     done <<< "$selected"
     exit 0
 fi

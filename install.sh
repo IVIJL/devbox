@@ -694,16 +694,20 @@ setup_claude_token() {
     SKIPPED+=("Claude token (run 'devbox claude-token' to set up)")
 }
 
-# --- Zsh completion ----------------------------------------------------------
+# --- Shell completion --------------------------------------------------------
+#
+# Two parallel completion files live in completions/:
+#   _devbox       — zsh (`#compdef devbox`, native fpath-installed)
+#   devbox.bash   — bash (`complete -F _devbox devbox`, sourced from .bashrc
+#                   or dropped into a system bash-completion dir)
+#
+# The install routine routes by $SHELL: zsh users get fpath wiring (existing
+# behaviour); bash users get the bash file sourced from .bashrc. Anything
+# else is skipped with a notice.
 
-setup_completions() {
-    local shell_name
-    shell_name="$(basename "${SHELL:-/bin/bash}")"
-    if [ "$shell_name" != "zsh" ]; then
-        SKIPPED+=("zsh completion (shell is $shell_name, not zsh)")
-        return
-    fi
-
+# Install zsh completion via fpath lookup. Extracted so setup_completions can
+# stay a thin dispatcher.
+_install_zsh_completion() {
     local src="$DEVBOX_DIR/completions/_devbox"
     if [ ! -f "$src" ]; then
         SKIPPED+=("zsh completion (completion file not found in repo)")
@@ -760,6 +764,46 @@ setup_completions() {
         CONFIGURED+=("zsh fpath in $zshrc")
     fi
     CONFIGURED+=("zsh completion -> $dest_dir/_devbox")
+}
+
+# Install bash completion. The source file is self-contained: it can be
+# sourced directly from .bashrc (no system completion dir required), which
+# is the simplest path for a single-binary CLI like devbox.
+#
+# Strategy: idempotent .bashrc edit gated by a marker line, similar to the
+# zsh fpath path above. We don't try to write into /etc or
+# /usr/local/etc/bash_completion.d/ because that needs sudo for what amounts
+# to a per-user CLI.
+_install_bash_completion() {
+    local src="$DEVBOX_DIR/completions/devbox.bash"
+    if [ ! -f "$src" ]; then
+        SKIPPED+=("bash completion (completion file not found in repo)")
+        return
+    fi
+
+    local bashrc="$HOME/.bashrc"
+    local marker="# Devbox: bash completion"
+    local source_line="source \"$src\""
+
+    if grep -qF "$marker" "$bashrc" 2>/dev/null; then
+        SKIPPED+=("bash completion in $bashrc (already configured)")
+        return
+    fi
+
+    printf '\n%s\n%s\n' "$marker" "$source_line" >> "$bashrc"
+    CONFIGURED+=("bash completion in $bashrc")
+}
+
+setup_completions() {
+    local shell_name
+    shell_name="$(basename "${SHELL:-/bin/bash}")"
+    case "$shell_name" in
+        zsh)  _install_zsh_completion ;;
+        bash) _install_bash_completion ;;
+        *)
+            SKIPPED+=("shell completion (shell is $shell_name, not zsh or bash)")
+            ;;
+    esac
 }
 
 # --- Clone / update devbox repo ---------------------------------------------

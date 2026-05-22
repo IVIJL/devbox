@@ -38,62 +38,74 @@ assert_fail() {
 
 # --- single select -----------------------------------------------------------
 
-assert_eq "one: pick first"  "alpha"  "$(_picker::select one "" 1 alpha beta gamma)"
-assert_eq "one: pick second" "beta"   "$(_picker::select one "" 2 alpha beta gamma)"
-assert_eq "one: pick last"   "gamma"  "$(_picker::select one "" 3 alpha beta gamma)"
+assert_eq "one: pick first"  "alpha"  "$(_picker::select one 0 1 alpha beta gamma)"
+assert_eq "one: pick second" "beta"   "$(_picker::select one 0 2 alpha beta gamma)"
+assert_eq "one: pick last"   "gamma"  "$(_picker::select one 0 3 alpha beta gamma)"
 
-assert_fail "one: q cancels"           _picker::select one "" "q" alpha beta
-assert_fail "one: empty cancels"       _picker::select one "" "" alpha beta
-assert_fail "one: out of range high"   _picker::select one "" "5" alpha beta
-assert_fail "one: out of range zero"   _picker::select one "" "0" alpha beta
-assert_fail "one: non-numeric"         _picker::select one "" "abc" alpha beta
-assert_fail "one: a without first-opt" _picker::select one "" "a" alpha beta
+assert_fail "one: q cancels"           _picker::select one 0 "q" alpha beta
+assert_fail "one: empty cancels"       _picker::select one 0 "" alpha beta
+assert_fail "one: out of range high"   _picker::select one 0 "5" alpha beta
+assert_fail "one: out of range zero"   _picker::select one 0 "0" alpha beta
+assert_fail "one: non-numeric"         _picker::select one 0 "abc" alpha beta
+assert_fail "one: a without first-opt" _picker::select one 0 "a" alpha beta
 
 # --- single select with first-option ----------------------------------------
 
-# When first-option is set, items[0] is the sentinel; index 1 means first real item.
+# With one first-option, items[0] is the sentinel; index 1 means first real item.
 assert_eq "one+first: pick first real" \
-    "alpha" "$(_picker::select one "* All" "1" "* All" alpha beta)"
+    "alpha" "$(_picker::select one 1 "1" "* All" alpha beta)"
 assert_eq "one+first: pick second real" \
-    "beta"  "$(_picker::select one "* All" "2" "* All" alpha beta)"
+    "beta"  "$(_picker::select one 1 "2" "* All" alpha beta)"
 assert_eq "one+first: 'a' returns sentinel" \
-    "* All" "$(_picker::select one "* All" "a" "* All" alpha beta)"
+    "* All" "$(_picker::select one 1 "a" "* All" alpha beta)"
 
-assert_fail "one+first: out of range" _picker::select one "* All" "3" "* All" alpha beta
+assert_fail "one+first: out of range" _picker::select one 1 "3" "* All" alpha beta
+
+# --- single select with two first-options -----------------------------------
+
+# Two sentinels: a→first sentinel, b→second sentinel, 1→first real item.
+assert_eq "one+2first: 'a' returns first sentinel" \
+    "* Allow all firewall" "$(_picker::select one 2 "a" "* Allow all firewall" "* Allow all browser" alpha beta)"
+assert_eq "one+2first: 'b' returns second sentinel" \
+    "* Allow all browser"  "$(_picker::select one 2 "b" "* Allow all firewall" "* Allow all browser" alpha beta)"
+assert_eq "one+2first: pick first real (index 1)" \
+    "alpha" "$(_picker::select one 2 "1" "* Allow all firewall" "* Allow all browser" alpha beta)"
+assert_fail "one+2first: 'c' invalid (only 2 sentinels)" \
+    _picker::select one 2 "c" "* Allow all firewall" "* Allow all browser" alpha beta
 
 # --- multi select ------------------------------------------------------------
 
-assert_eq "many: single index"     "alpha" "$(_picker::select many "" "1" alpha beta gamma)"
+assert_eq "many: single index"     "alpha" "$(_picker::select many 0 "1" alpha beta gamma)"
 
-multi_out=$(_picker::select many "" "1,3" alpha beta gamma)
+multi_out=$(_picker::select many 0 "1,3" alpha beta gamma)
 assert_eq "many: comma 1,3" "alpha
 gamma" "$multi_out"
 
-multi_spaces=$(_picker::select many "" "1, 3" alpha beta gamma)
+multi_spaces=$(_picker::select many 0 "1, 3" alpha beta gamma)
 assert_eq "many: comma w/ spaces" "alpha
 gamma" "$multi_spaces"
 
-multi_all=$(_picker::select many "" "1,2,3" alpha beta gamma)
+multi_all=$(_picker::select many 0 "1,2,3" alpha beta gamma)
 assert_eq "many: all three" "alpha
 beta
 gamma" "$multi_all"
 
-assert_fail "many: invalid index in list" _picker::select many "" "1,99" alpha beta
-assert_fail "many: empty cancels"         _picker::select many "" "" alpha beta
-assert_fail "many: q cancels"             _picker::select many "" "q" alpha beta
+assert_fail "many: invalid index in list" _picker::select many 0 "1,99" alpha beta
+assert_fail "many: empty cancels"         _picker::select many 0 "" alpha beta
+assert_fail "many: q cancels"             _picker::select many 0 "q" alpha beta
 
 # --- multi select with first-option -----------------------------------------
 
 assert_eq "many+first: pick reals" \
     "alpha
-beta" "$(_picker::select many "* All" "1,2" "* All" alpha beta gamma)"
+beta" "$(_picker::select many 1 "1,2" "* All" alpha beta gamma)"
 assert_eq "many+first: 'a' returns sentinel" \
-    "* All" "$(_picker::select many "* All" "a" "* All" alpha beta)"
+    "* All" "$(_picker::select many 1 "a" "* All" alpha beta)"
 
 # --- whitespace trim ---------------------------------------------------------
 
-assert_eq "trim leading space"  "alpha" "$(_picker::select one "" "  1" alpha beta)"
-assert_eq "trim trailing space" "alpha" "$(_picker::select one "" "1  " alpha beta)"
+assert_eq "trim leading space"  "alpha" "$(_picker::select one 0 "  1" alpha beta)"
+assert_eq "trim trailing space" "alpha" "$(_picker::select one 0 "1  " alpha beta)"
 
 # --- end-to-end fallback (regression: stdin items + tty-stub choice) --------
 #

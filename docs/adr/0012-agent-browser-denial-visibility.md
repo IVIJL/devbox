@@ -1,6 +1,6 @@
 # ADR 0012 — Agent-browser denial visibility and per-layer allow commands
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-05-22
 
 ## Context

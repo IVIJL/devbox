@@ -2143,6 +2143,61 @@ _filter_allowlisted_hosts() {
     done
 }
 
+# Resolve the proxy log for one container under the "last session, live or
+# archived" rule (ADR 0012 § Data source). Live wins even if empty; otherwise
+# the most recent archived log. Empty stdout if neither exists.
+#
+# Outputs two whitespace-separated tokens on success: `<kind> <path>` where
+# kind is `live` or `archived`. Callers may discard the kind.
+_resolve_last_session_log() {
+    local container="$1"
+    local log_path
+    log_path="$(_live_proxy_log_for "$container")"
+    if [ -n "$log_path" ]; then
+        printf 'live %s\n' "$log_path"
+        return 0
+    fi
+    log_path="$(_latest_archived_proxy_log "$container")"
+    if [ -n "$log_path" ]; then
+        printf 'archived %s\n' "$log_path"
+        return 0
+    fi
+    return 0
+}
+
+# Denied + allowlist-filtered hosts for one container. Wraps the live/archived
+# resolution + JSONL parse + allowlist filter in one place so both the per-
+# container `blocked` viewer and the global unified `devbox blocked` use the
+# same path. Emits one host per line on stdout, deduplicated, sorted.
+_denied_hosts_for_container() {
+    local container="$1"
+    local resolved log_path
+    resolved="$(_resolve_last_session_log "$container")"
+    [ -n "$resolved" ] || return 0
+    log_path="${resolved#* }"
+    _denied_hosts_from_log "$log_path" | _filter_allowlisted_hosts | sort -u
+}
+
+# Globally denied hosts across all containers that have ever produced an
+# agent-browser session (live ∪ archived), deduplicated and allowlist-
+# filtered. Used by the unified `devbox blocked` view.
+#
+# Silent fallback property (ADR 0012 acceptance #4): if no container has
+# any proxy log on disk anywhere, this function emits nothing — no headers,
+# no warnings — letting the caller render output indistinguishable from
+# today's firewall-only behaviour.
+_denied_hosts_global() {
+    local container
+    { _live_session_containers; _archived_containers; } \
+        | awk 'NF && !seen[$0]++' \
+        | while IFS= read -r container; do
+            [ -n "$container" ] || continue
+            _denied_hosts_for_container "$container"
+        done \
+        | awk 'NF && !seen[$0]++' \
+        | sort
+}
+
 # Interactive union picker over (live sessions ∪ archived containers).
 # Returns the picked container on stdout, non-zero on cancel/empty.
 _offer_blocked_container_picker() {
@@ -2194,33 +2249,22 @@ cmd_agent_blocked() {
         container="$(_require_container_arg "$container")"
     fi
 
-    # Pick the data source for this container. Live wins, even if empty
-    # (per ADR 0012 — "last session, live or archived").
-    local log_path="" log_kind=""
+    # Pick the data source for this container under the live > archived rule.
+    local resolved="" log_kind=""
     if [ -n "$container" ]; then
-        log_path="$(_live_proxy_log_for "$container")"
-        if [ -n "$log_path" ]; then
-            log_kind="live"
-        else
-            log_path="$(_latest_archived_proxy_log "$container")"
-            [ -n "$log_path" ] && log_kind="archived"
-        fi
+        resolved="$(_resolve_last_session_log "$container")"
+        [ -n "$resolved" ] && log_kind="${resolved%% *}"
     fi
 
     # No data for the explicit/CWD-derived container? Explicit dies with
     # the informative message; CWD-derived falls back to the picker.
-    if [ -z "$log_path" ]; then
+    if [ -z "$resolved" ]; then
         if [ "$from_cwd" = true ] || [ -z "$container" ]; then
             local picked
             if picked="$(_offer_blocked_container_picker)"; then
                 container="$picked"
-                log_path="$(_live_proxy_log_for "$container")"
-                if [ -n "$log_path" ]; then
-                    log_kind="live"
-                else
-                    log_path="$(_latest_archived_proxy_log "$container")"
-                    [ -n "$log_path" ] && log_kind="archived"
-                fi
+                resolved="$(_resolve_last_session_log "$container")"
+                [ -n "$resolved" ] && log_kind="${resolved%% *}"
             else
                 if [ -n "$container" ]; then
                     _log "no agent-browser sessions on record for ${container}"
@@ -2240,7 +2284,7 @@ cmd_agent_blocked() {
     local h
     while IFS= read -r h; do
         [ -n "$h" ] && hosts+=("$h")
-    done < <(_denied_hosts_from_log "$log_path" | _filter_allowlisted_hosts | sort)
+    done < <(_denied_hosts_for_container "$container")
 
     if [ "${#hosts[@]}" -eq 0 ]; then
         _log "No denied hosts to allow for ${container} (source: ${log_kind} log)."
@@ -3122,6 +3166,13 @@ main() {
         allow)     cmd_agent_allow "$@" ;;
         deny)      cmd_agent_deny  "$@" ;;
         blocked)   cmd_agent_blocked "$@" ;;
+        denied-hosts-global)
+            # Internal helper used by the unified `devbox blocked` view in
+            # docker-run.sh. Emits one denied host per line (live ∪ archived
+            # across all containers, deduplicated, allowlist-filtered). Not
+            # in the user-facing help: this is a Slice C wire-up surface, not
+            # a public sub-command. ADR 0012 § Surface.
+            _denied_hosts_global ;;
         -h|--help|help) _usage ;;
         *) _usage >&2; exit 2 ;;
     esac

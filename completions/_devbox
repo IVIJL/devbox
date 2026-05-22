@@ -40,9 +40,9 @@ _devbox() {
                 'claude-token:Generate/regenerate Claude Code token'
                 'allow:List or add allowed firewall domain'
                 'deny:Remove allowed domain (interactive)'
-                'blocked:Show blocked DNS queries, allow interactively'
+                'blocked:Show blocked DNS + agent-browser denials (interactive)'
                 'allow-for:Open a time-bounded Allow-for window (default 15 min)'
-                'agent-browser:Control Host agent Chrome (start/stop/status/open/allow-for)'
+                'agent-browser:Control Host agent Chrome (start/stop/status/open/allow-for/allow/deny/blocked)'
                 'cursor:Open Cursor attached to running devbox'
                 'code:Open VS Code attached to running devbox'
                 'clip:Grab clipboard image for container use'
@@ -136,7 +136,8 @@ _devbox() {
                     #   CURRENT==3 → subcommand
                     #   CURRENT==4 → container (start/stop/status) OR
                     #                minutes/--stop (allow-for) OR
-                    #                --project flag / URL (open)
+                    #                --project flag / URL (open) OR
+                    #                domain (deny — from allowlist file)
                     #   CURRENT==5 → container (allow-for only) OR
                     #                project value / URL (open)
                     #   CURRENT>=6 → URL (open)
@@ -148,6 +149,9 @@ _devbox() {
                             'status:Show session state (Chrome/proxy/watchdog PIDs)'
                             'open:Open URL(s) as new tabs in the running session'
                             'allow-for:Open time-bounded network window (default mode)'
+                            'allow:List or add agent-browser allowed domain'
+                            'deny:Remove agent-browser allowed domain'
+                            'blocked:Show agent-browser-denied hosts (interactive)'
                             'help:Show agent-browser help'
                         )
                         _describe 'agent-browser subcommands' subs
@@ -186,6 +190,36 @@ _devbox() {
                                 _describe 'allow-for flags' flags
                                 _devbox_containers
                                 ;;
+                            blocked)
+                                # `blocked` accepts -p/--project NAME just
+                                # like `open`. No positional URL/domain;
+                                # the broker drives an interactive picker.
+                                local -a flags
+                                flags=(
+                                    '--project:Target a non-CWD container'
+                                    '-p:Target a non-CWD container'
+                                )
+                                _describe 'blocked flags' flags
+                                ;;
+                            allow)
+                                # `allow` takes a domain to add. There is
+                                # no useful source for "things you might
+                                # want to add", so don't complete
+                                # (ADR 0012 § Shell completion).
+                                ;;
+                            deny)
+                                # `deny` removes an entry from the
+                                # agent-browser allowlist. Complete from
+                                # the current file contents — this is the
+                                # "help me find what to remove" path
+                                # promised in ADR 0012.
+                                local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/devbox/agent-browser-allowed-domains.conf"
+                                if [[ -f "$cfg" ]]; then
+                                    local -a entries
+                                    entries=(${(f)"$(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$cfg" 2>/dev/null | grep -v '^$')"})
+                                    _describe 'agent-browser allowed domains' entries
+                                fi
+                                ;;
                         esac
                     elif (( CURRENT == 5 )); then
                         case $words[3] in
@@ -199,10 +233,13 @@ _devbox() {
                                     _devbox_containers
                                 fi
                                 ;;
-                            open)
+                            open|blocked)
                                 # Container picker only after explicit
-                                # --project/-p flag; bare positionals
-                                # are URLs and have no completion.
+                                # --project/-p flag; bare positionals are
+                                # URLs (open) or absent (blocked). Both
+                                # accept `-p NAME` per `cmd_agent_blocked`
+                                # in scripts/agent-browser-broker.sh and
+                                # the `open` parser in docker-run.sh.
                                 if [ "$words[4]" = "--project" ] \
                                     || [ "$words[4]" = "-p" ]; then
                                     _devbox_containers

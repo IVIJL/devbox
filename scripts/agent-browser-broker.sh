@@ -2062,6 +2062,14 @@ cmd_agent_deny() {
     fi
 
     _sighup_all_proxies
+
+    # The proxy enforces the allowlist on CONNECT setup, not on bytes
+    # already flowing through an open tunnel. Live HTTPS sessions
+    # (HTTP/2 multiplexing, keep-alive) reuse the existing tunnel and
+    # bypass the deny until the browser closes the socket. Surface this
+    # so users don't think `deny` is broken when a tab keeps loading.
+    _log "Note: existing browser tunnels stay open until the tab/window is closed."
+    _log "      Restart the browser to enforce deny on live HTTPS sessions."
 }
 
 # --- subcommand: blocked (per-container deny viewer) -------------------------

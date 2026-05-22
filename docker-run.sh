@@ -64,11 +64,13 @@ Usage:
                                    List or add an Agent-browser allowlist
                                    entry. Unlike `devbox allow`, matches
                                    ONLY the literal host — quote a glob for
-                                   subdomains (e.g. '*.example.com').
+                                   subdomains (e.g. '*.example.com'). Auto-
+                                   pairs apex↔www (qr.cz → also www.qr.cz).
                                    SIGHUPs every live proxy.
   devbox agent-browser deny <domain>
-                                   Remove an Agent-browser allowlist entry;
-                                   SIGHUPs every live proxy.
+                                   Remove an Agent-browser allowlist entry
+                                   and its apex↔www counterpart (symmetric
+                                   with `allow`). SIGHUPs every live proxy.
   devbox agent-browser blocked [-p name]
                                    Pick from the last Agent-browser session's
                                    denied hosts (live or archived proxy log)

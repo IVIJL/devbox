@@ -121,7 +121,8 @@ command.
   (asymmetry documented below). Auto-globbing would silently widen
   the allowlist beyond what the user picked. The user can write a
   glob explicitly via `devbox agent-browser allow '*.openai.com'`
-  (quoted to suppress shell expansion).
+  (quoted to suppress shell expansion). See the narrow apex↔www
+  amendment under "Update 2026-05-22" below.
 
 ## Consequences
 
@@ -165,3 +166,35 @@ command.
 - `devbox blocked --since <ISO>` for power users who want a wider
   archived-log scan; not in MVP, would re-open the time-window
   discussion deliberately rejected above.
+
+## Update 2026-05-22 — apex↔www auto-pair on `allow`
+
+Shipped after the ADR was accepted. `devbox agent-browser allow <domain>`
+now writes the apex↔www counterpart alongside the user's input:
+
+- `qr.cz` → also adds `www.qr.cz`
+- `www.qr.cz` → also adds `qr.cz`
+- `*.qr.cz` → unchanged (globs already span the pair)
+- `localhost` (no dot) → unchanged (not a real domain)
+
+This is a narrow, deterministic exception to the "Auto-glob on write"
+rejection above. The rejected proposal added one wildcard pattern that
+silently covered the entire `*.example.com` subtree; this amendment adds
+exactly one literal entry — the other half of the apex↔www pair — and
+nothing else. The motivation is the HSTS / 301-to-`www` redirect that
+sends the user back through `blocked` for the same site (e.g. picking
+`qr.cz` opens it once, Chrome retries `www.qr.cz`, picker fires again).
+
+`deny` is **symmetric** — `deny X` also removes the apex↔www counterpart
+when present, mirroring `allow X`'s pair-add. The earlier "literal +
+hint" shape was changed once it shipped: the asymmetry between add
+(pair) and remove (literal) was confusing and the principal failure
+mode (user accidentally removes an unrelated counterpart) is rare
+enough not to outweigh the symmetric mental model. Removal is
+idempotent — silent when the counterpart is already absent.
+
+The `blocked` picker collapses apex↔www pairs in its output: when both
+hosts appear as denied for the same window, only the apex is shown.
+Selecting it auto-pairs both, so the `www.` row would be a redundant
+prompt. Implemented by `_collapse_www_pairs` applied after the existing
+allowlist filter.

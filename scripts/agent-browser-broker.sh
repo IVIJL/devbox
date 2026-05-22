@@ -153,6 +153,10 @@ Allowlist edits write to ~/.config/devbox/agent-browser-allowed-domains.conf
 and SIGHUP every live agent-browser proxy. Unlike the firewall allowlist,
 an entry matches ONLY the literal host — quote a glob for subdomains
 (e.g. '*.example.com').
+
+`allow <domain>` auto-pairs the apex↔www counterpart (qr.cz → also adds
+www.qr.cz, and vice versa) to cover the common HSTS / 301-to-www case.
+`deny` is symmetric — it removes the counterpart too.
 EOF
 }
 
@@ -1902,6 +1906,37 @@ _validate_ab_domain() {
     esac
 }
 
+# Compute the apex↔www counterpart for an allowlist entry, if one applies.
+# This is the deterministic narrow exception to ADR 0012's "no auto-glob on
+# write" rule — HSTS / 301-to-www is a common case where the user picks
+# `qr.cz` but Chrome immediately retries `www.qr.cz`. Pairing keeps the
+# allowlist literal (no wildcards) while saving one round-trip through
+# the picker. Globs are skipped — they already cover the pair.
+#
+# Examples:
+#   qr.cz          -> www.qr.cz
+#   www.qr.cz      -> qr.cz
+#   api.foo.com    -> www.api.foo.com
+#   *.foo.com      -> (empty: glob)
+#   localhost      -> (empty: no dot, not a real domain)
+_ab_www_pair() {
+    local d="$1"
+    case "$d" in
+        *'*'*|*'?'*|*'['*) return 0 ;;       # globs already span pairs
+    esac
+    case "$d" in
+        www.*)
+            local apex="${d#www.}"
+            case "$apex" in
+                *.*) printf '%s\n' "$apex" ;;  # strip only if apex still has a dot
+            esac
+            ;;
+        *.*)
+            printf '%s\n' "www.$d"
+            ;;
+    esac
+}
+
 # Fan SIGHUP out to every live agent-browser proxy and re-stage the
 # user-side allowlist into each session's profile dir first (the proxy
 # reads the staged copy, not $AGENT_ALLOWLIST_PATH directly — see the
@@ -1953,6 +1988,7 @@ cmd_agent_allow() {
         _log "Usage: devbox agent-browser allow <domain>  |  devbox agent-browser deny <domain>"
         _log "Note: Unlike the firewall allowlist, an entry matches ONLY the literal"
         _log "      host. For subdomains, quote a glob: devbox agent-browser allow '*.example.com'"
+        _log "      Apex↔www counterparts are auto-paired on add (e.g. qr.cz pulls in www.qr.cz)."
         return 0
     fi
 
@@ -1960,14 +1996,27 @@ cmd_agent_allow() {
     local domain="$1"
     _validate_ab_domain "$domain" || exit 2
 
+    local primary_added=0 pair pair_added=0
     if allowlist::add "$AGENT_ALLOWLIST_PATH" "$domain"; then
         _log "Allowed (agent-browser): ${domain}"
+        primary_added=1
     else
         _log "Already in agent-browser allowlist: ${domain}"
-        return 0
     fi
 
-    _sighup_all_proxies
+    # Auto-add the apex↔www counterpart so HSTS / 301 redirects don't
+    # send the user back through `blocked` for the same site.
+    pair="$(_ab_www_pair "$domain")"
+    if [ -n "$pair" ] && allowlist::add "$AGENT_ALLOWLIST_PATH" "$pair"; then
+        _log "Allowed (agent-browser): ${pair} (auto-paired with ${domain})"
+        pair_added=1
+    fi
+
+    # Skip SIGHUP fan-out when nothing changed — saves a re-stage cycle
+    # across every live proxy for a pure no-op.
+    if [ "$primary_added" = 1 ] || [ "$pair_added" = 1 ]; then
+        _sighup_all_proxies
+    fi
 }
 
 cmd_agent_deny() {
@@ -1975,10 +2024,24 @@ cmd_agent_deny() {
     local domain="$1"
     _validate_ab_domain "$domain" || exit 2
 
+    local primary_removed=0 pair pair_removed=0
     if allowlist::remove "$AGENT_ALLOWLIST_PATH" "$domain"; then
         _log "Removed (agent-browser): ${domain}"
+        primary_removed=1
     else
         _log "Not in agent-browser allowlist: ${domain}"
+    fi
+
+    # Symmetric with `allow`: if `allow X` added the counterpart,
+    # `deny X` removes it too. Idempotent — silent if the counterpart
+    # was already gone.
+    pair="$(_ab_www_pair "$domain")"
+    if [ -n "$pair" ] && allowlist::remove "$AGENT_ALLOWLIST_PATH" "$pair"; then
+        _log "Removed (agent-browser): ${pair} (auto-paired with ${domain})"
+        pair_removed=1
+    fi
+
+    if [ "$primary_removed" = 0 ] && [ "$pair_removed" = 0 ]; then
         return 0
     fi
 
@@ -2143,6 +2206,26 @@ _filter_allowlisted_hosts() {
     done
 }
 
+# Collapse apex↔www pairs in a host stream: when both `X` and `www.X`
+# appear, drop the `www.X` row so the picker shows the apex only.
+# Selecting the apex auto-pairs both via `cmd_agent_allow`, so the
+# `www.X` row would be a duplicate prompt. Symmetric with `_ab_www_pair`.
+# Input order is preserved for the surviving rows.
+_collapse_www_pairs() {
+    awk '
+    { hosts[NR]=$0; seen[$0]=1 }
+    END {
+        for (i=1; i<=NR; i++) {
+            h = hosts[i]
+            if (substr(h, 1, 4) == "www.") {
+                apex = substr(h, 5)
+                if (apex in seen) continue
+            }
+            print h
+        }
+    }'
+}
+
 # Resolve the proxy log for one container under the "last session, live or
 # archived" rule (ADR 0012 § Data source). Live wins even if empty; otherwise
 # the most recent archived log. Empty stdout if neither exists.
@@ -2175,7 +2258,7 @@ _denied_hosts_for_container() {
     resolved="$(_resolve_last_session_log "$container")"
     [ -n "$resolved" ] || return 0
     log_path="${resolved#* }"
-    _denied_hosts_from_log "$log_path" | _filter_allowlisted_hosts | sort -u
+    _denied_hosts_from_log "$log_path" | _filter_allowlisted_hosts | sort -u | _collapse_www_pairs
 }
 
 # Globally denied hosts across all containers that have ever produced an
@@ -2195,7 +2278,8 @@ _denied_hosts_global() {
             _denied_hosts_for_container "$container"
         done \
         | awk 'NF && !seen[$0]++' \
-        | sort
+        | sort \
+        | _collapse_www_pairs
 }
 
 # Interactive union picker over (live sessions ∪ archived containers).

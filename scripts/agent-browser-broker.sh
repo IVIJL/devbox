@@ -60,6 +60,14 @@ AGENT_DOWNLOADS_DIR="/var/lib/devbox-agent/downloads"
 # proxy-decision JSONL (slice 04 onwards).
 AGENT_NETLOG_ARCHIVE_DIR="/var/log/devbox/agent-browser"
 
+# Retention cap: how many session triples (.proxy.log + .netlog.json +
+# .summary.md sharing a `<container>-<ISO>` prefix) we keep per container
+# in the archive. Older ones are pruned at the start of each new session
+# so a long-running agent that re-opens sessions does not grow the dir
+# unbounded. Per-container so cleanup in one project does not stomp on
+# another. Override via env when forensics need more headroom.
+AGENT_ARCHIVE_KEEP_PER_CONTAINER="${DEVBOX_AGENT_ARCHIVE_KEEP_PER_CONTAINER:-10}"
+
 # Per-user agent-browser state root. The proxy daemon's active-mode file
 # lives here. The proxy itself runs as devbox-agent and reads files via
 # that OS identity, so paths must be reachable for that user (see
@@ -927,6 +935,14 @@ cmd_start() {
         sudo chown devbox-agent: "$AGENT_NETLOG_ARCHIVE_DIR"
         sudo chmod 750 "$AGENT_NETLOG_ARCHIVE_DIR"
     fi
+
+    # Defensive retention sweep. cmd_stop is the canonical enforcement
+    # point (runs after the new session's files land in the archive), but
+    # we also prune here so an archive that was over-cap before this
+    # broker version landed — or that grew via a crash that skipped the
+    # stop-time prune — gets trimmed on next start. Best-effort: failure
+    # warns but does not block the new session.
+    _prune_archive_for "$container" "$AGENT_ARCHIVE_KEEP_PER_CONTAINER"
 
     local ts profile_dir download_dir netlog_path
     ts="$(date -u +"%Y%m%dT%H%M%SZ")"
@@ -2086,6 +2102,87 @@ _live_session_containers() {
     shopt -u nullglob
 }
 
+# Trim the per-container archive to the newest $keep session triples.
+# A "session triple" is everything sharing a `<container>-<ISO>` prefix:
+# `.proxy.log`, `.netlog.json`, `.summary.md`. Proxy log is the anchor —
+# always written at stop, ISO ts is unambiguous, sorts as text — so we
+# enumerate proxy.log files, keep the newest $keep, and sweep the other
+# two extensions for the dropped prefixes too. Idempotent: a parallel
+# start for the same container can only add files (different ts), never
+# resurrect the ones we just deleted.
+_prune_archive_for() {
+    local container="$1" keep="$2"
+    [ -d "$AGENT_NETLOG_ARCHIVE_DIR" ] || return 0
+    [[ "$keep" =~ ^[0-9]+$ ]] || return 0
+    [ "$keep" -gt 0 ] || return 0
+
+    # Enumerate as devbox-agent. The archive dir is 0750 devbox-agent
+    # (ADR 0010), so a host shell without an active devbox-agent group
+    # membership — fresh install before `newgrp` / re-login — cannot list
+    # it directly. A bare glob would expand to nothing in that case and
+    # retention would silently never fire, letting the archive grow past
+    # the cap. Going through sudo makes retention robust to group state;
+    # the sudo prompt almost always piggybacks on cmd_start's other sudo
+    # calls (cached creds), and a sudo failure here is downgraded to a
+    # warning rather than aborting session start.
+    local listing
+    if ! listing=$(sudo -u devbox-agent \
+        find "$AGENT_NETLOG_ARCHIVE_DIR" -maxdepth 1 -type f \
+             -name "${container}-*.proxy.log" 2>/dev/null); then
+        _warn "agent-browser: could not enumerate archive for prune — retention skipped this session"
+        return 0
+    fi
+
+    # Walk the listing and require the dash-segment after `<container>-`
+    # to be the exact ISO-ts shape `[0-9]{8}T[0-9]{6}Z`, and the pre-ts
+    # head to equal `<container>` literally. Without the ts check, a
+    # prefix-collision project (`devbox-foo` vs `devbox-foo-bar`) would
+    # see its sibling's archives pulled into the keep/drop set and the
+    # deletion loop could remove the wrong container's files. Same
+    # defence as _devbox::remove_project_agent_browser_archives in
+    # docker-run.sh — keep them in sync.
+    local -a archives=()
+    local f base ts head
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        base="$(basename "$f" .proxy.log)"
+        ts="${base##*-}"
+        [[ "$ts" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || continue
+        head="${base%-"$ts"}"
+        [ "$head" = "$container" ] || continue
+        archives+=("$f")
+    done <<< "$listing"
+
+    [ "${#archives[@]}" -gt "$keep" ] || return 0
+
+    # ISO 8601 sorts lexicographically → ascending gives oldest first.
+    local -a sorted=()
+    while IFS= read -r line; do
+        sorted+=("$line")
+    done < <(printf '%s\n' "${archives[@]}" | sort)
+
+    local drop_count=$(( ${#sorted[@]} - keep ))
+    local idx ext victim
+    for (( idx=0; idx < drop_count; idx++ )); do
+        base="$(basename "${sorted[$idx]}" .proxy.log)"
+        # Belt-and-braces validation: the glob walk above already
+        # confirms `<container>-<ISO>` shape, but _is_managed_path also
+        # rejects any path that escapes the archive dir via traversal.
+        _is_managed_path "${AGENT_NETLOG_ARCHIVE_DIR}/${base}.proxy.log" \
+            "$AGENT_NETLOG_ARCHIVE_DIR" "${container}-" || continue
+        # `[ -e ]` would also stat-fail without group membership, so we
+        # skip the existence probe and let `rm -f` silently no-op on a
+        # missing file. The proxy.log is guaranteed present (we just
+        # found it); the other two extensions are best-effort.
+        for ext in proxy.log netlog.json summary.md; do
+            victim="${AGENT_NETLOG_ARCHIVE_DIR}/${base}.${ext}"
+            if ! sudo -u devbox-agent rm -f -- "$victim" 2>/dev/null; then
+                _warn "agent-browser: failed to prune ${victim}"
+            fi
+        done
+    done
+}
+
 # Pick the most recent archived proxy.log for a container by ISO
 # timestamp in filename (sortable as text). Empty stdout if none.
 # The shopt+nullglob path is preferred over `ls` so a no-match doesn't
@@ -2929,6 +3026,14 @@ PY
     else
         _warn "Summary generator missing at ${AGENT_SUMMARIZE_BIN}; skipping."
     fi
+
+    # Retention sweep after the new session's triple is fully in place.
+    # cmd_start also prunes (defensive against an archive that was already
+    # over-cap when the broker first encountered it), but stop is the
+    # canonical enforcement point: without this call a container that
+    # already had `keep` archived sessions would briefly hold `keep + 1`
+    # until the next start. Failure is non-fatal — teardown continues.
+    _prune_archive_for "$container" "$AGENT_ARCHIVE_KEEP_PER_CONTAINER"
 
     # Remove the ephemeral profile and download dirs — they are session-
     # scoped per ADR 0010 § Actor 1, and any forensic value has already

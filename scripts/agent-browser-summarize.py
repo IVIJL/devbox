@@ -35,6 +35,7 @@ import argparse
 import datetime as _dt
 import fnmatch
 import json
+import subprocess
 import sys
 import urllib.parse
 from collections import Counter, defaultdict
@@ -587,14 +588,81 @@ def _render(args: argparse.Namespace, proxy: ProxyLog | None,
     lines.append("## Pointers")
     lines.append("")
     if netlog_path is not None:
-        lines.append(f"- Netlog:    `{netlog_path}`")
+        lines.extend(_pointer_lines("Netlog", netlog_path))
     if proxy_path is not None:
-        lines.append(f"- Proxy log: `{proxy_path}`")
+        lines.extend(_pointer_lines("Proxy log", proxy_path))
     if netlog_path is None and proxy_path is None:
         lines.append("- (no raw log files associated with this session)")
     lines.append("")
 
     return "\n".join(lines)
+
+
+def _is_wsl2() -> bool:
+    """True on WSL2 hosts.
+
+    Same probe as scripts/deliver-allow-for-notification.sh::is_wsl2 —
+    /proc/version contains "Microsoft" on every WSL kernel build.
+    """
+    try:
+        return "microsoft" in Path("/proc/version").read_text().lower()
+    except OSError:
+        return False
+
+
+def _wsl_file_uri(path: Path) -> str | None:
+    """Render a Linux path as a `file://wsl.localhost/<distro>/...` URI.
+
+    Uses `wslpath -w` to get the UNC form (which embeds the active distro
+    name), flips backslashes to forward slashes, then percent-encodes per
+    RFC 8089. Mirrors the bash `to_file_uri` in
+    scripts/deliver-allow-for-notification.sh. Returns None if wslpath
+    is unavailable or fails so the caller can fall back silently — the
+    relative-basename link is still emitted unconditionally.
+    """
+    try:
+        result = subprocess.run(
+            ["wslpath", "-w", str(path)],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=2.0,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    unc = result.stdout.strip()
+    if not unc:
+        return None
+    forward = unc.replace("\\", "/")
+    # `/` and `:` stay literal so the path stays a path; everything else
+    # outside the URI-safe set gets percent-encoded. Real triggers in
+    # archive filenames: none today, but `+` in ISO offsets and spaces in
+    # a renamed distro would otherwise break the URL.
+    quoted = urllib.parse.quote(forward, safe="/:")
+    return f"file:{quoted}"
+
+
+def _pointer_lines(label: str, path: Path) -> list[str]:
+    """Render one archive pointer as one (or two) clickable Markdown lines.
+
+    Always emits a relative-basename link — the summary lives in the same
+    archive dir as the file it points at, so the basename is enough for
+    VS Code, GitHub, and any Markdown previewer that resolves relative
+    links against the document's location.
+
+    On WSL2 the system-absolute form changes meaning depending on whether
+    the renderer treats it as Linux or Windows, so we additionally emit a
+    `file://wsl.localhost/<distro>/...` URL — Windows Terminal Ctrl+Click
+    opens it in the default `.json`/`.log` handler and the VS Code
+    Markdown preview routes it through the OS shell.
+    """
+    basename = path.name
+    out = [f"- {label}: [`{basename}`]({basename})"]
+    if _is_wsl2():
+        wsl_uri = _wsl_file_uri(path)
+        if wsl_uri is not None:
+            out.append(f"  - Windows: [`{path}`]({wsl_uri})")
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:

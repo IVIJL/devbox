@@ -229,29 +229,56 @@ if [ "$UNINSTALL" = true ]; then
         fi
     fi
 
-    # Ask about allow-for harvest log directory (ADR 0009). Root-owned, so
-    # removal requires sudo. Kept opt-in because harvest logs document past
-    # outbound traffic from autonomous agents — some users will want to
-    # preserve them across reinstalls (forensics, allowlist audit trail).
-    ALLOW_FOR_LOG_DIR="/var/log/devbox/allow-for"
-    if [ -d "$ALLOW_FOR_LOG_DIR" ]; then
+    # Ask about /var/log/devbox/ — owns allow-for harvest logs (ADR 0009)
+    # and agent-browser session archives (ADR 0010). Root-owned, so removal
+    # requires sudo. Kept opt-in because both kinds document past outbound
+    # traffic from autonomous agents — some users will want to preserve
+    # them across reinstalls (forensics, allowlist audit trail).
+    DEVBOX_LOG_DIR="/var/log/devbox"
+    if [ -d "$DEVBOX_LOG_DIR" ]; then
+        # Per-subdir guards. Either subdir may be missing — a host that
+        # only ever ran agent-browser won't have allow-for/, and vice
+        # versa. Running `find` against a non-existent path exits 1; with
+        # `set -euo pipefail` that would abort the whole uninstall before
+        # the prompt.
+        #
+        # The agent-browser dir is also 0750 devbox-agent (ADR 0010), so
+        # a shell without an active devbox-agent group membership (fresh
+        # install before re-login or `newgrp`) cannot traverse it — find
+        # exits non-zero even when the dir exists. The count is purely a
+        # hint for the user; `sudo rm -rf` below clears the dir regardless
+        # of whether we could enumerate it, so a failed count falls back
+        # to "?" rather than aborting the whole uninstall.
+        allow_for_count=0
+        agent_browser_count=0
+        if [ -d "$DEVBOX_LOG_DIR/allow-for" ]; then
+            if ! allow_for_count=$(find "$DEVBOX_LOG_DIR/allow-for" -maxdepth 1 -type f -name '*.log' 2>/dev/null | wc -l); then
+                allow_for_count="?"
+            fi
+        fi
+        if [ -d "$DEVBOX_LOG_DIR/agent-browser" ]; then
+            if ! agent_browser_count=$(find "$DEVBOX_LOG_DIR/agent-browser" -maxdepth 1 -type f \
+                \( -name '*.netlog.json' -o -name '*.proxy.log' -o -name '*.summary.md' \) 2>/dev/null | wc -l); then
+                agent_browser_count="?"
+            fi
+        fi
         echo ""
-        echo "Allow-for harvest logs found: $ALLOW_FOR_LOG_DIR"
-        # Use sudo for the count too — directory is 0755 so listing works
-        # without it, but if perms drift `find` would still succeed.
-        log_count=$(find "$ALLOW_FOR_LOG_DIR" -maxdepth 1 -type f -name '*.log' 2>/dev/null | wc -l)
-        echo "  Contains: $log_count harvest log file(s)"
+        echo "Devbox log directory found: $DEVBOX_LOG_DIR"
+        # String compare so the "?" placeholder also prints — the user
+        # should see we know the dir is non-empty even when we can't count.
+        [ "$allow_for_count" != "0" ]     && echo "  Allow-for harvest logs:       $allow_for_count file(s)"
+        [ "$agent_browser_count" != "0" ] && echo "  Agent-browser session files:  $agent_browser_count file(s)"
         if [ -t 0 ]; then
-            printf "Remove harvest logs? [y/N] "
+            printf "Remove devbox logs? [y/N] "
             read -r answer
             if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
-                sudo rm -rf /var/log/devbox
-                echo "Removed: /var/log/devbox"
+                sudo rm -rf "$DEVBOX_LOG_DIR"
+                echo "Removed: $DEVBOX_LOG_DIR"
             else
-                echo "Kept: $ALLOW_FOR_LOG_DIR"
+                echo "Kept: $DEVBOX_LOG_DIR"
             fi
         else
-            echo "  Skipped (non-interactive). Remove manually: sudo rm -rf /var/log/devbox"
+            echo "  Skipped (non-interactive). Remove manually: sudo rm -rf $DEVBOX_LOG_DIR"
         fi
     fi
 

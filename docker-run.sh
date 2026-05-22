@@ -778,6 +778,79 @@ _devbox::remove_project_https_artifacts() {
         2>/dev/null || true
 }
 
+# Remove agent-browser session archives (.netlog.json + .proxy.log +
+# .summary.md) that belong to this project's container. Files live under
+# /var/log/devbox/agent-browser/ and are owned by the devbox-agent user
+# (ADR 0010), so deletion goes through `sudo -u devbox-agent rm` — same
+# identity the broker uses when archiving on `agent-browser stop`. Silent
+# no-op when the dir is missing or the project never ran an agent-browser
+# session.
+#
+# The archive filename shape is `devbox-<project>-<ISO_TS>.<ext>` where
+# `<ISO_TS>` matches `[0-9]{8}T[0-9]{6}Z`. A naive `devbox-<project>-*.<ext>`
+# glob would catch prefix-collision projects (`foo` matching `foo-bar`'s
+# files), so we walk the glob explicitly, verify the last dash-segment is
+# the ISO ts shape, and require the pre-ts prefix to equal `devbox-<project>`
+# before deleting. Same defence as _devbox::remove_project_route_yamls.
+#
+# Usage: _devbox::remove_project_agent_browser_archives <project>
+_devbox::remove_project_agent_browser_archives() {
+    local project="$1"
+    [ -n "$project" ] || return 0
+    local archive_dir="/var/log/devbox/agent-browser"
+    [ -d "$archive_dir" ] || return 0
+    local container="devbox-${project}"
+
+    # Enumerate as devbox-agent. The archive dir is 0750 devbox-agent
+    # (ADR 0010), so a host shell without an active devbox-agent group
+    # membership cannot list it directly — `devbox remove` immediately
+    # after install / before `newgrp` would otherwise see an empty glob
+    # and silently leave this project's archives behind. Sudo for the
+    # listing parallels the sudo for deletion below; if enumeration fails
+    # we surface a warning rather than masking the cleanup gap.
+    local listing
+    if ! listing=$(sudo -u devbox-agent \
+        find "$archive_dir" -maxdepth 1 -type f \
+             \( -name "${container}-*.netlog.json" \
+             -o -name "${container}-*.proxy.log" \
+             -o -name "${container}-*.summary.md" \) 2>/dev/null); then
+        echo "  WARN: could not enumerate $archive_dir — agent-browser logs for this project may remain" >&2
+        return 0
+    fi
+
+    local -a victims=()
+    local f base ts head ext
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        base="$(basename "$f")"
+        # Strip the longest known extension. Order matters: `.netlog.json`
+        # must be tried before `.json` would be — we only know three exts
+        # so an explicit case is cleaner than a generic strip.
+        case "$base" in
+            *.netlog.json) ext="netlog.json"; base="${base%.netlog.json}" ;;
+            *.proxy.log)   ext="proxy.log";   base="${base%.proxy.log}"   ;;
+            *.summary.md)  ext="summary.md";  base="${base%.summary.md}"  ;;
+            *) continue ;;
+        esac
+        ts="${base##*-}"
+        # ISO 8601 basic-format ts: 8 digits, literal T, 6 digits, Z.
+        [[ "$ts" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || continue
+        head="${base%-"$ts"}"
+        [ "$head" = "$container" ] || continue
+        # Re-build the validated path rather than trusting $f post-find,
+        # so a future change to the loop can't accidentally widen scope.
+        victims+=("$archive_dir/${container}-${ts}.${ext}")
+    done <<< "$listing"
+
+    [ "${#victims[@]}" -gt 0 ] || return 0
+
+    if sudo -u devbox-agent rm -f -- "${victims[@]}" 2>/dev/null; then
+        echo "  Removed ${#victims[@]} agent-browser archive file(s)"
+    else
+        echo "  WARN: failed to remove some agent-browser archive files in $archive_dir" >&2
+    fi
+}
+
 # Remove per-port Traefik route YAMLs for a project, plus any sibling
 # `.pre-https-backup` files left by scripts/migrate-routes-to-https.sh.
 # Companion to _devbox::remove_project_https_artifacts — the three
@@ -2591,6 +2664,7 @@ if [ "$MODE" = "remove" ]; then
         done
         _devbox::remove_project_route_yamls "$proj"
         _devbox::remove_project_https_artifacts "$proj"
+        _devbox::remove_project_agent_browser_archives "$proj"
         if [ "$found" = false ]; then
             echo "  No volumes for project $proj." >&2
             return 1

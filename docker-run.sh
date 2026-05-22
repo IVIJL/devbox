@@ -52,9 +52,9 @@ Usage:
   devbox agent-browser <cmd> [name]
                                    Manage the Agent-browser session for a
                                    container. <cmd> is start | stop | status
-                                   | open | allow-for | allow | deny.
-                                   Launches Host agent Chrome on the host
-                                   and the in-container CDP bridge.
+                                   | open | allow-for | allow | deny |
+                                   blocked. Launches Host agent Chrome on the
+                                   host and the in-container CDP bridge.
                                    See ADR 0010.
   devbox agent-browser allow-for <N> [name]
                                    Open a network window for N minutes (proxy
@@ -69,6 +69,12 @@ Usage:
   devbox agent-browser deny <domain>
                                    Remove an Agent-browser allowlist entry;
                                    SIGHUPs every live proxy.
+  devbox agent-browser blocked [-p name]
+                                   Pick from the last Agent-browser session's
+                                   denied hosts (live or archived proxy log)
+                                   and allow them. Resolves -p → CWD basename
+                                   → picker over (live sessions ∪ containers
+                                   with archived logs).
   devbox cursor [name]             Open Cursor attached to running devbox
   devbox code [name]               Open VS Code attached to running devbox
   devbox clip                      Grab clipboard image for container use
@@ -1659,6 +1665,41 @@ case "${1:-}" in
                              ;;
                      esac
                  done
+             elif [ "$AGENT_BROWSER_SUB" = "blocked" ]; then
+                 # `blocked` shape: [--project|-p NAME]. No positionals
+                 # — the source of denials is per-container and resolves
+                 # via -p → CWD basename → picker (broker side). Mirrors
+                 # the `-p` flag from `open` so users only need to learn
+                 # one shape.
+                 ab_expect_project=false
+                 for arg in "$@"; do
+                     case "$arg" in
+                         '') ;;
+                         --project|-p)
+                             ab_expect_project=true
+                             ;;
+                         --project=*)
+                             AGENT_BROWSER_TARGET="${arg#--project=}"
+                             ;;
+                         -p=*)
+                             AGENT_BROWSER_TARGET="${arg#-p=}"
+                             ;;
+                         *)
+                             if [ "$ab_expect_project" = true ]; then
+                                 AGENT_BROWSER_TARGET="$arg"
+                                 ab_expect_project=false
+                             else
+                                 echo "Unexpected positional for agent-browser blocked: $arg" >&2
+                                 exit 2
+                             fi
+                             ;;
+                     esac
+                 done
+                 if [ "$ab_expect_project" = true ]; then
+                     echo "agent-browser blocked: --project/-p requires an argument" >&2
+                     exit 2
+                 fi
+                 unset ab_expect_project
              elif [ "$AGENT_BROWSER_SUB" = "start" ]; then
                  # `start` shape: [--no-open] [project]. Single known
                  # flag plus an optional project token; anything else
@@ -2846,14 +2887,14 @@ fi
 
 if [ "$MODE" = "agent-browser" ]; then
     if [ -z "$AGENT_BROWSER_SUB" ]; then
-        echo "Usage: devbox agent-browser <start|stop|status|open|allow-for|allow|deny> [args]" >&2
+        echo "Usage: devbox agent-browser <start|stop|status|open|allow-for|allow|deny|blocked> [args]" >&2
         exit 2
     fi
     case "$AGENT_BROWSER_SUB" in
-        start|stop|status|open|allow-for|allow|deny|-h|--help|help) ;;
+        start|stop|status|open|allow-for|allow|deny|blocked|-h|--help|help) ;;
         *)
             echo "Unknown agent-browser subcommand: $AGENT_BROWSER_SUB" >&2
-            echo "Usage: devbox agent-browser <start|stop|status|open|allow-for|allow|deny> [args]" >&2
+            echo "Usage: devbox agent-browser <start|stop|status|open|allow-for|allow|deny|blocked> [args]" >&2
             exit 2
             ;;
     esac
@@ -2877,6 +2918,20 @@ if [ "$MODE" = "agent-browser" ]; then
             exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" "$AGENT_BROWSER_SUB" "$AGENT_BROWSER_DOMAIN"
         fi
         exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" "$AGENT_BROWSER_SUB"
+    fi
+
+    # `blocked` carries its own resolution rule: explicit -p → CWD
+    # basename → broker-side picker. Unlike `start`/`open`, the source
+    # data (live or archived proxy.log) is meaningful even for stopped
+    # containers, so we never reject on "container not running" here —
+    # the broker is the gate.
+    if [ "$AGENT_BROWSER_SUB" = "blocked" ]; then
+        if [ -n "$AGENT_BROWSER_TARGET" ]; then
+            devbox::names_from_token "$AGENT_BROWSER_TARGET"
+            exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" blocked "$DEVBOX_CONTAINER_NAME"
+        fi
+        devbox::names_from_path "$(pwd)"
+        exec "$DEVBOX_DIR/scripts/agent-browser-broker.sh" blocked --from-cwd "$DEVBOX_CONTAINER_NAME"
     fi
 
     if [ -n "$AGENT_BROWSER_TARGET" ]; then

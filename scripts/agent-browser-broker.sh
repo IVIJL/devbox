@@ -147,6 +147,7 @@ Usage:
   agent-browser-broker.sh allow-for  --stop    <container>
   agent-browser-broker.sh allow      [<domain>]
   agent-browser-broker.sh deny       <domain>
+  agent-browser-broker.sh blocked    [<container> | --from-cwd <container>]
 
 Allowlist edits write to ~/.config/devbox/agent-browser-allowed-domains.conf
 and SIGHUP every live agent-browser proxy. Unlike the firewall allowlist,
@@ -1984,6 +1985,289 @@ cmd_agent_deny() {
     _sighup_all_proxies
 }
 
+# --- subcommand: blocked (per-container deny viewer) -------------------------
+#
+# Surfaces the most recent agent-browser session's denied hosts for one
+# container in an interactive multi-select picker. Each pick routes back
+# through `agent-browser allow <domain>` so SIGHUP fan-out (slice A) runs
+# once per pick. ADR 0012 § "Data source — last session, live or archived".
+
+# Enumerate containers that have an archived proxy.log on disk. Used by
+# the union picker to surface "agent ran, session timed out, user comes
+# back" workflows. The archive filename shape is
+# `<container>-<ISO>.proxy.log`; the ISO suffix sorts as text, so we
+# strip it to recover the container.
+_archived_containers() {
+    [ -d "$AGENT_NETLOG_ARCHIVE_DIR" ] || return 0
+    local f base container
+    shopt -s nullglob
+    for f in "$AGENT_NETLOG_ARCHIVE_DIR"/*.proxy.log; do
+        base="$(basename "$f" .proxy.log)"
+        # Strip trailing -YYYYMMDDTHHMMSSZ. The suffix is fixed-width
+        # (15 chars + leading dash), so a sed cut is unambiguous.
+        container="$(printf '%s\n' "$base" | sed -E 's/-[0-9]{8}T[0-9]{6}Z$//')"
+        [ "$container" = "$base" ] && continue
+        printf '%s\n' "$container"
+    done
+    shopt -u nullglob
+}
+
+# Enumerate live session container names from the sessions/ state dir.
+_live_session_containers() {
+    [ -d "$SESSIONS_DIR" ] || return 0
+    local f
+    shopt -s nullglob
+    for f in "$SESSIONS_DIR"/*.json; do
+        basename "$f" .json
+    done
+    shopt -u nullglob
+}
+
+# Pick the most recent archived proxy.log for a container by ISO
+# timestamp in filename (sortable as text). Empty stdout if none.
+# The shopt+nullglob path is preferred over `ls` so a no-match doesn't
+# trip `set -euo pipefail` in the caller's `var="$(_latest...)"` line.
+_latest_archived_proxy_log() {
+    local container="$1"
+    [ -d "$AGENT_NETLOG_ARCHIVE_DIR" ] || return 0
+    local -a candidates=()
+    local f
+    shopt -s nullglob
+    for f in "$AGENT_NETLOG_ARCHIVE_DIR"/"${container}"-*.proxy.log; do
+        candidates+=("$f")
+    done
+    shopt -u nullglob
+    [ "${#candidates[@]}" -gt 0 ] || return 0
+    printf '%s\n' "${candidates[@]}" | sort | tail -1
+}
+
+# Locate the live proxy.log for a container (state-file path). Empty
+# stdout if no live session, or if the state file points outside the
+# managed profile dir — the latter prevents a tampered state JSON from
+# steering a downstream `sudo -u devbox-agent cat` at an arbitrary
+# devbox-agent-readable path. Same trust property the archive path uses.
+_live_proxy_log_for() {
+    local container="$1"
+    local state_file
+    state_file="$(_state_file "$container")"
+    [ -f "$state_file" ] || return 0
+    local proxy_log_path profile_dir
+    proxy_log_path="$(_session_proxy_log_live "$state_file" 2>/dev/null || true)"
+    profile_dir="$(_state_get "$state_file" profile_dir 2>/dev/null || true)"
+    [ -n "$proxy_log_path" ] && [ "$proxy_log_path" != "null" ] || return 0
+    [ -n "$profile_dir" ] && [ "$profile_dir" != "null" ] || return 0
+    if ! _is_managed_path "$profile_dir" "$AGENT_PROFILES_DIR" "${container}-"; then
+        return 0
+    fi
+    if ! _is_managed_path "$proxy_log_path" "$profile_dir"; then
+        return 0
+    fi
+    printf '%s\n' "$proxy_log_path"
+}
+
+# Read denied hosts from a JSONL proxy log, dedup by host. Live logs sit
+# under devbox-agent-owned profile dirs (0700) that the developer can't
+# traverse, so we shell out via sudo when the file isn't directly
+# readable. jq is preferred for the JSON parse; python3 is the fallback
+# (mirrors `_state_get`'s jq/python3 cascade).
+_denied_hosts_from_log() {
+    local log_path="$1"
+    [ -n "$log_path" ] || return 0
+    local reader
+    if [ -r "$log_path" ]; then
+        reader=(cat -- "$log_path")
+    else
+        reader=(sudo -u devbox-agent cat -- "$log_path")
+    fi
+    if command -v jq >/dev/null 2>&1; then
+        "${reader[@]}" 2>/dev/null \
+            | jq -r 'select(.decision == "deny") | .host // empty' 2>/dev/null \
+            | awk 'NF && !seen[$0]++'
+    else
+        # Heredoc-into-stdin would shadow the pipe, so pass the script
+        # via -c and let python3 inherit the piped stdin directly.
+        "${reader[@]}" 2>/dev/null \
+            | python3 -c '
+import json, sys
+seen = set()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        continue
+    if rec.get("decision") != "deny":
+        continue
+    host = rec.get("host")
+    if not host or host in seen:
+        continue
+    seen.add(host)
+    print(host)
+'
+    fi
+}
+
+# Drop hosts already covered by the Agent-browser allowlist. Bare
+# entries are literal matches; `*`-glob entries use shell fnmatch
+# (the same semantic the proxy applies at runtime). `*.example.com`
+# additionally matches the bare `example.com` apex, mirroring the
+# proxy's `is_allowed` rule. Both sides are lowercased to match the
+# proxy's case-insensitive comparison.
+_filter_allowlisted_hosts() {
+    local -a allow_entries=()
+    local entry
+    while IFS= read -r entry; do
+        [ -n "$entry" ] && allow_entries+=("${entry,,}")
+    done < <(allowlist::read "$AGENT_ALLOWLIST_PATH")
+
+    local host host_lc matched apex
+    while IFS= read -r host; do
+        [ -n "$host" ] || continue
+        host_lc="${host,,}"
+        matched=false
+        for entry in "${allow_entries[@]}"; do
+            # shellcheck disable=SC2254 # intentional pattern expansion — fnmatch is the proxy semantic
+            case "$host_lc" in
+                $entry) matched=true; break ;;
+            esac
+            case "$entry" in
+                \*.*)
+                    apex="${entry#*.}"
+                    [ "$host_lc" = "$apex" ] && { matched=true; break; }
+                    ;;
+            esac
+        done
+        [ "$matched" = true ] || printf '%s\n' "$host"
+    done
+}
+
+# Interactive union picker over (live sessions ∪ archived containers).
+# Returns the picked container on stdout, non-zero on cancel/empty.
+_offer_blocked_container_picker() {
+    [ -t 0 ] || return 1
+    [ -t 2 ] || return 1
+    local -a candidates=()
+    local name
+    while IFS= read -r name; do
+        [ -n "$name" ] && candidates+=("$name")
+    done < <({ _live_session_containers; _archived_containers; } | awk 'NF && !seen[$0]++' | sort)
+    [ "${#candidates[@]}" -gt 0 ] || return 1
+    local header="agent-browser: pick a container to view denials (live or archived)"
+    local chosen
+    chosen="$(printf '%s\n' "${candidates[@]}" \
+        | picker::one --prompt "container> " --header "$header")" \
+        || return 1
+    [ -n "$chosen" ] || return 1
+    printf '%s\n' "$chosen"
+}
+
+cmd_agent_blocked() {
+    # Container resolution: precedence handled by docker-run.sh
+    # (explicit -p → CWD basename → picker). The broker accepts three
+    # shapes:
+    #   blocked                       — no hint, jump straight to picker
+    #   blocked <container>           — explicit, error if no data
+    #   blocked --from-cwd <container> — CWD-derived, picker on no data
+    local container="" from_cwd=false
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --from-cwd)
+                from_cwd=true
+                [ -n "${2:-}" ] || _die "Usage: agent-browser-broker.sh blocked [<container> | --from-cwd <container>]"
+                container="$2"
+                shift 2
+                ;;
+            -*)
+                _die "Unknown flag: $1"
+                ;;
+            *)
+                [ -z "$container" ] || _die "Usage: agent-browser-broker.sh blocked [<container> | --from-cwd <container>]"
+                container="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if [ -n "$container" ]; then
+        container="$(_require_container_arg "$container")"
+    fi
+
+    # Pick the data source for this container. Live wins, even if empty
+    # (per ADR 0012 — "last session, live or archived").
+    local log_path="" log_kind=""
+    if [ -n "$container" ]; then
+        log_path="$(_live_proxy_log_for "$container")"
+        if [ -n "$log_path" ]; then
+            log_kind="live"
+        else
+            log_path="$(_latest_archived_proxy_log "$container")"
+            [ -n "$log_path" ] && log_kind="archived"
+        fi
+    fi
+
+    # No data for the explicit/CWD-derived container? Explicit dies with
+    # the informative message; CWD-derived falls back to the picker.
+    if [ -z "$log_path" ]; then
+        if [ "$from_cwd" = true ] || [ -z "$container" ]; then
+            local picked
+            if picked="$(_offer_blocked_container_picker)"; then
+                container="$picked"
+                log_path="$(_live_proxy_log_for "$container")"
+                if [ -n "$log_path" ]; then
+                    log_kind="live"
+                else
+                    log_path="$(_latest_archived_proxy_log "$container")"
+                    [ -n "$log_path" ] && log_kind="archived"
+                fi
+            else
+                if [ -n "$container" ]; then
+                    _log "no agent-browser sessions on record for ${container}"
+                else
+                    _log "no agent-browser sessions on record (no live or archived data)"
+                fi
+                return 0
+            fi
+        else
+            _log "no agent-browser sessions on record for ${container}"
+            return 0
+        fi
+    fi
+
+    # Resolve denied hosts → unique list → filter against the allowlist.
+    local -a hosts=()
+    local h
+    while IFS= read -r h; do
+        [ -n "$h" ] && hosts+=("$h")
+    done < <(_denied_hosts_from_log "$log_path" | _filter_allowlisted_hosts | sort)
+
+    if [ "${#hosts[@]}" -eq 0 ]; then
+        _log "No denied hosts to allow for ${container} (source: ${log_kind} log)."
+        return 0
+    fi
+
+    local selected
+    selected="$(printf '%s\n' "${hosts[@]}" \
+        | picker::many \
+            --prompt "Allow domain (agent-browser):" \
+            --header "Tab/Shift-Tab to mark · Enter to confirm   (or \"1,3,5\" without fzf)" \
+            --first-option "* Allow all")" \
+        || return 1
+
+    local sel d
+    while IFS= read -r sel; do
+        [ -z "$sel" ] && continue
+        if [ "$sel" = "* Allow all" ]; then
+            for d in "${hosts[@]}"; do
+                "$0" allow "$d"
+            done
+        else
+            "$0" allow "$sel"
+        fi
+    done <<< "$selected"
+}
+
 # --- subcommand: allow-for ---------------------------------------------------
 
 cmd_allow_for() {
@@ -2837,6 +3121,7 @@ main() {
         allow-for) cmd_allow_for   "$@" ;;
         allow)     cmd_agent_allow "$@" ;;
         deny)      cmd_agent_deny  "$@" ;;
+        blocked)   cmd_agent_blocked "$@" ;;
         -h|--help|help) _usage ;;
         *) _usage >&2; exit 2 ;;
     esac

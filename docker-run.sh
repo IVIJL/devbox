@@ -77,6 +77,12 @@ Usage:
                                    and allow them. Resolves -p → CWD basename
                                    → picker over (live sessions ∪ containers
                                    with archived logs).
+  devbox mcp <cmd> [args]          Manage MCP servers for devbox Containers.
+                                   <cmd> is import | list | render | doctor |
+                                   add | install | enable | disable | remove.
+                                   Read-only today: 'mcp import' (dry-run
+                                   discovery) and 'mcp list --inherited'. See
+                                   ADR 0013.
   devbox cursor [name]             Open Cursor attached to running devbox
   devbox code [name]               Open VS Code attached to running devbox
   devbox clip                      Grab clipboard image for container use
@@ -1804,6 +1810,15 @@ case "${1:-}" in
                  AGENT_BROWSER_TARGET="${1:-}"
              fi
              ;;
+    mcp)       MODE="mcp"; shift
+             # Capture the subcommand and forward all remaining args verbatim
+             # to scripts/mcp-cli.sh, which owns final validation. devbox mcp
+             # is a host-side command and must not resolve a container here —
+             # read-only commands run without Docker.
+             MCP_SUB="${1:-}"
+             [ -n "$MCP_SUB" ] && shift
+             MCP_ARGS=("$@")
+             ;;
     cursor)    MODE="cursor";     shift; CURSOR_TARGET="${1:-}" ;;
     code)      MODE="code";       shift; CODE_TARGET="${1:-}" ;;
     ssh-config) MODE="ssh-config"; shift; SSH_CONFIG_ACTION="${1:-}" ;;
@@ -3028,6 +3043,21 @@ if [ "$MODE" = "allow-for" ]; then
 fi
 
 # --- devbox agent-browser <cmd> [project] ------------------------------------
+# --- devbox mcp <subcommand> -------------------------------------------------
+
+# Thin wrapper over scripts/mcp-cli.sh (ADR 0013). devbox mcp is a host-side
+# command: --help, import (empty), list --inherited (empty) and any --json
+# path run without Docker and resolve no container here. The dispatcher owns
+# subcommand validation and delegates candidate-model / JSON work to the
+# Python core in scripts/mcp/.
+
+if [ "$MODE" = "mcp" ]; then
+    if [ -n "$MCP_SUB" ]; then
+        exec "$DEVBOX_DIR/scripts/mcp-cli.sh" "$MCP_SUB" "${MCP_ARGS[@]}"
+    fi
+    exec "$DEVBOX_DIR/scripts/mcp-cli.sh"
+fi
+
 # Thin wrapper over scripts/agent-browser-broker.sh — resolves the target
 # container the same way `allow-for` / `cursor` / `code` do (explicit token
 # → CWD basename → interactive picker), then dispatches to the broker. The

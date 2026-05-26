@@ -30,7 +30,8 @@ from typing import Optional
 
 from . import import_result, inherited_list_result
 from .candidate import Candidate
-from .providers import ClaudeProvider
+from .merge import MergedCandidate, merge_candidates
+from .providers import ClaudeProvider, CodexProvider
 
 
 def _emit(payload: dict) -> int:
@@ -69,37 +70,75 @@ def _parse_scope(argv: list[str]) -> Optional[_Scope]:
     return scope
 
 
-def _discover(scope: _Scope) -> list[Candidate]:
-    provider = ClaudeProvider()
-    return provider.discover(
-        project_keys=scope.project_keys,
-        include_global=scope.include_global,
-        all_projects=scope.all_projects,
+def _discover(scope: _Scope) -> list[MergedCandidate]:
+    """Collect candidates from ALL import providers and merge them.
+
+    Each provider normalizes its own config into `Candidate`s; the shared
+    `merge_candidates` step (issue 03) then collapses identical candidates
+    discovered by multiple providers into one result, flags same-name/same-scope
+    spec disagreements as conflicts, and assigns every result a stable, secret-
+    free ``importId``. The Codex provider is conservative — it contributes
+    nothing (cleanly) when no supported Codex MCP config exists.
+    """
+    raw: list[Candidate] = []
+    raw.extend(
+        ClaudeProvider().discover(
+            project_keys=scope.project_keys,
+            include_global=scope.include_global,
+            all_projects=scope.all_projects,
+        )
     )
+    raw.extend(
+        CodexProvider().discover(
+            project_keys=scope.project_keys,
+            include_global=scope.include_global,
+            all_projects=scope.all_projects,
+        )
+    )
+    return merge_candidates(raw)
 
 
-def _render_text(candidates: list[Candidate]) -> int:
-    """Human-readable discovery report (no secret values, names only)."""
-    if not candidates:
+def _render_text(merged: list[MergedCandidate]) -> int:
+    """Human-readable discovery report (no secret values, names only).
+
+    Each line group covers one merged candidate: its stable ``importId``, every
+    contributing provider/source, the (redacted) command shape and env key
+    NAMES, and — when present — a conflict marker pointing at the colliding
+    import IDs so the user can pick one with ``--import-id`` once apply exists.
+    """
+    if not merged:
         sys.stdout.write("No Inherited MCP servers detected in the selected scope.\n")
         return 0
 
-    importable = [c for c in candidates if c.classification.placement != "excluded"]
-    excluded = [c for c in candidates if c.classification.placement == "excluded"]
+    importable = [
+        m for m in merged if m.candidate.classification.placement != "excluded"
+    ]
+    excluded = [
+        m for m in merged if m.candidate.classification.placement == "excluded"
+    ]
+    conflicts = [m for m in merged if m.conflict]
 
-    sys.stdout.write(
-        f"Discovered {len(candidates)} Inherited MCP server(s) "
-        f"({len(importable)} importable, {len(excluded)} excluded):\n"
+    summary = (
+        f"Discovered {len(merged)} Inherited MCP server(s) "
+        f"({len(importable)} importable, {len(excluded)} excluded"
     )
-    for cand in candidates:
+    if conflicts:
+        summary += f", {len(conflicts)} in conflict"
+    summary += "):\n"
+    sys.stdout.write(summary)
+
+    for m in merged:
+        cand = m.candidate
         scope_label = cand.source_scope
         if cand.source_project:
             scope_label = f"{scope_label} ({cand.source_project})"
         sys.stdout.write("\n")
         sys.stdout.write(f"  {cand.name}\n")
-        sys.stdout.write(f"    provider : {cand.provider}\n")
+        sys.stdout.write(f"    import id: {m.import_id}\n")
+        sys.stdout.write(f"    providers: {', '.join(m.providers)}\n")
         sys.stdout.write(f"    scope    : {scope_label}\n")
-        sys.stdout.write(f"    source   : {cand.source_path}\n")
+        for src in m.sources:
+            sys.stdout.write(f"    source   : {src.provider} -> {src.source_path}\n")
         sys.stdout.write(f"    type     : {cand.type or 'stdio'}\n")
         if cand.command.argv:
             sys.stdout.write(f"    command  : {' '.join(cand.command.argv)}\n")
@@ -112,6 +151,11 @@ def _render_text(candidates: list[Candidate]) -> int:
             sys.stdout.write(
                 "    secrets  : "
                 f"{', '.join(cand.command.secret_env_keys)} (values not shown)\n"
+            )
+        if m.conflict:
+            sys.stdout.write(
+                "    conflict : same name+scope as a different spec; "
+                f"choose by import id ({', '.join(m.conflict_with)})\n"
             )
         if cand.classification.placement == "excluded":
             reason = "; ".join(cand.classification.reasons) or "unsupported"

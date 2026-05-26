@@ -27,7 +27,15 @@ from typing import Any, Optional
 # serialized shape changes so later migrations (issue 02+) can branch on it.
 # Matches the spirit of the profile `version` field in local-plan-mcp.md
 # decision 24.
-SCHEMA_VERSION = 1
+#
+# v1 (issues 01-02): bare candidate entries (provider/sourcePath/sourceScope/
+#                    sourceProject/name/type/command/classification).
+# v2 (issue 03):     merged candidate entries — each now also carries the
+#                    cross-provider merge fields ``importId``, ``providers``,
+#                    ``sources``, and ``conflict`` (+ ``conflictWith`` when in
+#                    conflict). Consumers branching on the version can tell the
+#                    merged shape apart from the original bare shape.
+SCHEMA_VERSION = 2
 
 # Allowed classification placements (local-plan-mcp.md core question 9).
 # A candidate's placement separates *where it should run* from *how confident*
@@ -143,32 +151,61 @@ class Candidate:
         }
 
 
-def import_result(candidates: Optional[list[Candidate]] = None) -> dict[str, Any]:
+def _merged_dicts(candidates: Optional[list[Any]]) -> list[dict[str, Any]]:
+    """Serialize candidates as schema-v2 (merged) entries, always.
+
+    The envelope advertises ``SCHEMA_VERSION`` (v2 carries the cross-provider
+    merge fields ``importId``/``providers``/``sources``/``conflict``). To keep
+    the serialized shape consistent with the advertised version regardless of
+    caller, bare `Candidate`s are coerced through the merge step here so they
+    gain those fields; objects that are already merged (anything exposing the
+    merge-aware ``to_dict`` via an ``import_id`` attribute) serialize as-is.
+
+    `mcp.merge` is imported lazily to avoid a circular import (`merge` imports
+    this module for the `Candidate` type).
+    """
+    cands = candidates or []
+    if not cands:
+        return []
+    # Already-merged candidates carry an ``import_id`` attribute.
+    if all(hasattr(c, "import_id") for c in cands):
+        return [c.to_dict() for c in cands]
+    if all(isinstance(c, Candidate) for c in cands):
+        from .merge import merge_candidates
+
+        return [m.to_dict() for m in merge_candidates(list(cands))]
+    # Mixed/unknown input: trust each element's own ``to_dict`` (back-compat).
+    return [c.to_dict() for c in cands]
+
+
+def import_result(candidates: Optional[list[Any]] = None) -> dict[str, Any]:
     """Build the `devbox mcp import --json` envelope.
 
     Stable contract from the very first slice: a versioned object with a
-    `candidates` array. With no providers active yet the array is empty, but
-    the shape is identical once providers land in later issues.
+    `candidates` array. As of issue 03 (schema v2) each element is a merged
+    candidate carrying ``importId``, ``providers``, ``sources``, and a
+    ``conflict`` marker. Bare `Candidate`s passed here are coerced through the
+    merge step so the serialized shape always matches the advertised version.
     """
 
-    cands = candidates or []
     return {
         "version": SCHEMA_VERSION,
-        "candidates": [c.to_dict() for c in cands],
+        "candidates": _merged_dicts(candidates),
     }
 
 
 def inherited_list_result(
-    candidates: Optional[list[Candidate]] = None,
+    candidates: Optional[list[Any]] = None,
 ) -> dict[str, Any]:
     """Build the `devbox mcp list --inherited --json` envelope.
 
     `list --inherited` reports detected Inherited MCP servers (local-plan-mcp.md
-    decision 22). Same candidate shape as import; empty until providers exist.
+    decision 22). Same schema-v2 merged-candidate element shape as import; bare
+    `Candidate`s are coerced through the merge step so the entries always carry
+    the advertised v2 fields.
     """
 
-    cands = candidates or []
     return {
         "version": SCHEMA_VERSION,
-        "inherited": [c.to_dict() for c in cands],
+        "inherited": _merged_dicts(candidates),
     }

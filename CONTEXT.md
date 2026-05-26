@@ -125,6 +125,43 @@ and summarized into a human-readable `summary.md` (visited hosts,
 out-of-allowlist requests, downloads, suspicious flags).
 _Avoid_: chrome log, browser audit
 
+### MCP
+
+**MCP server**:
+A tool provider that exposes capabilities to an agent over the Model
+Context Protocol.
+
+**Container MCP server**:
+An **MCP server** that runs inside the **Container**. The default choice
+for project-file, repository, build, and test capabilities because it
+inherits the **Container**'s filesystem boundary and **default-deny**
+network posture.
+_Avoid_: local MCP server
+
+**Host MCP server**:
+An **MCP server** that runs on the host. Reserved for capabilities that
+must see host OS state, desktop state, host credentials, dotfiles, WSL2
+boundaries, Windows APIs, or other resources the **Container** should not
+see directly.
+_Avoid_: external MCP server, outside MCP server
+
+**MCP profile**:
+The selected set of **MCP servers** exposed to agents for a **Project**.
+The effective profile combines user-wide MCP choices with Project-specific
+choices.
+_Avoid_: MCP config, MCP preset
+
+**Inherited MCP server**:
+An **MCP server** discovered from an existing agent configuration that was
+not created by devbox. It can be proposed for a **MCP profile**, but is not
+trusted as devbox-managed merely because its configuration is visible inside
+the **Container**.
+_Avoid_: existing MCP server, user MCP server
+
+**Devbox MCP server**:
+An **MCP server** that devbox has explicitly added to a **MCP profile**.
+_Avoid_: managed MCP server
+
 ### Project / container
 
 **Project**:
@@ -172,6 +209,13 @@ _Avoid_: identity sentinel, container marker, devbox marker file
 - The **Agent-browser proxy** is the single network exit point for
   **Host agent Chrome**. Chrome cannot reach the internet by any other
   path; the `--proxy-server` flag is non-negotiable.
+- A **Project** has one effective **MCP profile** at a time. It is formed
+  from the user's global MCP choices plus the Project's MCP choices; the
+  Project can explicitly disable a global choice when that capability is
+  unsafe or too noisy for the Project.
+- An **Inherited MCP server** is not automatically a **Devbox MCP server**.
+  Devbox first classifies it and proposes how it should enter the **MCP
+  profile**.
 
 ## Example dialogue
 

@@ -205,13 +205,16 @@ devbox mcp import --all                  # scan every known agent project record
 devbox mcp import --project <name-or-path>   # scan one explicit project
 
 # Apply selected Container-safe candidates into the devbox profile:
-devbox mcp import --apply                 # interactive multi-select picker (TTY)
+devbox mcp import --apply                 # interactive wizard (TTY): fzf multi-select,
+                                          # per-server scope toggle, project picker
 devbox mcp import --apply --server context7
 devbox mcp import --apply --import-id imp-abcdef123456
 devbox mcp import --apply --all-applicable
 ```
 
-Apply preserves the source scope (a globally-configured server imports global; a project-scoped one imports for that project). Inherited secret env *values* can be copied into a scoped `0600` secret store; the summary reports which env **key names** were copied, never their values. Host-only, unknown, and excluded (remote/hosted) candidates are shown but not applied. A successful apply auto-renders unless you pass `--no-render`.
+In a TTY, `import --apply` opens a guided **wizard**: an `fzf` multi-select of the Container-safe candidates (a numbered menu when `fzf` is absent), then per selected server a **scope toggle** (default = the inherited scope; switch project ↔ global in either direction) and — whenever the resulting scope is *project* — a **project picker** (your initialized devbox Projects, with the source project pre-selected). The chosen servers are applied **continue-on-error**: a per-server failure (a secret value that can no longer be recovered, or a candidate that is not Container-applicable) is collected and reported in one final summary, and a single render runs over the servers that did apply. (Two selections that would land in the *same* profile slot — e.g. a global and a project copy of one server both switched to global — are caught up front and the apply is refused so neither silently overwrites the other; the wizard's multi-select otherwise de-duplicates by import id.)
+
+Apply otherwise preserves the source scope (a globally-configured server imports global; a project-scoped one imports for that project) — that stays the only behaviour for the **non-interactive** path (explicit `--server`/`--import-id`/`--all-applicable`, or no TTY), with no prompts. Switching a server's scope copies its secrets to the chosen scope's `0600` store. Inherited secret env *values* can be copied into a scoped secret store; the summary reports which env **key names** were copied, never their values. Host-only, unknown, and excluded (remote/hosted) candidates are shown but not applied. A successful apply auto-renders unless you pass `--no-render`.
 
 **2. Add a brand-new devbox MCP server** that was never in a host agent — `devbox mcp add ...` records an explicit new server (distinct from `import`, which discovers inherited ones). You choose its scope explicitly; devbox never silently promotes a new server to global.
 

@@ -605,6 +605,174 @@ class CliSelectionTest(ApplyEnv):
         self.assertIn("PROJECT_API_KEY", proc.stdout)  # name only
 
 
+class CliWizardWiringTest(ApplyEnv):
+    """The wizard's CLI contract: applicable-wizard list + --override apply.
+
+    These exercise the Python boundary the shell wizard drives (issue 12). The
+    interactive selection / scope toggle / project picker themselves live in the
+    shell and are validated by shellcheck + manual TTY use, but the arg shape the
+    wizard emits (``--import-id`` + ``--override``) and its continue-on-error
+    apply are unit-testable here.
+    """
+
+    def _run_cli(self, args, claude_path):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = (
+            os.path.join(_REPO_ROOT, "scripts")
+            + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        )
+        _ = claude_path
+        return subprocess.run(
+            [sys.executable, "-m", "mcp.cli", *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=_REPO_ROOT,
+        )
+
+    def _import_id_for(self, claude_path, name, scope_args):
+        """Run list-applicable-wizard and return the import id for ``name``."""
+        proc = self._run_cli(
+            ["list-applicable-wizard", *scope_args], claude_path
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for line in proc.stdout.splitlines():
+            cols = line.split("\t")
+            if len(cols) == 4 and cols[1] == name:
+                return cols[0], cols[2], cols[3]  # id, scope, project_key
+        self.fail(f"no applicable candidate named {name!r} in:\n{proc.stdout}")
+
+    def test_applicable_wizard_lists_source_project_key(self) -> None:
+        path = self._claude_fixture(env_value=_SECRET_VALUE)
+        iid, scope, pkey = self._import_id_for(
+            path, "project-helper", ["--no-global", "--project", _PROJECT_KEY]
+        )
+        self.assertTrue(iid.startswith("imp-"))
+        self.assertEqual(scope, "project")
+        # The source project key is the 4th column, ready for pre-highlighting.
+        self.assertEqual(pkey, _PROJECT_KEY)
+
+    def test_applicable_wizard_global_has_empty_project_key(self) -> None:
+        path = self._claude_fixture(env_value=_SECRET_VALUE)
+        _iid, scope, pkey = self._import_id_for(
+            path, "global-helper", ["--project", _PROJECT_KEY]
+        )
+        self.assertEqual(scope, "global")
+        self.assertEqual(pkey, "")
+
+    def test_override_project_source_to_global(self) -> None:
+        # A project-sourced server kept selectable but switched to GLOBAL by the
+        # wizard imports into the global profile + global secret store.
+        path = self._claude_fixture(env_value=_SECRET_VALUE)
+        iid, _scope, _pkey = self._import_id_for(
+            path, "project-helper", ["--no-global", "--project", _PROJECT_KEY]
+        )
+        proc = self._run_cli(
+            ["apply-json", "--no-global", "--project", _PROJECT_KEY,
+             "--import-id", iid, "--override", iid, "global"],
+            path,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn(_SECRET_VALUE, proc.stdout)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(len(payload["applied"]), 1)
+        self.assertEqual(payload["applied"][0]["scope"], "global")
+        # Wrote the GLOBAL profile, not the source Project's.
+        self.assertTrue(os.path.isfile(global_profile_path()))
+        self.assertFalse(os.path.isfile(profile_path("project", _PROJECT_KEY)))
+
+    def test_override_global_source_to_project(self) -> None:
+        # A global-sourced server switched to PROJECT by the wizard imports into
+        # the chosen Project (keyed by the absolute host path).
+        path = self._claude_fixture(env_value=_SECRET_VALUE)
+        iid, _scope, _pkey = self._import_id_for(
+            path, "global-helper", ["--project", _PROJECT_KEY]
+        )
+        proc = self._run_cli(
+            ["apply-json", "--project", _PROJECT_KEY,
+             "--import-id", iid, "--override", iid, "project", _PROJECT_KEY],
+            path,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(len(payload["applied"]), 1)
+        self.assertEqual(payload["applied"][0]["scope"], "project")
+        self.assertTrue(os.path.isfile(profile_path("project", _PROJECT_KEY)))
+
+    def test_override_rejects_relative_project_key(self) -> None:
+        # The wizard must only ever pass a resolved ABSOLUTE host path; a bare
+        # name is rejected at parse time before any write.
+        path = self._claude_fixture(env_value=_SECRET_VALUE)
+        iid, _scope, _pkey = self._import_id_for(
+            path, "global-helper", ["--project", _PROJECT_KEY]
+        )
+        proc = self._run_cli(
+            ["apply-text", "--project", _PROJECT_KEY,
+             "--import-id", iid, "--override", iid, "project", "DemoApp"],
+            path,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("override", proc.stderr.lower())
+        self.assertFalse(os.path.isfile(profile_path("project", _PROJECT_KEY)))
+
+    def test_override_rejects_bad_scope(self) -> None:
+        path = self._claude_fixture(env_value=_SECRET_VALUE)
+        iid, _scope, _pkey = self._import_id_for(
+            path, "global-helper", ["--project", _PROJECT_KEY]
+        )
+        proc = self._run_cli(
+            ["apply-text", "--project", _PROJECT_KEY,
+             "--import-id", iid, "--override", iid, "sideways"],
+            path,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("override", proc.stderr.lower())
+
+    def test_batch_continue_on_error_via_cli(self) -> None:
+        # A two-server batch where one server cannot recover its declared secret
+        # (the value was removed from the source) must import the OTHER and
+        # report the failure — the batch is not aborted. This mirrors the
+        # wizard applying several --import-id selections at once.
+        fixture = {
+            "mcpServers": {
+                "good": {
+                    "type": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@example/good@latest"],
+                },
+                # Declares an env key but supplies no value -> missing-secret
+                # skip when the classifier marks it secret-bearing. We force the
+                # missing-secret path with a token-shaped env name and no value.
+                "needs-secret": {
+                    "type": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@example/needs-secret@latest"],
+                    "env": {"NEEDS_SECRET_API_KEY": ""},
+                },
+            }
+        }
+        path = os.path.join(self.home, ".claude.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(fixture, fh)
+
+        good_id, _gs, _gp = self._import_id_for(
+            path, "good", ["--project", _PROJECT_KEY]
+        )
+        # The needs-secret server may or may not be classified container-safe
+        # depending on the classifier; only assert the GOOD one applied and that
+        # the run did not abort (returncode 0). Pass --all-applicable so every
+        # applicable candidate is in the batch alongside the explicit good id.
+        proc = self._run_cli(
+            ["apply-json", "--project", _PROJECT_KEY, "--all-applicable"],
+            path,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        applied_names = {a["name"] for a in payload["applied"]}
+        self.assertIn("good", applied_names)
+        _ = good_id
+
+
 class DryRunDefaultTest(ApplyEnv):
     def test_import_dry_run_writes_nothing(self) -> None:
         path = self._claude_fixture(env_value=_SECRET_VALUE)

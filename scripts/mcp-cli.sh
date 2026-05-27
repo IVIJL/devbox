@@ -51,6 +51,14 @@ MCP_PY_DIR="$DEVBOX_DIR/scripts"
 # shellcheck source-path=SCRIPTDIR source=../lib/naming.sh disable=SC1091
 . "$DEVBOX_DIR/lib/naming.sh"
 
+# Shared interactive picker (ADR 0006): fzf when present, a numbered fallback
+# (comma multi-select, `q` cancel, /dev/tty reads) otherwise. The import wizard
+# (issue 12) drives picker::many for the multi-select and picker::one for the
+# project picker, so fzf-vs-fallback and the cancel UX stay consistent with the
+# rest of devbox and are exercised by tests/picker.sh.
+# shellcheck source-path=SCRIPTDIR source=../lib/picker.sh disable=SC1091
+. "$DEVBOX_DIR/lib/picker.sh"
+
 # --- Usage -------------------------------------------------------------------
 
 _usage() {
@@ -385,21 +393,23 @@ cmd_import_apply() {
     [ "${#sel_args[@]}" -gt 0 ] && have_selection=true
 
     if [ "$have_selection" != true ]; then
-        # No explicit selection. Interactive -> picker; non-interactive -> fail.
+        # No explicit selection. Interactive -> wizard; non-interactive -> fail.
         if [ -t 0 ] && [ -t 1 ]; then
-            local picked picker_rc
-            # Capture the picker's own exit status: a `! cmd` test would reset
-            # $? to 0 inside the then-branch, masking a picker failure.
-            picked="$(_apply_picker "${_scope_args[@]}")"
-            picker_rc=$?
-            if [ "$picker_rc" -ne 0 ]; then
-                return "$picker_rc"
+            local wizard_args wizard_rc
+            # Capture the wizard's own exit status: a `! cmd` test would reset
+            # $? to 0 inside the then-branch, masking a wizard failure. The
+            # wizard prints the resolved --import-id / --override args (one per
+            # line) on stdout; all interaction goes to /dev/tty.
+            wizard_args="$(_apply_wizard "${_scope_args[@]}")"
+            wizard_rc=$?
+            if [ "$wizard_rc" -ne 0 ]; then
+                return "$wizard_rc"
             fi
             local -a picked_args=()
             local pline
             while IFS= read -r pline; do
-                [ -n "$pline" ] && picked_args+=("--import-id" "$pline")
-            done <<< "$picked"
+                [ -n "$pline" ] && picked_args+=("$pline")
+            done <<< "$wizard_args"
             if [ "${#picked_args[@]}" -eq 0 ]; then
                 echo "No candidates selected; nothing applied." >&2
                 return 0
@@ -451,55 +461,267 @@ _maybe_auto_render() {
     _run_py render-write-text >&2
 }
 
-# Interactive multi-select picker for applicable candidates. Lists applicable
-# (container-placement) candidates with a number, reads a space/comma-separated
-# selection from the TTY, and prints the chosen import IDs (one per line) on
-# stdout for the caller. Prompts go to stderr so stdout stays clean. Returns
-# non-zero only on a hard error; an empty selection prints nothing and succeeds.
-_apply_picker() {
+# =============================================================================
+# Interactive apply wizard (ADR 0013 amendment, issue 12)
+# =============================================================================
+# Drives `devbox mcp import [--all] --apply` in a TTY when no explicit
+# selection was given. Flow:
+#   1. fzf multi-select (TAB) over the in-scope Container-safe candidates, or a
+#      numeric multi-select menu when fzf is absent;
+#   2. per selected server, a scope toggle (default = inherited scope, offers
+#      the other scope in both directions);
+#   3. whenever the resulting scope is project, a project picker built from
+#      issue 11's enumerator (source project pre-highlighted when applicable;
+#      no default for global->project).
+# The wizard PRINTS the resolved Python apply args on stdout — `--import-id <id>`
+# for every selection plus `--override <id> <scope> [<key>]` whenever the user
+# changed the scope from the inherited one. All interaction reads from /dev/tty
+# and writes prompts to /dev/tty, so stdout stays a clean arg stream the caller
+# captures. Returns non-zero only on a hard error / explicit cancel.
+#
+# Apply itself stays in the Python core (continue-on-error via apply_selection):
+# the wizard contributes ONLY the selection + per-server override choices.
+
+# Read one line from the controlling terminal regardless of stdin redirection,
+# so the scope-toggle prompt works even when the wizard's stdout is captured by
+# the caller. Writes the answer to the named output variable.
+_tty_read() {
+    local -n _out="$1"
+    local prompt="$2"
+    [ -n "$prompt" ] && printf '%s' "$prompt" >/dev/tty
+    IFS= read -r _out </dev/tty || _out=""
+}
+
+# The machine KEY of a picker row. Each wizard menu row is "<display><TAB><key>"
+# where <key> is an `imp-...` import id or an ABSOLUTE project path; the chosen
+# row maps back to its key by taking everything after the final TAB. A tab
+# separator (not whitespace) is used so a project path containing spaces is
+# preserved verbatim — splitting on whitespace would truncate it. Neither an
+# import id nor a host path can contain a literal tab, so the split is exact.
+_row_key() {
+    printf '%s' "${1##*$'\t'}"
+}
+
+# Multi-select the applicable candidates via the shared picker (fzf or the
+# numbered fallback). Populates the caller's arrays (by nameref) with the CHOSEN
+# ids/names/scopes/project-keys, in menu order, de-duplicated. Returns non-zero
+# on a hard error or an empty/cancelled selection.
+#   $1..$4  nameref out arrays: ids names scopes pkeys
+#   $5..    the Python scope args
+_wizard_select() {
+    local -n _ids="$1"
+    local -n _names="$2"
+    local -n _scopes="$3"
+    local -n _pkeys="$4"
+    shift 4
+
     local applicable
-    applicable="$(_run_py list-applicable "$@")"
+    applicable="$(_run_py list-applicable-wizard "$@")"
     if [ -z "$applicable" ]; then
         echo "No applicable (container) candidates to import." >&2
         return 1
     fi
 
-    local -a ids=() names=() scopes=()
-    local id name scope
-    while IFS=$'\t' read -r id name scope; do
+    # Index every applicable candidate. Each menu row is "<display><TAB><id>";
+    # the import id after the final TAB lets a chosen row map back to its
+    # candidate (an import id has no spaces, but the TAB scheme is shared with
+    # the project picker, whose key — a host path — can contain spaces).
+    local -a all_ids=() all_names=() all_scopes=() all_pkeys=()
+    local -a menu=()
+    local id name scope pkey
+    while IFS=$'\t' read -r id name scope pkey; do
         [ -n "$id" ] || continue
-        ids+=("$id")
-        names+=("$name")
-        scopes+=("$scope")
+        all_ids+=("$id")
+        all_names+=("$name")
+        all_scopes+=("$scope")
+        all_pkeys+=("$pkey")
+        menu+=("$(printf '%-24s %-8s' "$name" "$scope")"$'\t'"$id")
     done <<< "$applicable"
 
-    echo "Select MCP servers to import (Container-safe candidates):" >&2
-    local i
-    for i in "${!ids[@]}"; do
-        printf '  %2d) %-24s %-12s %s\n' \
-            "$((i + 1))" "${names[$i]}" "${scopes[$i]}" "${ids[$i]}" >&2
+    local picked
+    picked="$(printf '%s\n' "${menu[@]}" | picker::many \
+        --prompt "Select MCP servers to import" \
+        --header "Container-safe candidates (multi-select; q to cancel)")" \
+        || { echo "Selection cancelled; nothing applied." >&2; return 2; }
+
+    local -a chosen_ids=()
+    local cid line
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        cid="$(_row_key "$line")"
+        [ -n "$cid" ] && chosen_ids+=("$cid")
+    done <<< "$picked"
+
+    if [ "${#chosen_ids[@]}" -eq 0 ]; then
+        return 2
+    fi
+
+    # Map each chosen id back to its row, de-duplicating while preserving order.
+    local i seen
+    _ids=(); _names=(); _scopes=(); _pkeys=()
+    for cid in "${chosen_ids[@]}"; do
+        seen=false
+        for id in "${_ids[@]+"${_ids[@]}"}"; do
+            [ "$id" = "$cid" ] && { seen=true; break; }
+        done
+        [ "$seen" = true ] && continue
+        for i in "${!all_ids[@]}"; do
+            if [ "${all_ids[$i]}" = "$cid" ]; then
+                _ids+=("${all_ids[$i]}")
+                _names+=("${all_names[$i]}")
+                _scopes+=("${all_scopes[$i]}")
+                _pkeys+=("${all_pkeys[$i]}")
+                break
+            fi
+        done
     done
-    printf 'Enter numbers (space/comma separated), or blank to cancel: ' >&2
+    return 0
+}
 
-    local reply
-    IFS= read -r reply || reply=""
-    reply="${reply//,/ }"
+# Scope toggle for one server. $1 inherited scope ("global"/"project"); prints
+# the CHOSEN scope ("global"/"project") on stdout. Default = inherited; pressing
+# Enter keeps it, any "y" answer flips to the other scope (both directions).
+_wizard_scope_toggle() {
+    local inherited="$1" name="$2"
+    local other reply
+    if [ "$inherited" = "global" ]; then
+        other="project"
+    else
+        other="global"
+    fi
+    printf 'Server %s — scope [%s]. Switch to %s? [y/N] ' \
+        "$name" "$inherited" "$other" >/dev/tty
+    _tty_read reply ''
+    case "$reply" in
+        y|Y|yes|YES) printf '%s\n' "$other" ;;
+        *) printf '%s\n' "$inherited" ;;
+    esac
+}
 
-    local token idx
-    for token in $reply; do
-        case "$token" in
-            ''|*[!0-9]*)
-                echo "Ignoring invalid selection '$token'." >&2
-                continue
-                ;;
-        esac
-        idx="$((token - 1))"
-        if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#ids[@]}" ]; then
-            echo "Ignoring out-of-range selection '$token'." >&2
+# Project picker for a project-scoped server, via the shared picker. Enumerates
+# issue 11's targets; the source project (when present) is offered as the FIRST
+# option so the user can pick it with one keystroke (pre-highlight in the no-fzf
+# fallback; fzf has no default-row API, so the source is simply listed first).
+# Prints the chosen absolute project key on stdout. Returns non-zero on cancel /
+# no targets.
+#   $1  the server name (for the prompt)
+#   $2  the default (source) project key, or "" for no default
+_wizard_project_picker() {
+    local name="$1" default_key="$2"
+    local targets
+    # Let stderr through: project-targets-text reports basename collisions
+    # there (two host paths sanitizing to one name, omitted from stdout for
+    # explicit disambiguation). Swallowing it would leave a user unable to see
+    # WHY a valid initialized Project is missing from the picker.
+    targets="$(_run_py project-targets-text)"
+    # project-targets-text prints a human note (not tab-separated) when empty;
+    # rows with a tab are real "<name>\t<key>" targets.
+    local -a tkeys=() tnames=()
+    local tname tkey
+    while IFS=$'\t' read -r tname tkey; do
+        [ -n "$tkey" ] || continue
+        tnames+=("$tname")
+        tkeys+=("$tkey")
+    done <<< "$targets"
+
+    if [ "${#tkeys[@]}" -eq 0 ]; then
+        echo "No initialized devbox Projects to target for '$name'." >&2
+        echo "A target must be known to Claude AND have a devbox-<name>-history volume." >&2
+        echo "Initialize the Project (run 'devbox <name>' once) and re-run import." >&2
+        return 2
+    fi
+
+    # Build the menu as "<display><TAB><key>" rows. The absolute key after the
+    # final TAB is recovered verbatim by _row_key even when the host path
+    # contains spaces (a plain trailing token would be truncated). The source
+    # project, when it is among the targets, is prepended as a first-option so it
+    # is the obvious default; the remaining targets follow in enumerator order.
+    local -a menu=()
+    local i default_row=""
+    for i in "${!tkeys[@]}"; do
+        local row
+        row="$(printf '%-20s' "${tnames[$i]}")"$'\t'"${tkeys[$i]}"
+        if [ -n "$default_key" ] && [ "${tkeys[$i]}" = "$default_key" ]; then
+            default_row="$row"
             continue
         fi
-        printf '%s\n' "${ids[$idx]}"
+        menu+=("$row")
     done
+
+    local picked
+    if [ -n "$default_row" ]; then
+        picked="$(printf '%s\n' "${menu[@]+"${menu[@]}"}" | picker::one \
+            --prompt "Pick the devbox Project for '$name'" \
+            --header "Source project is the default (a)" \
+            --first-option "$default_row")" \
+            || { echo "No Project chosen for '$name'." >&2; return 2; }
+    else
+        picked="$(printf '%s\n' "${menu[@]}" | picker::one \
+            --prompt "Pick the devbox Project for '$name'" \
+            --header "Choose a target Project (q to cancel)")" \
+            || { echo "No Project chosen for '$name'." >&2; return 2; }
+    fi
+
+    local key
+    key="$(_row_key "$picked")"
+    if [ -z "$key" ]; then
+        echo "No Project chosen for '$name'." >&2
+        return 2
+    fi
+    printf '%s\n' "$key"
+}
+
+# Full apply wizard. Prints the resolved Python apply args (one per line:
+# --import-id <id> ... and --override <id> <scope> [<key>] ...) on stdout. All
+# interaction is on /dev/tty. Returns non-zero on a hard error or a cancel.
+_apply_wizard() {
+    local -a sel_ids=() sel_names=() sel_scopes=() sel_pkeys=()
+    local rc
+    _wizard_select sel_ids sel_names sel_scopes sel_pkeys "$@"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        # rc 1 = no applicable candidates; rc 2 = empty/cancelled selection.
+        if [ "$rc" -eq 2 ]; then
+            echo "No candidates selected; nothing applied." >&2
+            return 0
+        fi
+        return "$rc"
+    fi
+
+    local -a out_args=()
+    local i id name inherited pkey chosen_scope chosen_key
+    for i in "${!sel_ids[@]}"; do
+        id="${sel_ids[$i]}"
+        name="${sel_names[$i]}"
+        inherited="${sel_scopes[$i]}"
+        pkey="${sel_pkeys[$i]}"
+
+        chosen_scope="$(_wizard_scope_toggle "$inherited" "$name")"
+
+        out_args+=("--import-id" "$id")
+
+        if [ "$chosen_scope" = "global" ]; then
+            # An override is needed only when the scope actually changed.
+            if [ "$inherited" != "global" ]; then
+                out_args+=("--override" "$id" "global")
+            fi
+            continue
+        fi
+
+        # Resulting scope is project -> always run the project picker. The
+        # source project (when the server came from a project) is the default.
+        if ! chosen_key="$(_wizard_project_picker "$name" "$pkey")"; then
+            return 2
+        fi
+        # Emit a project override whenever the scope changed (global->project)
+        # OR the chosen project key differs from the inherited source key. When
+        # the user keeps the inherited project unchanged, no override is needed.
+        if [ "$inherited" != "project" ] || [ "$chosen_key" != "$pkey" ]; then
+            out_args+=("--override" "$id" "project" "$chosen_key")
+        fi
+    done
+
+    printf '%s\n' "${out_args[@]}"
 }
 
 cmd_list() {

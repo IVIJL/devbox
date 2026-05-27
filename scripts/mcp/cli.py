@@ -29,7 +29,12 @@ import sys
 from typing import Optional
 
 from . import import_result, inherited_list_result
-from .apply import ApplyConflictError, apply_selection, is_applicable
+from .apply import (
+    ApplyConflictError,
+    ScopeOverride,
+    apply_selection,
+    is_applicable,
+)
 from .candidate import Candidate
 from .classify import classify_candidate
 from .merge import MergedCandidate, merge_candidates
@@ -337,6 +342,10 @@ class _Selection:
         self.servers: list[str] = []
         self.import_ids: list[str] = []
         self.all_applicable: bool = False
+        # ADR 0013 amendment (issue 12): per-server scope overrides keyed by
+        # import id, set only by the interactive apply wizard. Empty otherwise,
+        # so the non-interactive path preserves inherited scope byte-for-byte.
+        self.overrides: dict[str, ScopeOverride] = {}
 
 
 def _parse_selection(argv: list[str]) -> Optional[_Selection]:
@@ -368,6 +377,40 @@ def _parse_selection(argv: list[str]) -> Optional[_Selection]:
                 sys.stderr.write("mcp.cli: --import-id requires a value\n")
                 return None
             sel.import_ids.append(argv[i])
+        elif arg == "--override":
+            # Per-server scope override emitted by the apply wizard. Shape:
+            #   --override <import-id> global
+            #   --override <import-id> project <absolute-project-key>
+            # The import id selects which candidate is overridden; an override
+            # for a candidate that is not also in the selection is a no-op (the
+            # wizard always pairs --override with the matching --import-id).
+            if i + 2 >= len(argv):
+                sys.stderr.write(
+                    "mcp.cli: --override requires <import-id> <scope> "
+                    "[<project-key>]\n"
+                )
+                return None
+            iid = argv[i + 1]
+            ov_scope = argv[i + 2]
+            consumed = 2
+            project_key = ""
+            if ov_scope == "project":
+                if i + 3 >= len(argv):
+                    sys.stderr.write(
+                        "mcp.cli: --override <id> project requires a "
+                        "project key\n"
+                    )
+                    return None
+                project_key = argv[i + 3]
+                consumed = 3
+            try:
+                sel.overrides[iid] = ScopeOverride(
+                    scope=ov_scope, project_key=project_key
+                )
+            except ValueError as exc:
+                sys.stderr.write(f"mcp.cli: invalid --override: {exc}\n")
+                return None
+            i += consumed
         else:
             sys.stderr.write(f"mcp.cli: unknown argument {arg!r}\n")
             return None
@@ -439,7 +482,7 @@ def _apply_payload(merged: list[MergedCandidate], sel: _Selection) -> dict:
     if selected is None:
         return {"error": "selection"}
     try:
-        result = apply_selection(selected)
+        result = apply_selection(selected, sel.overrides or None)
     except ApplyConflictError as exc:
         sys.stderr.write(f"mcp.cli: {exc}\n")
         return {"error": "conflict"}
@@ -459,7 +502,7 @@ def _render_apply_text(merged: list[MergedCandidate], sel: _Selection) -> int:
     if selected is None:
         return 2
     try:
-        result = apply_selection(selected)
+        result = apply_selection(selected, sel.overrides or None)
     except ApplyConflictError as exc:
         sys.stderr.write(f"mcp.cli: {exc}\n")
         return 2
@@ -517,6 +560,34 @@ def _render_applicable_list(merged: list[MergedCandidate]) -> int:
         if m.candidate.source_project:
             scope = f"{scope}:{m.candidate.source_project}"
         sys.stdout.write(f"{m.import_id}\t{m.candidate.name}\t{scope}\n")
+    return 0
+
+
+def _render_applicable_wizard(merged: list[MergedCandidate]) -> int:
+    """Emit applicable candidates for the interactive apply WIZARD (issue 12).
+
+    Richer than ``list-applicable``: each line carries the source project KEY so
+    the wizard's project picker can pre-highlight the server's source Project
+    when its (inherited or overridden) scope is project. SECRET-FREE — identity
+    and directory metadata only.
+
+    Format (tab-separated, one applicable candidate per line)::
+
+        <import_id>\\t<name>\\t<source_scope>\\t<source_project_key>
+
+    ``source_scope`` is the bare scope (``global`` / ``project``) WITHOUT the
+    project suffix (the key follows in its own column). ``source_project_key`` is
+    the absolute host path the candidate was discovered in, or empty for a global
+    source. Only ``container`` candidates are emitted so the picker can never
+    offer a host-only/unknown choice.
+    """
+    for m in merged:
+        if not is_applicable(m):
+            continue
+        sys.stdout.write(
+            f"{m.import_id}\t{m.candidate.name}\t"
+            f"{m.candidate.source_scope}\t{m.candidate.source_project or ''}\n"
+        )
     return 0
 
 
@@ -1289,6 +1360,11 @@ def main(argv: list[str]) -> int:
         if scope is None:
             return 2
         return _render_applicable_list(_discover(scope))
+    if command == "list-applicable-wizard":
+        scope = _parse_scope(rest)
+        if scope is None:
+            return 2
+        return _render_applicable_wizard(_discover(scope))
     if command in ("render-json", "render-text"):
         # Render preview reuses the scope flags only to scope WHICH project
         # profiles to read. ``--project`` selects explicit project keys; with no

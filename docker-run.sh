@@ -2119,6 +2119,19 @@ if [ "$MODE" = "update" ]; then
                     ;;
             esac
         fi
+        # One-time MCP onboarding offer (ADR 0013, issue 10). Runs in the
+        # interactive update block so it can prompt on a TTY, mirroring the
+        # HTTPS prompt above. The hook is eligibility-gated by the Python core:
+        # it offers the import wizard ONLY when no devbox MCP profile exists yet
+        # AND the wizard has not already been seen/dismissed. On a later update
+        # (already seen, or a profile exists) it stays quiet under
+        # --quiet-if-noop. A non-interactive update prints a follow-up command
+        # and never prompts (the hook detects the TTY state itself). The
+        # seen/dismissed marker lives in ~/.config/devbox/mcp/state.json, so
+        # deleting profile files does not re-arm the prompt.
+        if [ -x "$DEVBOX_DIR/scripts/ensure-mcp-onboarding.sh" ]; then
+            "$DEVBOX_DIR/scripts/ensure-mcp-onboarding.sh" --quiet-if-noop || true
+        fi
         echo "Rebuilding image..."
         exec "$DEVBOX_DIR/build.sh" "$@"
     else

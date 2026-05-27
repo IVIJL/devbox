@@ -589,6 +589,39 @@ setup_devbox_skill() {
     fi
 }
 
+# --- MCP onboarding (ADR 0013) -----------------------------------------------
+# Delegates to scripts/ensure-mcp-onboarding.sh — the same hook the
+# `devbox update` self-heal chain calls, so install-time and upgrade-time
+# paths stay in lockstep. On a fresh interactive install it offers to scan
+# existing Claude Code / Codex MCP servers for devbox import; non-interactive
+# installs print a follow-up command instead (never a prompt or picker).
+
+setup_mcp_onboarding() {
+    info "Checking MCP onboarding..."
+
+    local hook="$DEVBOX_DIR/scripts/ensure-mcp-onboarding.sh"
+    if [ ! -x "$hook" ]; then
+        warn "scripts/ensure-mcp-onboarding.sh missing or non-executable; skipping."
+        SKIPPED+=("MCP onboarding (hook missing)")
+        return
+    fi
+
+    # A piped/`--yes` install has no usable TTY for the wizard; force the
+    # non-interactive branch so it prints the follow-up command instead of
+    # blocking on a prompt. An interactive install runs the offer directly.
+    local hook_args=()
+    if $AUTO_YES || [ ! -t 0 ]; then
+        hook_args+=("--non-interactive")
+    fi
+
+    if "$hook" "${hook_args[@]}"; then
+        CONFIGURED+=("MCP onboarding (run 'devbox mcp import' to discover servers)")
+    else
+        warn "MCP onboarding check failed — run 'devbox mcp import' manually later."
+        SKIPPED+=("MCP onboarding (check failed; see warnings above)")
+    fi
+}
+
 # --- SSH agent configuration -------------------------------------------------
 
 configure_ssh_agent() {
@@ -984,9 +1017,10 @@ main() {
         msg "  8. Install upstream vercel-labs/agent-browser skill via 'npx skills add' (network)"
         msg "  9. Install agent-browser allowlist example to \$HOME/.config/devbox"
         msg " 10. Install 'devbox' agent skill to \$HOME/.agents/skills/devbox (+ Claude/Codex symlinks)"
-        msg " 11. Install 'devbox' command to $SYMLINK_PATH"
-        msg " 12. Optionally generate Claude Code token for containers"
-        msg " 13. Check Docker availability"
+        msg " 11. Offer MCP onboarding (scan existing Claude Code / Codex MCP servers for devbox import)"
+        msg " 12. Install 'devbox' command to $SYMLINK_PATH"
+        msg " 13. Optionally generate Claude Code token for containers"
+        msg " 14. Check Docker availability"
         echo ""
         if ! confirm "Continue?"; then
             msg "Aborted."
@@ -1026,6 +1060,9 @@ main() {
 
     echo ""
     setup_devbox_skill
+
+    echo ""
+    setup_mcp_onboarding
 
     echo ""
     install_command

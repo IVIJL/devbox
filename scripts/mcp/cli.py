@@ -33,6 +33,7 @@ from .apply import ApplyConflictError, apply_selection, is_applicable
 from .candidate import Candidate
 from .classify import classify_candidate
 from .merge import MergedCandidate, merge_candidates
+from . import onboarding
 from .providers import ClaudeProvider, CodexProvider
 from .render import (
     DEVBOX_PREFIX,
@@ -1330,6 +1331,43 @@ def main(argv: list[str]) -> int:
         # shell dispatcher to resolve a bare `--project <name>` token.
         for key in ClaudeProvider().project_keys():
             sys.stdout.write(key + "\n")
+        return 0
+    if command == "onboarding-status":
+        # One-time MCP onboarding eligibility (issue 10). The install/update
+        # shell hook reads this to decide whether to offer the import wizard.
+        if rest:
+            sys.stderr.write(
+                "mcp.cli: onboarding-status takes no arguments\n"
+            )
+            return 2
+        return onboarding.emit_status(sys.stdout)
+    if command == "onboarding-text":
+        # Emit one onboarding text block: offer / followup / reminder.
+        if len(rest) != 1:
+            sys.stderr.write(
+                "mcp.cli: onboarding-text takes exactly one of "
+                "offer|followup|reminder\n"
+            )
+            return 2
+        rc = onboarding.emit_text(sys.stdout, rest[0])
+        if rc is None:
+            sys.stderr.write(
+                f"mcp.cli: unknown onboarding text block {rest[0]!r} "
+                "(offer|followup|reminder)\n"
+            )
+            return 2
+        return rc
+    if command == "onboarding-mark-seen":
+        # Record that onboarding was seen (suppresses future prompts). The
+        # optional decision label is informational only.
+        decision = rest[0] if rest else onboarding.DECISION_NOOP
+        if len(rest) > 1:
+            sys.stderr.write(
+                "mcp.cli: onboarding-mark-seen takes at most one decision "
+                "label\n"
+            )
+            return 2
+        onboarding.mark_seen(decision)
         return 0
 
     sys.stderr.write(f"mcp.cli: unknown command {command!r}\n")

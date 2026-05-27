@@ -106,6 +106,7 @@ Run `devbox --help` for the full list. Summary:
 | `devbox blocked` | Show blocked DNS queries, allow interactively via fzf |
 | `devbox allow-for [N] [name]` | Open an N-minute window that records (not blocks) non-allowlist DNS; `--stop` closes early |
 | `devbox agent-browser <start\|stop\|status\|allow-for> [args]` | Drive a hardened host Chrome from inside the container; `allow-for` opens an N-minute proxy harvest window |
+| `devbox mcp <import\|list\|render\|doctor\|add\|install\|enable\|disable\|remove> [args]` | Manage Container MCP servers: import host agent config, render devbox-managed entries, diagnose, materialize runtime |
 | `devbox cursor [name]` | Open Cursor attached to running devbox |
 | `devbox code [name]` | Open VS Code attached to running devbox |
 | `devbox clip` | Grab clipboard image for container use |
@@ -183,6 +184,82 @@ devbox allow-for --stop myapp    # Close the active window in 'myapp'
 ```
 
 Harvest logs persist at `/var/log/devbox/allow-for/<container>-<timestamp>.log` on the host (root-owned, tamper-proof from inside the container). See [ADR 0009](docs/adr/0009-allow-for-harvest-window.md) for the security model.
+
+## MCP servers
+
+`devbox mcp` manages [MCP](https://modelcontextprotocol.io) servers for your Containers. Devbox stores an **agent-neutral MCP profile** as its source of truth and *renders* agent-specific config for both Claude Code and Codex from it. Rendered entries are prefixed `devbox-` (e.g. `devbox-context7`) and call a wrapper, `devbox-mcp-run <server>`, instead of the raw command — so devbox keeps a stable control point for the Container-identity check, env validation, and future runtime changes. Re-rendering only ever touches `devbox-` entries; your inherited or hand-added agent MCP entries are never rewritten. See [ADR 0013](docs/adr/0013-container-mcp-profile-and-rendering.md) for the full model.
+
+**v1 supports Container MCP servers only.** A server that runs *inside* the Container (e.g. an `npx`/`uvx`/`docker` launcher) can be imported and launched. **Host MCP servers** — ones that need host credential stores, desktop/OS APIs, browser state, or absolute host paths — are *detected and explained* but **not launched**: crossing that boundary deserves its own design and is deferred.
+
+### Onboarding
+
+A fresh interactive install, and the first `devbox update` after MCP support shipped, offer to scan your existing Claude Code / Codex MCP servers for import. The offer fires **once**: it only appears when no devbox MCP profile exists yet *and* you have not already seen or dismissed it. The seen/dismissed marker lives at `~/.config/devbox/mcp/state.json` (outside the profile), so deleting profile files does not re-trigger the prompt. Non-interactive installs and updates never prompt or open a picker — they print a concise follow-up command (`devbox mcp import`) instead. Later updates show only a short reminder.
+
+### Two workflows
+
+**1. Import existing host agent MCP config.** Discovery reads MCP servers already configured in Claude Code / Codex and classifies each candidate (`container` / `host-only` / `unknown`) from evidence — command family, arguments, absolute paths, referenced env-var names, network needs. It is **dry-run by default and writes nothing**:
+
+```bash
+devbox mcp import                       # dry-run discovery report (current project + global)
+devbox mcp import --all                  # scan every known agent project record
+devbox mcp import --project <name-or-path>   # scan one explicit project
+
+# Apply selected Container-safe candidates into the devbox profile:
+devbox mcp import --apply                 # interactive multi-select picker (TTY)
+devbox mcp import --apply --server context7
+devbox mcp import --apply --import-id imp-abcdef123456
+devbox mcp import --apply --all-applicable
+```
+
+Apply preserves the source scope (a globally-configured server imports global; a project-scoped one imports for that project). Inherited secret env *values* can be copied into a scoped `0600` secret store; the summary reports which env **key names** were copied, never their values. Host-only, unknown, and excluded (remote/hosted) candidates are shown but not applied. A successful apply auto-renders unless you pass `--no-render`.
+
+**2. Add a brand-new devbox MCP server** that was never in a host agent — `devbox mcp add ...` records an explicit new server (distinct from `import`, which discovers inherited ones). You choose its scope explicitly; devbox never silently promotes a new server to global.
+
+### Profile management
+
+```bash
+devbox mcp list                          # effective profile for the current project (global + project)
+devbox mcp list --all                    # global plus every project profile
+devbox mcp list --inherited              # detected Inherited MCP servers (read-only)
+devbox mcp enable  <name> [--global|--project <p>]
+devbox mcp disable <name> [--global|--project <p>]   # a project disable of a global server creates a project-only override
+devbox mcp remove  <name> [--global|--project <p>] [--purge]   # --purge also deletes scoped secrets
+```
+
+A Project entry **shadows** a same-named global entry for that project's effective view. Mutating commands auto-render unless you pass `--no-render`.
+
+### Render
+
+```bash
+devbox mcp render --dry-run              # preview the Claude Code / Codex config devbox would write
+devbox mcp render --dry-run --project <p>   # focus the preview on one project
+devbox mcp render                        # write the full devbox-managed surface into both agents
+```
+
+The dry-run preview shows planned `devbox-` entries (their prefixed name and the wrapper command they call — never the raw command, never secret values) and separates existing entries by ownership so the re-render contract is visible. The write path always renders the **full** managed surface (a scoped write would drop other projects' rendered entries).
+
+### Install (materialize)
+
+`import` preserves the inherited command by default (e.g. `npx -y @upstash/context7-mcp@latest`). `devbox mcp install` optionally **materializes** an existing profile entry into persistent Container runtime and rewrites the profile to use the installed command:
+
+```bash
+devbox mcp install <name> [--global|--project <p>] [--allow-for <min>] [--keep-window]
+```
+
+The install runs **inside a Container** (the runtime lives there, not on the host): a project install targets that project's Container; a global install uses one running Container, offers a picker when several run, and requires `--project` in non-interactive ambiguous cases. npm/npx servers install into the persistent npm-global prefix; Docker-backed servers pull into project-scoped rootless Docker state; Python/uv reports that a dedicated MCP runtime volume is needed first.
+
+Install uses the existing firewall workflow. `--allow-for <min>` opens an [Allow-for window](#allow-for-harvest-window) for the attempt (closed afterward by default so the harvest log is produced immediately; `--keep-window` leaves it open). On a blocked-network failure the command points at `devbox blocked` and shows the exact rerun command — so you can review blocked domains, allow the trusted ones, and rerun the same install.
+
+### Doctor
+
+```bash
+devbox mcp doctor                        # diagnose profile / render / runtime problems
+devbox mcp doctor --fix                  # apply only SAFE local fixes
+```
+
+Doctor checks host-vs-Container context, the `devbox-mcp-run` wrapper on PATH, profile JSON validity, render drift (profile vs rendered config), and required env presence (by name only). `--fix` performs only safe local fixes — re-render, create missing MCP dirs, repair the wrapper symlink. It never installs packages, allows domains, purges runtime, or enables host-only servers.
+
+Run `devbox mcp --help` for the full subcommand reference.
 
 ## Agent-browser
 

@@ -37,7 +37,7 @@ from .secrets import (
     secrets_path,
     store_server_secrets,
 )
-from .source_values import read_secret_values
+from .source_values import read_nonsecret_values, read_secret_values
 
 # Only this placement can be applied in v1 (ADR 0013: Container MCP only).
 APPLICABLE_PLACEMENT = "container"
@@ -204,6 +204,19 @@ def apply_candidate(m: MergedCandidate) -> AppliedServer:
     #    for a server we then fail to import. Building the entry now also keeps
     #    all secret-free profile work ahead of the secret write.
     profile = load_profile(applied.profile_path)
+    # Record the ORIGINAL (full) project key in the project profile. The profile
+    # FILENAME is a sanitized+hashed label from which the absolute key is not
+    # recoverable; render needs the real key so the rendered wrapper call carries
+    # ``--project <full-key>`` and the wrapper can resolve the matching profile /
+    # secret store at launch (otherwise it would re-hash the label and miss).
+    # Non-secret identity (an absolute path); never written for global scope.
+    if scope == "project" and project_key:
+        profile["projectKey"] = project_key
+    # Carry over NON-secret env values the source set inline (e.g. BASE_URL) so
+    # the wrapper, which requires every declared env name at launch, can start the
+    # server without the user re-exporting them. Secret values stay out of the
+    # profile and live only in the 0600 store (handled below).
+    nonsecret_values = read_nonsecret_values(cand)
     profile["servers"][cand.name] = build_server_entry(
         name=cand.name,
         argv=cand.command.argv,
@@ -212,6 +225,7 @@ def apply_candidate(m: MergedCandidate) -> AppliedServer:
         type_=cand.type,
         source_provider=cand.provider,
         import_id=m.import_id,
+        env=nonsecret_values,
     )
 
     # 3. Persist secrets, then commit the profile. Always call store: with

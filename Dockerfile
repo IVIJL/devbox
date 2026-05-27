@@ -332,6 +332,13 @@ RUN chmod +x /etc/claude-defaults/hooks/*.sh /etc/claude-defaults/statusline-inf
 
 COPY lib/allowlist.sh /usr/local/share/devbox/lib/allowlist.sh
 COPY lib/allow-for.sh /usr/local/share/devbox/lib/allow-for.sh
+# Container MCP runtime (ADR 0013, issue 07). The devbox-mcp-run wrapper lives
+# on PATH; it resolves `import mcp` from the package shipped at a fixed share
+# dir so it runs from any CWD the agent launches it in. The wrapper checks
+# Container identity, resolves the server from devbox's canonical profile,
+# validates required env without logging values, and execs the MCP command.
+COPY scripts/mcp/ /usr/local/share/devbox/mcp/
+COPY scripts/mcp-run.sh /usr/local/bin/devbox-mcp-run
 COPY init-firewall.sh /usr/local/bin/
 COPY scripts/setup-chezmoi.sh /usr/local/bin/
 COPY scripts/n scripts/nx /usr/local/bin/
@@ -374,6 +381,7 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/start-agent-browser-host-allow \
     /usr/local/bin/stop-agent-browser-host-allow \
     /usr/local/bin/agent-browser \
+    /usr/local/bin/devbox-mcp-run \
     /usr/local/bin/devbox-identity-context.sh
 
 # Sudo with password — prevents AI agents from modifying firewall rules

@@ -87,6 +87,19 @@ class RenderEnv(unittest.TestCase):
         return path
 
     def _write_project_profile(self, project_key: str, servers: dict) -> str:
+        # Modern profile: records the full projectKey (what apply writes since
+        # issue 07), so a scan recovers the real key and the server is renderable.
+        path = project_profile_path(project_key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"version": 1, "projectKey": project_key, "servers": servers}, fh
+            )
+        return path
+
+    def _write_legacy_project_profile(self, project_key: str, servers: dict) -> str:
+        # Legacy profile: written before projectKey was recorded. A scan cannot
+        # recover the real key, so render must SKIP it as non-renderable.
         path = project_profile_path(project_key)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
@@ -233,6 +246,24 @@ class CodexPlanTest(RenderEnv):
         # Inherited Codex table entry is preserved/never devbox-managed.
         self.assertEqual(plan.inherited_existing, ["some-manual"])
 
+    def test_project_servers_excluded_from_codex_plan(self) -> None:
+        # Codex has no per-project MCP namespace, so a project-scoped server must
+        # NOT appear in the Codex plan (preview must match the write). The global
+        # server still renders.
+        self._write_global_profile({"context7": self._server_entry("context7")})
+        self._write_project_profile(
+            _PROJECT_KEY, {"local-tool": self._server_entry("local-tool")}
+        )
+        codex_cfg = self._codex_fixture("")
+        servers = collect_profile_servers()
+        if render_mod.codex_provider._toml is None:
+            self.skipTest("no TOML parser available in this runtime")
+        plan = build_codex_plan(servers, config_path=codex_cfg)
+        names = [p.rendered_name for p in plan.planned]
+        self.assertIn("devbox-context7", names)
+        self.assertNotIn("devbox-local-tool", names)
+        self.assertTrue(all(p.scope == "global" for p in plan.planned))
+
     def test_unsupported_when_no_toml_parser(self) -> None:
         self._write_global_profile({"context7": self._server_entry("context7")})
         codex_cfg = self._codex_fixture("[mcp_servers.x]\ncommand = \"y\"\n")
@@ -361,6 +392,87 @@ class NameCollisionTest(RenderEnv):
         )
         rendered = sorted(e.rendered_name for e in plan.planned)
         self.assertEqual(rendered, ["devbox-context7", "devbox-other"])
+
+
+class ProjectKeyRoundTripTest(RenderEnv):
+    """A scanned project profile must render the FULL key the wrapper resolves.
+
+    Regression for the project-scoped launch bug: when render scans project
+    profiles without an explicit --project, the rendered wrapper call must carry
+    the original absolute project key recorded at apply time — NOT the
+    sanitized+hashed filename label, which the wrapper would re-hash into a
+    different, non-existent profile/secrets path and fail to launch.
+    """
+
+    def _write_project_profile_with_key(self, project_key: str, servers: dict) -> str:
+        path = project_profile_path(project_key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"version": 1, "projectKey": project_key, "servers": servers}, fh
+            )
+        return path
+
+    def test_scanned_profile_emits_recorded_full_key(self) -> None:
+        self._write_project_profile_with_key(
+            _PROJECT_KEY, {"local-tool": self._server_entry("local-tool")}
+        )
+        # No explicit project_keys: render must SCAN and recover the stored key.
+        servers = collect_profile_servers()
+        proj = [s for s in servers if s.scope == "project"]
+        self.assertEqual(len(proj), 1)
+        # The recovered key is the full absolute key, not the hashed filename.
+        self.assertEqual(proj[0].project_key, _PROJECT_KEY)
+
+    def test_scanned_profile_wrapper_argv_carries_full_key(self) -> None:
+        self._write_project_profile_with_key(
+            _PROJECT_KEY, {"local-tool": self._server_entry("local-tool")}
+        )
+        claude_cfg = self._claude_fixture({})
+        plan = build_claude_plan(collect_profile_servers(), config_path=claude_cfg)
+        entry = plan.planned[0]
+        self.assertEqual(
+            entry.argv, [WRAPPER_COMMAND, "--project", _PROJECT_KEY, "local-tool"]
+        )
+        # And that key maps back to the SAME profile file render read.
+        self.assertEqual(
+            project_profile_path(entry.project_key),
+            project_profile_path(_PROJECT_KEY),
+        )
+
+    def test_legacy_profile_without_key_is_skipped_not_rendered(self) -> None:
+        # A profile written before projectKey was recorded: its filename is a
+        # sanitized+hashed label the wrapper cannot reverse into a profile path,
+        # so rendering a `--project <label>` entry would parse yet fail to launch.
+        # Render must SKIP it (renderable=False, with a reason), never emit it.
+        self._write_legacy_project_profile(
+            _PROJECT_KEY, {"local-tool": self._server_entry("local-tool")}
+        )
+        servers = collect_profile_servers()
+        proj = [s for s in servers if s.scope == "project"]
+        self.assertEqual(len(proj), 1)
+        self.assertFalse(proj[0].renderable)
+        self.assertIn("projectKey", proj[0].skip_reason)
+
+    def test_legacy_profile_excluded_from_planned_entries(self) -> None:
+        # The skipped legacy server must not produce an agent entry...
+        self._write_legacy_project_profile(
+            _PROJECT_KEY, {"local-tool": self._server_entry("local-tool")}
+        )
+        claude_cfg = self._claude_fixture({})
+        servers = collect_profile_servers()
+        plan = build_claude_plan(servers, config_path=claude_cfg)
+        self.assertEqual(plan.planned, [])
+
+    def test_legacy_profile_surfaced_in_render_plan_skipped(self) -> None:
+        # ...but it IS surfaced in the plan's skipped list with its reason.
+        self._write_legacy_project_profile(
+            _PROJECT_KEY, {"local-tool": self._server_entry("local-tool")}
+        )
+        plan = build_render_plan()
+        self.assertEqual([s.name for s in plan.skipped], ["local-tool"])
+        self.assertEqual(plan.renderable_servers, [])
+        self.assertIn("skipped", plan.to_dict())
 
 
 class StaleManagedTest(RenderEnv):

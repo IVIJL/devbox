@@ -160,6 +160,15 @@ class ScopeAndShapeTest(ApplyEnv):
         self.assertIn("projects", ppath)
         profile = load_profile(ppath)
         self.assertIn("project-helper", profile["servers"])
+        # The ORIGINAL full project key is recorded so render can emit a wrapper
+        # call the wrapper resolves (the filename label is hashed and lossy).
+        self.assertEqual(profile.get("projectKey"), _PROJECT_KEY)
+
+    def test_global_source_records_no_project_key(self) -> None:
+        cand = _container_cand("ctx", scope="global")
+        apply_selection(merge_candidates([cand]))
+        profile = load_profile(global_profile_path())
+        self.assertNotIn("projectKey", profile)
 
 
 class MalformedStateTest(ApplyEnv):
@@ -231,8 +240,72 @@ class SecretRedactionTest(ApplyEnv):
             store["servers"]["global-helper"]["GLOBAL_HELPER_TOKEN"],
             _SECRET_VALUE,
         )
-        # Non-secret env (LOG_LEVEL) is NOT copied.
+        # Non-secret env (LOG_LEVEL) is NOT copied into the secret store.
         self.assertNotIn("LOG_LEVEL", store["servers"]["global-helper"])
+
+    def test_nonsecret_env_value_preserved_in_profile(self) -> None:
+        # A non-secret value the source set inline (LOG_LEVEL=info) must be
+        # carried into the profile's `env` map so the wrapper — which requires
+        # every declared env name at launch — can start the server without the
+        # user re-exporting it. Secrets must NOT appear there.
+        path = self._claude_fixture(env_value=_SECRET_VALUE)
+        cand = _container_cand(
+            "global-helper",
+            scope="global",
+            path=path,
+            env_keys=["GLOBAL_HELPER_TOKEN", "LOG_LEVEL"],
+            secret_env_keys=["GLOBAL_HELPER_TOKEN"],
+        )
+        apply_selection(merge_candidates([cand]))
+        with open(global_profile_path(), encoding="utf-8") as fh:
+            profile = json.load(fh)
+        entry = profile["servers"]["global-helper"]
+        self.assertEqual(entry["env"], {"LOG_LEVEL": "info"})
+        self.assertNotIn("GLOBAL_HELPER_TOKEN", entry["env"])
+
+    def test_secret_by_value_non_secret_name_kept_out_of_profile(self) -> None:
+        # A value that LOOKS like a credential (a connection string with embedded
+        # creds) under an innocuous, non-secret-flagged NAME must NOT be written
+        # into the secret-free profile, or import would leak it into a non-0600
+        # file. It is left unpersisted (runtime/env resolution).
+        fixture = {
+            "mcpServers": {
+                "svc": {
+                    "type": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@example/svc@latest"],
+                    "env": {
+                        # Credential-bearing URL: userinfo (user:pass@) is secret
+                        # by VALUE even though DATABASE_URL is not a secret NAME.
+                        "DATABASE_URL": "postgres://user:pass@db/app",
+                        # A benign endpoint URL (no userinfo) must survive.
+                        "BASE_URL": "https://api.example.test/v1",
+                        "LOG_LEVEL": "debug",
+                    },
+                }
+            }
+        }
+        path = os.path.join(self.home, ".claude.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(fixture, fh)
+        cand = _container_cand(
+            "svc",
+            scope="global",
+            path=path,
+            env_keys=["DATABASE_URL", "BASE_URL", "LOG_LEVEL"],
+            secret_env_keys=[],
+        )
+        apply_selection(merge_candidates([cand]))
+        with open(global_profile_path(), encoding="utf-8") as fh:
+            blob = fh.read()
+        self.assertNotIn("postgres://", blob)
+        with open(global_profile_path(), encoding="utf-8") as fh:
+            entry = json.load(fh)["servers"]["svc"]
+        # The benign values are kept; the credential-bearing URL is not.
+        self.assertEqual(
+            entry.get("env"),
+            {"BASE_URL": "https://api.example.test/v1", "LOG_LEVEL": "debug"},
+        )
 
     def test_project_secret_goes_to_project_secret_store(self) -> None:
         path = self._claude_fixture(env_value=_SECRET_VALUE)

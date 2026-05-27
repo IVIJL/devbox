@@ -41,6 +41,9 @@ from .render import (
     RenderPlan,
     build_render_plan,
 )
+from .runner import RunnerError, run as runner_run
+from .identity import NotInsideContainerError
+from .writer import RenderWriteError, write_plan
 
 
 def _emit(payload: dict) -> int:
@@ -464,9 +467,14 @@ def _render_apply_text(merged: list[MergedCandidate], sel: _Selection) -> int:
             f"Skipped {s['name']} ({s['importId']}): {s['reason']}\n"
         )
 
+    # NOTE: agent config is NOT written here. The shell front-end runs
+    # auto-render right after a successful apply (unless --no-render), and that
+    # step prints exactly what it wrote (or that it was skipped). So this summary
+    # must not claim "nothing was modified" — that would be false on the default
+    # path; it only states the profile result and points at the render step.
     sys.stdout.write(
-        "\nProfile updated. No Claude Code or Codex config was modified "
-        "(render is a later step).\n"
+        "\nProfile updated. Agent config (Claude Code / Codex) is written by the "
+        "render step that follows (use --no-render to skip it).\n"
     )
     return 0
 
@@ -554,7 +562,14 @@ def _render_plan_text(plan: RenderPlan) -> int:
     # agent's config for stale entries. Only print the empty short-circuit when
     # every agent is supported AND there is nothing to render or clean up.
     any_unsupported = not plan.claude.supported or not plan.codex.supported
-    if not plan.servers and not has_stale_managed and not any_unsupported:
+    renderable = plan.renderable_servers
+    skipped = plan.skipped
+    if (
+        not renderable
+        and not has_stale_managed
+        and not any_unsupported
+        and not skipped
+    ):
         sys.stdout.write(
             "No enabled MCP profile servers to render, and no devbox-managed "
             "entries to clean up. Import or add servers first "
@@ -562,9 +577,9 @@ def _render_plan_text(plan: RenderPlan) -> int:
         )
         return 0
 
-    if plan.servers:
+    if renderable:
         sys.stdout.write(
-            f"Render preview for {len(plan.servers)} enabled MCP profile "
+            f"Render preview for {len(renderable)} enabled MCP profile "
             "server(s).\n"
         )
     else:
@@ -579,6 +594,7 @@ def _render_plan_text(plan: RenderPlan) -> int:
 
     _render_agent_text(plan.claude)
     _render_agent_text(plan.codex)
+    _render_skipped_text(skipped)
 
     sys.stdout.write(
         "\nDry-run only: no Claude Code or Codex config was modified.\n"
@@ -586,6 +602,116 @@ def _render_plan_text(plan: RenderPlan) -> int:
         "inherited/manual entries are never touched.\n"
     )
     return 0
+
+
+def _render_skipped_text(skipped: list) -> None:
+    """Report profile servers that could not be rendered, and why (SECRET-FREE).
+
+    Surfaces the actionable reason (e.g. a legacy project profile with no
+    recorded key) so a 'render reported success but my server never launched'
+    surprise becomes a visible, fixable line instead.
+    """
+    if not skipped:
+        return
+    sys.stdout.write(
+        f"\nSkipped {len(skipped)} server(s) (not rendered):\n"
+    )
+    for srv in skipped:
+        where = f" [project {srv.project_key}]" if srv.project_key else ""
+        sys.stdout.write(f"  - {srv.name}{where}: {srv.skip_reason}\n")
+
+
+def _render_written_text(plan: RenderPlan, written: list[str]) -> int:
+    """Human-readable summary after a REAL render (SECRET-FREE).
+
+    Reports which agents were written and the planned devbox-managed entries
+    per agent. An unsupported agent (e.g. Codex with no TOML parser) is reported
+    as skipped rather than written, so the user sees exactly what changed.
+    """
+    renderable = plan.renderable_servers
+    if renderable:
+        sys.stdout.write(
+            f"Rendered {len(renderable)} enabled MCP profile server(s) "
+            f"into: {', '.join(written) if written else 'no agents'}.\n"
+        )
+    else:
+        sys.stdout.write(
+            "No enabled MCP profile servers; removed any stale devbox-managed "
+            f"entries from: {', '.join(written) if written else 'no agents'}.\n"
+        )
+    sys.stdout.write(
+        f"Rendered names are '{DEVBOX_PREFIX}' prefixed and call the wrapper "
+        f"'{WRAPPER_COMMAND} <server>'.\n"
+    )
+
+    _render_agent_text(plan.claude)
+    # Only describe Codex if it was actually written; an unsupported Codex was
+    # skipped (not an error) and its reason is still worth showing.
+    if plan.codex.supported:
+        _render_agent_text(plan.codex)
+    else:
+        sys.stdout.write(f"\n{plan.codex.agent} ({plan.codex.config_path})\n")
+        sys.stdout.write(
+            f"  skipped: {plan.codex.unsupported_reason}\n"
+        )
+
+    _render_skipped_text(plan.skipped)
+
+    sys.stdout.write(
+        "\nWrote only devbox-managed (devbox-) entries; inherited/manual "
+        "entries were left unchanged.\n"
+    )
+    return 0
+
+
+def _run_wrapper(argv: list[str]) -> int:
+    """Parse the wrapper args and launch the named server (never returns on OK).
+
+    Accepts ``[--project <full-project-key>] <server>``; the ``--project`` form
+    matches what the render path emits for a Project-scoped entry. Container
+    identity, resolution, env validation, and exec live in ``mcp.runner``;
+    failures map to clear, SECRET-FREE stderr messages and a non-zero exit.
+    """
+    project_key: Optional[str] = None
+    server: Optional[str] = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--project":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("devbox-mcp-run: --project requires a value\n")
+                return 2
+            project_key = argv[i]
+        elif arg.startswith("--project="):
+            project_key = arg[len("--project="):]
+        elif arg.startswith("-"):
+            sys.stderr.write(f"devbox-mcp-run: unknown flag {arg!r}\n")
+            return 2
+        elif server is None:
+            server = arg
+        else:
+            sys.stderr.write(
+                f"devbox-mcp-run: unexpected extra argument {arg!r}\n"
+            )
+            return 2
+        i += 1
+
+    if not server:
+        sys.stderr.write(
+            "devbox-mcp-run: missing server name\n"
+            "Usage: devbox-mcp-run [--project <project-key>] <server>\n"
+        )
+        return 2
+
+    try:
+        return runner_run(server, project_key)
+    except NotInsideContainerError as exc:
+        sys.stderr.write(f"devbox-mcp-run: {exc}\n")
+        return 3
+    except RunnerError as exc:
+        sys.stderr.write(f"devbox-mcp-run: {exc}\n")
+        return 1
 
 
 def main(argv: list[str]) -> int:
@@ -653,6 +779,49 @@ def main(argv: list[str]) -> int:
         if command == "render-json":
             return _emit(plan.to_dict())
         return _render_plan_text(plan)
+    if command in ("render-write-json", "render-write-text"):
+        # REAL render (no --dry-run): write devbox-managed entries into the
+        # Claude Code and Codex config trees.
+        #
+        # Unlike the dry-run PREVIEW (which may scope to one --project just to
+        # focus its output), the WRITE path must ALWAYS render the FULL managed
+        # surface (global + every project profile). The writers own all
+        # ``devbox-`` entries: they strip every existing one and write back only
+        # the planned set. A scoped write would therefore delete other projects'
+        # already-rendered devbox entries. So --project is rejected here and the
+        # plan is always built for the full surface.
+        scope = _parse_scope(rest)
+        if scope is None:
+            return 2
+        if scope.all_projects or not scope.include_global:
+            sys.stderr.write(
+                "mcp.cli: render does not accept --all or --no-global\n"
+            )
+            return 2
+        if scope.project_keys:
+            sys.stderr.write(
+                "mcp.cli: 'devbox mcp render' writes the full devbox-managed "
+                "surface and does not accept --project (a scoped write would "
+                "drop other projects' rendered entries). Use "
+                "'devbox mcp render --dry-run --project <p>' to preview one "
+                "project.\n"
+            )
+            return 2
+        plan = build_render_plan(None)
+        try:
+            written = write_plan(plan.claude, plan.codex)
+        except RenderWriteError as exc:
+            sys.stderr.write(f"mcp.cli: {exc}\n")
+            return 1
+        if command == "render-write-json":
+            payload = plan.to_dict()
+            payload["dryRun"] = False
+            payload["written"] = written
+            return _emit(payload)
+        return _render_written_text(plan, written)
+    if command == "run":
+        # The devbox-mcp-run wrapper core. Args: [--project <key>] <server>.
+        return _run_wrapper(rest)
     if command == "project-keys":
         # Emit known Claude project record keys, one per line. These are
         # directory paths (Claude's own map keys) — not secret. Used by the

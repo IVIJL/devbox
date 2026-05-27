@@ -236,6 +236,7 @@ cmd_import() {
     local all=false
     local apply=false
     local all_applicable=false
+    local no_render=false
     local -a projects=()
     local -a servers=()
     local -a import_ids=()
@@ -245,6 +246,7 @@ cmd_import() {
             --all) all=true ;;
             --apply) apply=true ;;
             --all-applicable) all_applicable=true ;;
+            --no-render) no_render=true ;;
             --project)
                 shift
                 if [ "$#" -eq 0 ]; then
@@ -303,6 +305,10 @@ cmd_import() {
             echo "--server/--import-id/--all-applicable require --apply." >&2
             return 2
         fi
+        if [ "$no_render" = true ]; then
+            echo "--no-render only applies to 'mcp import --apply'." >&2
+            return 2
+        fi
         if [ "$json" = true ]; then
             _run_py import-json "${scope_args[@]}"
             return $?
@@ -312,7 +318,7 @@ cmd_import() {
         return $?
     fi
 
-    cmd_import_apply "$json" "$all_applicable" \
+    cmd_import_apply "$json" "$all_applicable" "$no_render" \
         scope_args servers import_ids
 }
 
@@ -324,10 +330,10 @@ cmd_import() {
 #   * non-interactive with no selection -> fail with examples (no writes).
 # Array arguments are passed BY NAME (nameref) to avoid re-quoting issues.
 cmd_import_apply() {
-    local json="$1" all_applicable="$2"
-    local -n _scope_args="$3"
-    local -n _servers="$4"
-    local -n _import_ids="$5"
+    local json="$1" all_applicable="$2" no_render="$3"
+    local -n _scope_args="$4"
+    local -n _servers="$5"
+    local -n _import_ids="$6"
 
     local -a sel_args=()
     local s
@@ -375,10 +381,38 @@ cmd_import_apply() {
     fi
 
     if [ "$json" = true ]; then
-        _run_py apply-json "${_scope_args[@]}" "${sel_args[@]}"
+        _run_py apply-json "${_scope_args[@]}" "${sel_args[@]}" || return $?
+        _maybe_auto_render "$no_render" true
         return $?
     fi
-    _run_py apply-text "${_scope_args[@]}" "${sel_args[@]}"
+    _run_py apply-text "${_scope_args[@]}" "${sel_args[@]}" || return $?
+    _maybe_auto_render "$no_render" false
+}
+
+# Auto-render after a successful apply (ADR 0013, issue 07). A mutating profile
+# command re-renders the devbox-managed agent entries so the new server is
+# usable immediately, unless the user passed --no-render. Render is idempotent
+# and owns only devbox- entries, so re-rendering the full surface here is safe.
+#   $1  no_render flag ("true" to skip)
+#   $2  json ("true" to suppress the human note; JSON consumers parse render
+#       output separately, so we stay quiet on the apply path's stdout)
+_maybe_auto_render() {
+    local no_render="$1" json="$2"
+    if [ "$no_render" = true ]; then
+        if [ "$json" != true ]; then
+            echo "Skipped auto-render (--no-render); run 'devbox mcp render' to apply." >&2
+        fi
+        return 0
+    fi
+    if [ "$json" = true ]; then
+        # Keep the apply JSON the sole stdout payload; render quietly, surfacing
+        # only a hard failure.
+        _run_py render-write-json >/dev/null || return $?
+        return 0
+    fi
+    echo >&2
+    echo "Auto-rendering devbox-managed agent entries..." >&2
+    _run_py render-write-text >&2
 }
 
 # Interactive multi-select picker for applicable candidates. Lists applicable
@@ -495,10 +529,12 @@ cmd_list() {
 }
 
 cmd_render() {
-    # Render preview (issue 06): dry-run ONLY. This slice reports the planned
-    # Claude Code / Codex config without writing anything. The real write path
-    # (and the devbox-mcp-run wrapper) is a later issue, so a bare
-    # `devbox mcp render` (apply) is rejected with a clear message.
+    # Render (issue 07): `--dry-run` previews the planned Claude Code / Codex
+    # config WITHOUT writing (issue 06 behaviour, preserved); a bare
+    # `devbox mcp render` now WRITES the devbox-managed entries into the agent
+    # config trees. Both paths read only the canonical profile + agent config;
+    # the write path owns only `devbox-` entries and leaves inherited/manual
+    # entries untouched.
     local dry_run=false
     local json=false
     local -a projects=()
@@ -528,15 +564,21 @@ cmd_render() {
         shift
     done
 
-    if [ "$dry_run" != true ]; then
-        echo "'devbox mcp render' (apply) is planned but not implemented yet." >&2
-        echo "Use 'devbox mcp render --dry-run' to preview planned config." >&2
+    # --project scopes the DRY-RUN preview only (to focus its output). The real
+    # WRITE path always renders the FULL devbox-managed surface — the writers own
+    # every devbox- entry and rewrite the whole set, so a scoped write would drop
+    # other projects' already-rendered entries. Reject --project on the write
+    # path with a clear pointer to the preview.
+    if [ "$dry_run" != true ] && [ "${#projects[@]}" -gt 0 ]; then
+        echo "'devbox mcp render' writes the full devbox-managed surface and does not accept --project." >&2
+        echo "A scoped write would drop other projects' rendered entries." >&2
+        echo "To preview one project: devbox mcp render --dry-run --project <name-or-path>" >&2
         return 2
     fi
 
-    # Resolve explicit --project tokens to Claude record keys; render then reads
-    # the matching project profile(s). With no --project, every project profile
-    # is previewed. --all/--no-global are not meaningful here.
+    # Resolve explicit --project tokens to Claude record keys; the preview then
+    # reads the matching project profile(s). With no --project, every project
+    # profile is used. --all/--no-global are not meaningful here.
     local -a scope_args=()
     if [ "${#projects[@]}" -gt 0 ]; then
         local token key
@@ -548,11 +590,21 @@ cmd_render() {
         done
     fi
 
+    # Dry-run preview (write-free) vs the real write path.
+    local py_cmd_json py_cmd_text
+    if [ "$dry_run" = true ]; then
+        py_cmd_json="render-json"
+        py_cmd_text="render-text"
+    else
+        py_cmd_json="render-write-json"
+        py_cmd_text="render-write-text"
+    fi
+
     if [ "$json" = true ]; then
-        _run_py render-json "${scope_args[@]+"${scope_args[@]}"}"
+        _run_py "$py_cmd_json" "${scope_args[@]+"${scope_args[@]}"}"
         return $?
     fi
-    _run_py render-text "${scope_args[@]+"${scope_args[@]}"}"
+    _run_py "$py_cmd_text" "${scope_args[@]+"${scope_args[@]}"}"
 }
 
 # Placeholder for subcommands that are planned but not part of this slice.

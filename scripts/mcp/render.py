@@ -68,13 +68,23 @@ def is_devbox_managed(entry_name: str) -> bool:
 
 @dataclass
 class ProfileServer:
-    """One enabled profile server, with the scope it came from."""
+    """One enabled profile server, with the scope it came from.
+
+    ``renderable`` is False for a server we cannot emit a launchable agent entry
+    for; ``skip_reason`` then explains why. The only such case today is a LEGACY
+    project profile scanned without a recorded ``projectKey``: its filename is a
+    sanitized+hashed label the wrapper cannot reverse into a profile path, so a
+    rendered ``--project <label>`` entry would parse fine yet fail to launch. We
+    skip it (with a clear, actionable reason) rather than write a broken entry.
+    """
 
     name: str
     scope: str  # "global" or "project"
     project_key: str  # "" for global
     env_keys: list[str] = field(default_factory=list)
     secret_env_keys: list[str] = field(default_factory=list)
+    renderable: bool = True
+    skip_reason: str = ""
 
 
 @dataclass
@@ -205,10 +215,16 @@ def _planned_entries(servers: list[ProfileServer]) -> list[PlannedEntry]:
     and launches it at runtime from the canonical profile. Rendered names are
     disambiguated across scopes so a global+project name clash does not produce
     two colliding agent entries.
+
+    Non-renderable servers (e.g. a legacy project profile with no recoverable
+    key) are EXCLUDED here: emitting a wrapper entry for one would write config
+    that parses but cannot launch. They are surfaced separately via the plan's
+    skipped list, never as a planned entry.
     """
-    resolved = _disambiguated_names(servers)
+    renderables = [s for s in servers if s.renderable]
+    resolved = _disambiguated_names(renderables)
     planned: list[PlannedEntry] = []
-    for idx, srv in enumerate(servers):
+    for idx, srv in enumerate(renderables):
         # The wrapper argv must uniquely identify WHICH scoped profile slot to
         # launch, or a global+project name clash (or two same-basename projects)
         # would leave the wrapper unable to tell the slots apart. A bare global
@@ -236,13 +252,23 @@ def _planned_entries(servers: list[ProfileServer]) -> list[PlannedEntry]:
     return planned
 
 
-def _profile_servers_from(path: str, scope: str, project_key: str) -> list[ProfileServer]:
+def _profile_servers_from(
+    path: str,
+    scope: str,
+    project_key: str,
+    renderable: bool = True,
+    skip_reason: str = "",
+) -> list[ProfileServer]:
     """Load one profile file and return its enabled servers as ProfileServers.
 
     A server is considered enabled unless it carries an explicit ``"enabled":
     false`` flag (enable/disable lands in a later issue; until then everything is
     enabled). Reads NAMES only — no secret value is ever in the profile, so
     nothing to redact here.
+
+    ``renderable``/``skip_reason`` mark a whole profile whose servers cannot be
+    rendered into a launchable agent entry (see ``ProfileServer``); the flags are
+    stamped onto every server the file yields.
     """
     profile = load_profile(path)
     out: list[ProfileServer] = []
@@ -268,6 +294,8 @@ def _profile_servers_from(path: str, scope: str, project_key: str) -> list[Profi
                     if isinstance(secret_env_keys, list)
                     else []
                 ),
+                renderable=renderable,
+                skip_reason=skip_reason,
             )
         )
     return out
@@ -317,10 +345,54 @@ def collect_profile_servers(project_keys: Optional[list[str]] = None) -> list[Pr
             if not filename.endswith(".json") or filename.endswith(".secrets.json"):
                 continue
             path = os.path.join(projects_dir, filename)
-            label = _project_key_for_profile(filename, projects_dir)
-            servers.extend(_profile_servers_from(path, "project", label))
+            # Use the ORIGINAL project key the profile recorded at apply time: the
+            # rendered wrapper call must carry the FULL key so the wrapper can
+            # locate the matching profile/secrets at launch. The filename is a
+            # sanitized+hashed label the wrapper would re-hash into a different,
+            # non-existent path — so it is NOT a usable fallback. A legacy profile
+            # written before the key was recorded is therefore SKIPPED as
+            # non-renderable (with an actionable reason) rather than rendered into
+            # a wrapper entry that parses but cannot launch.
+            key = _project_key_from_profile(path)
+            if key:
+                servers.extend(_profile_servers_from(path, "project", key))
+            else:
+                label = _project_key_for_profile(filename, projects_dir)
+                servers.extend(
+                    _profile_servers_from(
+                        path,
+                        "project",
+                        label,
+                        renderable=False,
+                        skip_reason=(
+                            "legacy project profile has no recorded projectKey; "
+                            "re-import the server(s) for this project so devbox "
+                            "records the full key and can render a launchable "
+                            "wrapper entry"
+                        ),
+                    )
+                )
 
     return servers
+
+
+def _project_key_from_profile(path: str) -> str:
+    """Read the original project key a project profile recorded, or "".
+
+    Apply stores the full absolute project key under ``projectKey`` so render can
+    emit a wrapper call the wrapper can resolve. Any read/parse error or missing
+    field degrades to "" so the caller falls back to the filename label rather
+    than raising. Non-secret identity only.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    key = data.get("projectKey")
+    return key if isinstance(key, str) and key else ""
 
 
 def _read_existing_agent_names_claude(config_path: str) -> list[str]:
@@ -427,7 +499,18 @@ def build_codex_plan(
             "shape."
         )
         return plan
-    plan.planned = _planned_entries(servers)
+    # Codex has a SINGLE global ``[mcp_servers]`` table and no per-project MCP
+    # namespace (verified schema). A project-scoped server therefore has no
+    # scoped Codex target — writing it globally would offer it (and let the
+    # wrapper load its project credentials) in every Codex session, breaking the
+    # source-scope isolation ADR 0013 mandates. So Codex renders GLOBAL-scoped
+    # servers only; project-scoped ones are excluded here (and from the write),
+    # keeping the preview and the real write consistent. Claude keeps them via
+    # its project records.
+    global_servers = [
+        s for s in servers if not (s.scope == "project" and s.project_key)
+    ]
+    plan.planned = _planned_entries(global_servers)
     managed, inherited = _split_ownership(existing)
     plan.managed_existing = managed
     plan.inherited_existing = inherited
@@ -436,14 +519,30 @@ def build_codex_plan(
 
 @dataclass
 class RenderPlan:
-    """The full dry-run render plan: shared profile servers + per-agent plans."""
+    """The full dry-run render plan: shared profile servers + per-agent plans.
+
+    ``servers`` is every profile server scanned; ``skipped`` is the subset that
+    could NOT be rendered into a launchable agent entry (and so was excluded from
+    every agent plan), kept so both the preview and the write summary can report
+    what was left out and why.
+    """
 
     servers: list[ProfileServer]
     claude: AgentPlan
     codex: AgentPlan
 
+    @property
+    def renderable_servers(self) -> list[ProfileServer]:
+        """Servers actually rendered into the agent plans."""
+        return [s for s in self.servers if s.renderable]
+
+    @property
+    def skipped(self) -> list[ProfileServer]:
+        """Servers excluded from rendering (e.g. legacy profiles, no key)."""
+        return [s for s in self.servers if not s.renderable]
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "dryRun": True,
             "wrapperCommand": WRAPPER_COMMAND,
             "prefix": DEVBOX_PREFIX,
@@ -453,10 +552,22 @@ class RenderPlan:
                     "scope": s.scope,
                     **({"project": s.project_key} if s.project_key else {}),
                 }
-                for s in self.servers
+                for s in self.renderable_servers
             ],
             "agents": [self.claude.to_dict(), self.codex.to_dict()],
         }
+        skipped = self.skipped
+        if skipped:
+            out["skipped"] = [
+                {
+                    "name": s.name,
+                    "scope": s.scope,
+                    **({"project": s.project_key} if s.project_key else {}),
+                    "reason": s.skip_reason,
+                }
+                for s in skipped
+            ]
+        return out
 
 
 def build_render_plan(project_keys: Optional[list[str]] = None) -> RenderPlan:

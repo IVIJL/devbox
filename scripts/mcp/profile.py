@@ -150,6 +150,7 @@ def build_server_entry(
     type_: Optional[str],
     source_provider: str,
     import_id: str,
+    env: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     """Build one agent-neutral, SECRET-FREE profile server entry.
 
@@ -158,8 +159,14 @@ def build_server_entry(
     their VALUES (when the user opted to copy them) live exclusively in the
     scoped secret store. ``importId`` ties the entry back to its inherited
     source for traceability without embedding any secret.
+
+    ``env`` is an optional map of NON-secret env name -> value carried over from
+    the source config (e.g. ``BASE_URL``). These are not credentials, so they are
+    safe to record here; the wrapper reads them at launch so an imported server
+    whose config supplied non-secret values inline still starts without the user
+    re-exporting them. A SECRET name must never appear in this map.
     """
-    return {
+    entry: dict[str, Any] = {
         "name": name,
         "type": type_ or "stdio",
         "command": {"argv": list(argv)},
@@ -167,3 +174,11 @@ def build_server_entry(
         "secretEnvKeys": list(secret_env_keys),
         "source": {"provider": source_provider, "importId": import_id},
     }
+    # Only record non-secret values, and never a name flagged secret (defense in
+    # depth against a caller passing a secret through the wrong channel).
+    if env:
+        secret = set(secret_env_keys)
+        nonsecret = {k: v for k, v in env.items() if k not in secret}
+        if nonsecret:
+            entry["env"] = nonsecret
+    return entry

@@ -43,6 +43,13 @@ from .render import (
 )
 from .runner import RunnerError, run as runner_run
 from .identity import NotInsideContainerError
+from .install import (
+    BlockedNetworkError,
+    InstallError,
+    InstallResult,
+    UnsupportedRuntimeError,
+    install_server,
+)
 from .writer import RenderWriteError, write_plan
 from .lifecycle import (
     DoctorReport,
@@ -1031,6 +1038,108 @@ def _cmd_doctor(argv: list[str], as_json: bool) -> int:
     return _render_doctor_text(report)
 
 
+def _render_install_text(result: InstallResult) -> int:
+    """Human-readable install summary (SECRET-FREE).
+
+    Reports the runtime family, the actions taken (commands run, profile
+    rewrite), and the launcher the profile now records. Install never touches a
+    secret value, so the only thing surfaced from a sub-command is its own
+    (non-secret) package-manager output, already folded into the actions.
+    """
+    scope_label = result.scope
+    if result.project_key:
+        scope_label = f"{result.scope} ({result.project_key})"
+    if result.already_materialized:
+        sys.stdout.write(
+            f"MCP server {result.name!r} ({scope_label}) needs no materialization "
+            f"({result.runtime} runtime).\n"
+        )
+    else:
+        sys.stdout.write(
+            f"Materialized MCP server {result.name!r} ({scope_label}, "
+            f"{result.runtime} runtime).\n"
+        )
+    for action in result.actions:
+        sys.stdout.write(f"  - {action}\n")
+    if result.installed_command:
+        sys.stdout.write(f"  launch command: {result.installed_command}\n")
+    sys.stdout.write(
+        "\nProfile updated. Re-render so agents pick up the materialized command "
+        "(the shell front-end does this automatically unless --no-render).\n"
+    )
+    return 0
+
+
+def _cmd_install(argv: list[str], as_json: bool) -> int:
+    """`devbox mcp install <server>` materialization core.
+
+    Accepts ``[--global | --project <full-project-key>] [--exec-prefix <cmd>]
+    <server>``. The CANONICAL PROFILE lives on the host and is read/rewritten
+    here in process; the runtime install COMMANDS run wherever ``--exec-prefix``
+    points. The host shell front-end passes ``--exec-prefix`` as a shell-quoted
+    ``docker exec -u node <container>`` so ``npm install -g`` / ``docker pull``
+    run inside the target Container while the profile update lands on the host
+    (the host ``~/.config/devbox`` is NOT bind-mounted into Containers, so the
+    profile cannot be updated from inside one). The Allow-for window
+    orchestration and container targeting also live in the shell front-end.
+    """
+    import shlex
+
+    exec_prefix: list[str] = []
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--exec-prefix":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: --exec-prefix requires a value\n")
+                return 2
+            exec_prefix = shlex.split(argv[i])
+        elif arg.startswith("--exec-prefix="):
+            exec_prefix = shlex.split(arg[len("--exec-prefix="):])
+        else:
+            rest.append(arg)
+        i += 1
+
+    scope = _parse_lifecycle_scope(rest)
+    if scope is None:
+        return 2
+    if scope.purge:
+        sys.stderr.write("mcp.cli: install does not accept --purge\n")
+        return 2
+    if len(scope.positional) != 1:
+        sys.stderr.write("mcp.cli: install takes exactly one server name\n")
+        return 2
+    resolved = _resolve_lifecycle_scope(scope)
+    if resolved is None:
+        return 2
+    scope_name, project_key = resolved
+    name = scope.positional[0]
+    from .install import Executor
+
+    executor = Executor(exec_prefix) if exec_prefix else None
+    try:
+        result = install_server(name, scope_name, project_key, executor=executor)
+    except BlockedNetworkError as exc:
+        # Blocked-network failures get a distinct exit code (4) so the shell
+        # front-end can tell "needs domains allowed / rerun" apart from a generic
+        # failure and present the Allow-for / devbox blocked guidance.
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 4
+    except UnsupportedRuntimeError as exc:
+        # Not retryable (needs a runtime tool / dedicated volume). Exit code 5
+        # distinguishes it from a transient failure.
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 5
+    except InstallError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 1
+    if as_json:
+        return _emit(result.to_dict())
+    return _render_install_text(result)
+
+
 def _run_wrapper(argv: list[str]) -> int:
     """Parse the wrapper args and launch the named server (never returns on OK).
 
@@ -1208,6 +1317,10 @@ def main(argv: list[str]) -> int:
         return _cmd_doctor(rest, as_json=True)
     if command == "doctor-text":
         return _cmd_doctor(rest, as_json=False)
+    if command == "install-json":
+        return _cmd_install(rest, as_json=True)
+    if command == "install-text":
+        return _cmd_install(rest, as_json=False)
     if command == "run":
         # The devbox-mcp-run wrapper core. Args: [--project <key>] <server>.
         return _run_wrapper(rest)

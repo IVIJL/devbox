@@ -121,6 +121,23 @@ Profile management (mutating; auto-render unless --no-render):
       --purge (or interactive confirmation); a Project remove never touches
       global secrets. With no scope flag the command targets the global profile.
 
+Install (materialize) path:
+  devbox mcp install <name> [--global|--project <p>] [--allow-for <min>] [--keep-window] [--json]
+      Materialize an existing profile entry into persistent Container runtime
+      and rewrite the canonical profile to use the materialized command. npm/npx
+      servers install into the persistent npm-global prefix; Docker-backed
+      servers pull into Project-scoped rootless Docker state; Python/uv reports
+      that a dedicated MCP runtime volume is needed before proceeding. The
+      install runs INSIDE a Container (the runtime lives there, not on the host):
+      a Project install targets that Project's Container; a global install uses
+      one running Container, offers a picker in a TTY when several run, and
+      requires --project in non-interactive ambiguous cases (it never creates a
+      new Project in an unintended location). --allow-for <min> opens an
+      Allow-for window for the attempt and closes it afterward by default so the
+      harvest log is produced immediately; --keep-window leaves it open. On a
+      blocked network failure the command points at 'devbox blocked' and shows
+      the exact rerun command.
+
 Scope flags (import / list):
   (default)                 Current Project record + global Claude config.
   --project <name-or-path>  Scan one explicit Project (repeatable).
@@ -849,6 +866,311 @@ cmd_doctor() {
     _run_py doctor-text "${args[@]+"${args[@]}"}"
 }
 
+# --- install (materialize) ---------------------------------------------------
+
+# Path to the devbox entrypoint, so install can drive `devbox allow-for` and
+# the container lifecycle (start/stop) for a global materialization. mcp-cli.sh
+# lives in scripts/; the entrypoint is docker-run.sh at the repo root.
+_DEVBOX_ENTRYPOINT="$DEVBOX_DIR/docker-run.sh"
+
+# List RUNNING user devbox project containers (one name per line). Mirrors
+# docker-run.sh's list_devbox_container_names but without sourcing that file:
+# shared infrastructure containers (devbox_traefik, devbox_dns, …) are excluded
+# by the `devbox-` project-name prefix the user containers carry.
+_running_devbox_containers() {
+    docker ps --filter "name=^devbox-" --format '{{.Names}}' 2>/dev/null || true
+}
+
+# List EXISTING (any state) user devbox project containers, one name per line.
+_existing_devbox_containers() {
+    docker ps -a --filter "name=^devbox-" --format '{{.Names}}' 2>/dev/null || true
+}
+
+# Resolve the target container for a GLOBAL install (ADR 0013 / plan decision
+# 15). A global server installs into shared runtime, but the install runs INSIDE
+# an existing devbox runtime — never by creating a new Project in an unintended
+# location. Rules:
+#   * exactly one RUNNING container          -> use it;
+#   * multiple running + TTY                 -> picker;
+#   * multiple running + non-interactive     -> require --project;
+#   * none running but exactly one EXISTING  -> caller starts it, runs, stops;
+#   * none running, multiple existing + TTY  -> picker;
+#   * none running, multiple existing, non-TTY -> require --project;
+#   * no devbox container exists at all      -> require an explicit --project.
+# Prints "<state>\t<container>" on stdout (state is "running" or "stopped") so
+# the caller can read BOTH out of the command substitution — a global assignment
+# would be lost in the subshell. Returns non-zero (message on stderr) when the
+# user must disambiguate or provide a target.
+_resolve_global_container() {
+    local -a running=() existing=()
+    local line
+    while IFS= read -r line; do
+        [ -n "$line" ] && running+=("$line")
+    done < <(_running_devbox_containers)
+    while IFS= read -r line; do
+        [ -n "$line" ] && existing+=("$line")
+    done < <(_existing_devbox_containers)
+
+    if [ "${#existing[@]}" -eq 0 ]; then
+        echo "No devbox Project container exists yet." >&2
+        echo "A global MCP install runs inside an existing devbox runtime; it will not" >&2
+        echo "create a new Project in an unintended location. Create or name a Project:" >&2
+        echo "  devbox mcp install <server> --project <name-or-path>" >&2
+        return 2
+    fi
+
+    if [ "${#running[@]}" -eq 1 ]; then
+        printf 'running\t%s\n' "${running[0]}"
+        return 0
+    fi
+    if [ "${#running[@]}" -gt 1 ]; then
+        if [ -t 0 ] && [ -t 1 ]; then
+            _pick_container "running" "${running[@]}"
+            return $?
+        fi
+        echo "Multiple running devbox containers; choose one with --project <name>:" >&2
+        printf '  %s\n' "${running[@]}" >&2
+        return 2
+    fi
+
+    # None running. Fall back to existing (stopped) containers.
+    if [ "${#existing[@]}" -eq 1 ]; then
+        printf 'stopped\t%s\n' "${existing[0]}"
+        return 0
+    fi
+    if [ -t 0 ] && [ -t 1 ]; then
+        _pick_container "stopped" "${existing[@]}"
+        return $?
+    fi
+    echo "No running devbox container and multiple stopped Projects exist." >&2
+    echo "Choose one with --project <name>:" >&2
+    printf '  %s\n' "${existing[@]}" >&2
+    return 2
+}
+
+# Interactive container picker. $1 is the state label ("running"/"stopped"); the
+# rest are container names. Prints "<state>\t<chosen-name>" on stdout (prompts go
+# to stderr so the command substitution captures only the result line).
+_pick_container() {
+    local state="$1"
+    shift
+    local -a names=("$@")
+    echo "Select a devbox container for the global MCP install:" >&2
+    local i
+    for i in "${!names[@]}"; do
+        printf '  %2d) %s\n' "$((i + 1))" "${names[$i]}" >&2
+    done
+    printf 'Enter a number (blank to cancel): ' >&2
+    local reply
+    IFS= read -r reply || reply=""
+    case "$reply" in
+        ''|*[!0-9]*)
+            echo "No selection; nothing installed." >&2
+            return 2
+            ;;
+    esac
+    local idx="$((reply - 1))"
+    if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#names[@]}" ]; then
+        echo "Out-of-range selection; nothing installed." >&2
+        return 2
+    fi
+    printf '%s\t%s\n' "$state" "${names[$idx]}"
+}
+
+# Map a resolved project key (absolute path) to the devbox container name. The
+# Project name is the sanitized basename of the key (ADR 0005); the container is
+# `devbox-<name>`. Reuses the shared naming helper sourced at the top.
+_container_for_project_key() {
+    local key="$1"
+    devbox::names_from_token "$(basename "$key")"
+    printf '%s\n' "$DEVBOX_CONTAINER_NAME"
+}
+
+# Run the Python install core ON THE HOST, pointing its runtime commands INTO
+# the target container. The canonical MCP profile lives on the host
+# (~/.config/devbox/mcp), which is NOT bind-mounted into containers — so the
+# profile read/rewrite must happen host-side. Only the install COMMANDS
+# (npm install -g, docker pull, the post-install binary probe) must run in the
+# container, where the runtime lives. The core's --exec-prefix prepends a
+# `docker exec` to every such command so the split is honoured.
+#   $1   container name
+#   $2   "install-json" | "install-text"
+#   $3.. the Python core scope+name args (e.g. --global <name>)
+_run_install_in_container() {
+    local container="$1" py_cmd="$2"
+    shift 2
+    # The prefix runs install commands as the node user inside the container.
+    local exec_prefix="docker exec -u node $container"
+    _run_py "$py_cmd" --exec-prefix "$exec_prefix" "$@"
+}
+
+cmd_install() {
+    local json=false is_global=false keep_window=false
+    local project_token="" name="" allow_for=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -h|--help) _usage; return 0 ;;
+            --json) json=true ;;
+            --global) is_global=true ;;
+            --keep-window) keep_window=true ;;
+            --allow-for)
+                shift
+                if [ "$#" -eq 0 ]; then
+                    echo "'mcp install --allow-for' requires a number of minutes." >&2
+                    return 2
+                fi
+                allow_for="$1"
+                ;;
+            --allow-for=*) allow_for="${1#--allow-for=}" ;;
+            --project)
+                shift
+                if [ "$#" -eq 0 ]; then
+                    echo "'mcp install --project' requires a name or path." >&2
+                    return 2
+                fi
+                project_token="$1"
+                ;;
+            --project=*) project_token="${1#--project=}" ;;
+            -*)
+                echo "Unknown flag for 'mcp install': $1" >&2
+                return 2
+                ;;
+            *)
+                if [ -n "$name" ]; then
+                    echo "'mcp install' takes exactly one server name." >&2
+                    return 2
+                fi
+                name="$1"
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$name" ]; then
+        echo "'mcp install' requires a server name." >&2
+        echo "Usage: devbox mcp install <server> [--global|--project <p>] [--allow-for <min>] [--keep-window]" >&2
+        return 2
+    fi
+    if [ "$is_global" = true ] && [ -n "$project_token" ]; then
+        echo "'mcp install': --global and --project are mutually exclusive." >&2
+        return 2
+    fi
+    if [ -n "$allow_for" ] && ! [[ "$allow_for" =~ ^[1-9][0-9]*$ ]]; then
+        echo "'mcp install --allow-for' minutes must be a positive integer (got: '$allow_for')." >&2
+        return 2
+    fi
+    if [ "$keep_window" = true ] && [ -z "$allow_for" ]; then
+        echo "'mcp install --keep-window' only applies with --allow-for." >&2
+        return 2
+    fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "'mcp install' materializes runtime inside a Container and needs Docker." >&2
+        return 2
+    fi
+
+    # Resolve the target container and the Python-core scope args. A project
+    # install targets that Project's container and passes --project <key>; a
+    # global install runs inside a resolved devbox runtime and passes --global.
+    local container="" project_key="" started_here=false target_state=""
+    local -a scope_args=()
+    if [ -n "$project_token" ]; then
+        if ! project_key="$(_resolve_project_key "$project_token")"; then
+            return 2
+        fi
+        container="$(_container_for_project_key "$project_key")"
+        scope_args=("--project" "$project_key")
+        if _running_devbox_containers | grep -qx "$container"; then
+            target_state="running"
+        elif _existing_devbox_containers | grep -qx "$container"; then
+            target_state="stopped"
+        else
+            echo "No devbox container named '$container' for Project '$project_token'." >&2
+            echo "Start it first: devbox $(basename "$project_key")" >&2
+            return 2
+        fi
+    else
+        # _resolve_global_container prints "<state>\t<container>" so BOTH the
+        # state and the name survive the command substitution (a global var set
+        # inside it would be lost to the subshell).
+        local resolved
+        if ! resolved="$(_resolve_global_container)"; then
+            return 2
+        fi
+        target_state="${resolved%%$'\t'*}"
+        container="${resolved#*$'\t'}"
+        scope_args=("--global")
+    fi
+
+    # Start a stopped target so the install can run inside it; stop it again
+    # afterward only if we started it (leave a user's running container alone).
+    # `docker start` resumes the EXISTING container without attaching a shell,
+    # which is what a background install needs (a bare `devbox <name>` attaches
+    # an interactive session). The container's entrypoint re-runs the firewall
+    # setup on start, so the runtime is ready for the install + Allow-for window.
+    if [ "$target_state" = "stopped" ]; then
+        echo "Starting container '$container' for the install..." >&2
+        if ! docker start "$container" >/dev/null 2>&1; then
+            echo "Failed to start container '$container'." >&2
+            return 1
+        fi
+        started_here=true
+        # Give the entrypoint a moment to finish firewall/runtime setup before
+        # the install reaches for the network.
+        sleep 2
+    fi
+
+    # Open an Allow-for window before the install when requested, so the
+    # network-fetching install can reach package registries that are not yet on
+    # the Allowlist, and the window's harvest log records what it hit.
+    local window_opened=false
+    if [ -n "$allow_for" ]; then
+        echo "Opening an Allow-for window (${allow_for} min) for '${container#devbox-}'..." >&2
+        if "$_DEVBOX_ENTRYPOINT" allow-for "$allow_for" "${container#devbox-}"; then
+            window_opened=true
+        else
+            echo "Failed to open the Allow-for window; continuing without it." >&2
+            echo "The install may fail on blocked domains; review with 'devbox blocked'." >&2
+        fi
+    fi
+
+    # Run the install inside the container.
+    local py_cmd rc=0
+    if [ "$json" = true ]; then
+        py_cmd="install-json"
+    else
+        py_cmd="install-text"
+    fi
+    _run_install_in_container "$container" "$py_cmd" "${scope_args[@]}" "$name" || rc=$?
+
+    # Close the Allow-for window after the attempt by default so the harvest log
+    # is produced immediately; --keep-window leaves it open until normal expiry.
+    if [ "$window_opened" = true ]; then
+        if [ "$keep_window" = true ]; then
+            echo "Leaving the Allow-for window open (--keep-window) until it expires." >&2
+        else
+            echo "Closing the Allow-for window (harvest log produced)..." >&2
+            "$_DEVBOX_ENTRYPOINT" allow-for --stop "${container#devbox-}" \
+                || echo "Note: could not close the window; it will expire on its own." >&2
+        fi
+    fi
+
+    # Stop a container we started for the install (global install into a stopped
+    # Project), leaving the user's environment as we found it.
+    if [ "$started_here" = true ]; then
+        echo "Stopping container '$container' (started only for the install)..." >&2
+        "$_DEVBOX_ENTRYPOINT" stop "${container#devbox-}" >/dev/null 2>&1 \
+            || echo "Note: could not stop '$container'; stop it manually if needed." >&2
+    fi
+
+    if [ "$rc" -eq 4 ]; then
+        # Blocked-network exit from the Python core already printed the
+        # devbox blocked / rerun guidance; surface a short pointer too.
+        echo "Install hit the default-deny firewall. See the guidance above." >&2
+    fi
+    return "$rc"
+}
+
 # Placeholder for subcommands that are planned but not part of this slice.
 # Listing them in --help sets user expectations; invoking them must fail
 # clearly rather than silently no-op.
@@ -878,7 +1200,8 @@ main() {
         disable) cmd_disable "$@" ;;
         remove)  cmd_remove "$@" ;;
         doctor)  cmd_doctor "$@" ;;
-        add|install)
+        install) cmd_install "$@" ;;
+        add)
             _not_implemented "$sub"
             ;;
         *)

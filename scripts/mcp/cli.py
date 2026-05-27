@@ -29,6 +29,7 @@ import sys
 from typing import Optional
 
 from . import import_result, inherited_list_result
+from .apply import ApplyConflictError, apply_selection, is_applicable
 from .candidate import Candidate
 from .classify import classify_candidate
 from .merge import MergedCandidate, merge_candidates
@@ -289,6 +290,198 @@ def _render_inherited_table(merged: list[MergedCandidate]) -> int:
     return 0
 
 
+class _Selection:
+    """Parsed apply selection flags layered on top of the scope flags.
+
+    ``--server <name>`` and ``--import-id <id>`` are repeatable and choose which
+    discovered candidates to apply. ``--all-applicable`` selects every applicable
+    (``container``) candidate — used by the shell dispatcher after an interactive
+    multi-select picker has already confirmed the choice with the user.
+    """
+
+    def __init__(self) -> None:
+        self.scope = _Scope()
+        self.servers: list[str] = []
+        self.import_ids: list[str] = []
+        self.all_applicable: bool = False
+
+
+def _parse_selection(argv: list[str]) -> Optional[_Selection]:
+    sel = _Selection()
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--all":
+            sel.scope.all_projects = True
+        elif arg == "--no-global":
+            sel.scope.include_global = False
+        elif arg == "--all-applicable":
+            sel.all_applicable = True
+        elif arg == "--project":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: --project requires a value\n")
+                return None
+            sel.scope.project_keys.append(argv[i])
+        elif arg == "--server":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: --server requires a value\n")
+                return None
+            sel.servers.append(argv[i])
+        elif arg == "--import-id":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: --import-id requires a value\n")
+                return None
+            sel.import_ids.append(argv[i])
+        else:
+            sys.stderr.write(f"mcp.cli: unknown argument {arg!r}\n")
+            return None
+        i += 1
+    return sel
+
+
+def _resolve_selection(
+    merged: list[MergedCandidate], sel: _Selection
+) -> Optional[list[MergedCandidate]]:
+    """Turn selection flags into the concrete candidates to apply.
+
+    Resolution rules (local-plan-mcp.md decision 18):
+
+      * ``--import-id <id>`` picks an exact candidate; an unknown ID is an error.
+      * ``--server <name>`` picks by name but FAILS on ambiguity (two candidates
+        share the name, e.g. a conflict or a global+project pair) and tells the
+        user to disambiguate with ``--import-id``.
+      * ``--all-applicable`` picks every applicable candidate (post-picker path).
+      * No selection at all is an error here — the shell dispatcher only calls
+        the Python apply path once it has a selection (picker or flags), and a
+        non-interactive apply without selection is rejected upstream.
+
+    Returns None (after writing a message to stderr) on any selection error.
+    """
+    chosen: dict[str, MergedCandidate] = {}
+
+    by_id = {m.import_id: m for m in merged}
+    for iid in sel.import_ids:
+        m = by_id.get(iid)
+        if m is None:
+            sys.stderr.write(f"mcp.cli: no candidate with import id {iid!r}\n")
+            return None
+        chosen[m.import_id] = m
+
+    for name in sel.servers:
+        matches = [m for m in merged if m.candidate.name == name]
+        if not matches:
+            sys.stderr.write(f"mcp.cli: no candidate named {name!r}\n")
+            return None
+        if len(matches) > 1:
+            ids = ", ".join(m.import_id for m in matches)
+            sys.stderr.write(
+                f"mcp.cli: server name {name!r} is ambiguous "
+                f"({len(matches)} candidates); choose one with --import-id "
+                f"({ids})\n"
+            )
+            return None
+        chosen[matches[0].import_id] = matches[0]
+
+    if sel.all_applicable:
+        for m in merged:
+            if is_applicable(m):
+                chosen[m.import_id] = m
+
+    if not chosen:
+        sys.stderr.write(
+            "mcp.cli: no candidates selected; pass --server <name>, "
+            "--import-id <id>, or --all-applicable\n"
+        )
+        return None
+
+    # Preserve discovery order for a stable, repeatable summary.
+    return [m for m in merged if m.import_id in chosen]
+
+
+def _apply_payload(merged: list[MergedCandidate], sel: _Selection) -> dict:
+    selected = _resolve_selection(merged, sel)
+    if selected is None:
+        return {"error": "selection"}
+    try:
+        result = apply_selection(selected)
+    except ApplyConflictError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return {"error": "conflict"}
+    return result.to_dict()
+
+
+def _render_apply_text(merged: list[MergedCandidate], sel: _Selection) -> int:
+    """Human-readable apply summary. SECRET-FREE: copied secret KEY NAMES only.
+
+    Reports each applied server, its scope and profile path, and exactly which
+    env keys were copied into the devbox secret store — never their values. Any
+    non-applicable selection (host-only / unknown / excluded) is listed as
+    skipped with a reason so the user is never left wondering why a choice did
+    nothing.
+    """
+    selected = _resolve_selection(merged, sel)
+    if selected is None:
+        return 2
+    try:
+        result = apply_selection(selected)
+    except ApplyConflictError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 2
+
+    if not result.applied and not result.skipped:
+        sys.stdout.write("No candidates applied.\n")
+        return 0
+
+    for a in result.applied:
+        scope_label = a.scope
+        if a.project_key:
+            scope_label = f"{a.scope} ({a.project_key})"
+        sys.stdout.write(f"Applied {a.name}\n")
+        sys.stdout.write(f"  import id: {a.import_id}\n")
+        sys.stdout.write(f"  scope    : {scope_label}\n")
+        sys.stdout.write(f"  profile  : {a.profile_path}\n")
+        if a.copied_secret_keys:
+            sys.stdout.write(
+                "  secrets  : copied "
+                f"{', '.join(a.copied_secret_keys)} to {a.secrets_path} "
+                "(values not shown)\n"
+            )
+        else:
+            sys.stdout.write("  secrets  : none copied\n")
+
+    for s in result.skipped:
+        sys.stdout.write(
+            f"Skipped {s['name']} ({s['importId']}): {s['reason']}\n"
+        )
+
+    sys.stdout.write(
+        "\nProfile updated. No Claude Code or Codex config was modified "
+        "(render is a later step).\n"
+    )
+    return 0
+
+
+def _render_applicable_list(merged: list[MergedCandidate]) -> int:
+    """Emit one applicable candidate per line for the shell's TTY picker.
+
+    Format: ``<import_id>\\t<name>\\t<scope>``. Applicable means ``container``
+    placement (the only thing v1 can apply). SECRET-FREE — identity metadata
+    only. Non-applicable candidates are intentionally omitted so the picker can
+    never offer a host-only/unknown choice.
+    """
+    for m in merged:
+        if not is_applicable(m):
+            continue
+        scope = m.candidate.source_scope
+        if m.candidate.source_project:
+            scope = f"{scope}:{m.candidate.source_project}"
+        sys.stdout.write(f"{m.import_id}\t{m.candidate.name}\t{scope}\n")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         sys.stderr.write("mcp.cli: missing command\n")
@@ -316,6 +509,26 @@ def main(argv: list[str]) -> int:
         if scope is None:
             return 2
         return _emit(inherited_list_result(_discover(scope)))
+    if command == "apply-json":
+        sel = _parse_selection(rest)
+        if sel is None:
+            return 2
+        merged = _discover(sel.scope)
+        payload = _apply_payload(merged, sel)
+        if payload.get("error") in ("selection", "conflict"):
+            return 2
+        return _emit(payload)
+    if command == "apply-text":
+        sel = _parse_selection(rest)
+        if sel is None:
+            return 2
+        merged = _discover(sel.scope)
+        return _render_apply_text(merged, sel)
+    if command == "list-applicable":
+        scope = _parse_scope(rest)
+        if scope is None:
+            return 2
+        return _render_applicable_list(_discover(scope))
     if command == "project-keys":
         # Emit known Claude project record keys, one per line. These are
         # directory paths (Claude's own map keys) — not secret. Used by the

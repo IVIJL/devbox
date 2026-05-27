@@ -79,6 +79,21 @@ Read-only commands in this version:
   devbox mcp import [scope] [--json]            Dry-run discovery report.
   devbox mcp list --inherited [scope] [--json]  Detected Inherited MCP servers.
 
+Apply (write) path:
+  devbox mcp import --apply [scope]             Apply selected candidates.
+      Interactive TTY  -> multi-select picker of Container-safe candidates.
+      Non-interactive  -> requires an explicit selection:
+        --server <name>     Apply by server name (repeatable; fails on
+                            ambiguity — use --import-id instead).
+        --import-id <id>    Apply by stable import id (repeatable).
+        --all-applicable    Apply every applicable (container) candidate.
+  Applied servers are written to the devbox MCP profile, preserving inherited
+  scope (global source -> global profile, project source -> Project profile).
+  Inherited secret env VALUES can be copied into a scoped 0600 secret store;
+  the summary reports which env KEYS were copied, never their values. Host-only,
+  unknown, and excluded candidates are shown but not applied. No Claude Code or
+  Codex config is modified yet.
+
 Scope flags (import / list --inherited):
   (default)                 Current Project record + global Claude config.
   --project <name-or-path>  Scan one explicit Project (repeatable).
@@ -211,11 +226,17 @@ _build_scope_args() {
 cmd_import() {
     local json=false
     local all=false
+    local apply=false
+    local all_applicable=false
     local -a projects=()
+    local -a servers=()
+    local -a import_ids=()
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --json) json=true ;;
             --all) all=true ;;
+            --apply) apply=true ;;
+            --all-applicable) all_applicable=true ;;
             --project)
                 shift
                 if [ "$#" -eq 0 ]; then
@@ -225,6 +246,24 @@ cmd_import() {
                 projects+=("$1")
                 ;;
             --project=*) projects+=("${1#--project=}") ;;
+            --server)
+                shift
+                if [ "$#" -eq 0 ]; then
+                    echo "'mcp import --server' requires a server name." >&2
+                    return 2
+                fi
+                servers+=("$1")
+                ;;
+            --server=*) servers+=("${1#--server=}") ;;
+            --import-id)
+                shift
+                if [ "$#" -eq 0 ]; then
+                    echo "'mcp import --import-id' requires an id." >&2
+                    return 2
+                fi
+                import_ids+=("$1")
+                ;;
+            --import-id=*) import_ids+=("${1#--import-id=}") ;;
             -h|--help) _usage; return 0 ;;
             -*)
                 echo "Unknown flag for 'mcp import': $1" >&2
@@ -248,13 +287,141 @@ cmd_import() {
         [ -n "$line" ] && scope_args+=("$line")
     done <<< "$scope_out"
 
-    if [ "$json" = true ]; then
-        _run_py import-json "${scope_args[@]}"
+    # Selection flags are only meaningful for an apply. Reject them on a plain
+    # dry-run rather than silently ignoring the user's choice.
+    if [ "$apply" != true ]; then
+        if [ "${#servers[@]}" -gt 0 ] || [ "${#import_ids[@]}" -gt 0 ] \
+            || [ "$all_applicable" = true ]; then
+            echo "--server/--import-id/--all-applicable require --apply." >&2
+            return 2
+        fi
+        if [ "$json" = true ]; then
+            _run_py import-json "${scope_args[@]}"
+            return $?
+        fi
+        # Dry-run by default (ADR 0013 / local-plan-mcp.md decision 10). No writes.
+        _run_py import-text "${scope_args[@]}"
         return $?
     fi
 
-    # Dry-run by default (ADR 0013 / local-plan-mcp.md decision 10). No writes.
-    _run_py import-text "${scope_args[@]}"
+    cmd_import_apply "$json" "$all_applicable" \
+        scope_args servers import_ids
+}
+
+# Run the apply path of `devbox mcp import --apply`. Selection resolution and
+# all writes live in the Python core; this function only decides HOW the user
+# selected candidates:
+#   * explicit --server/--import-id/--all-applicable -> pass straight through;
+#   * interactive TTY with no explicit selection -> run a multi-select picker;
+#   * non-interactive with no selection -> fail with examples (no writes).
+# Array arguments are passed BY NAME (nameref) to avoid re-quoting issues.
+cmd_import_apply() {
+    local json="$1" all_applicable="$2"
+    local -n _scope_args="$3"
+    local -n _servers="$4"
+    local -n _import_ids="$5"
+
+    local -a sel_args=()
+    local s
+    for s in "${_servers[@]+"${_servers[@]}"}"; do
+        sel_args+=("--server" "$s")
+    done
+    for s in "${_import_ids[@]+"${_import_ids[@]}"}"; do
+        sel_args+=("--import-id" "$s")
+    done
+    [ "$all_applicable" = true ] && sel_args+=("--all-applicable")
+
+    local have_selection=false
+    [ "${#sel_args[@]}" -gt 0 ] && have_selection=true
+
+    if [ "$have_selection" != true ]; then
+        # No explicit selection. Interactive -> picker; non-interactive -> fail.
+        if [ -t 0 ] && [ -t 1 ]; then
+            local picked picker_rc
+            # Capture the picker's own exit status: a `! cmd` test would reset
+            # $? to 0 inside the then-branch, masking a picker failure.
+            picked="$(_apply_picker "${_scope_args[@]}")"
+            picker_rc=$?
+            if [ "$picker_rc" -ne 0 ]; then
+                return "$picker_rc"
+            fi
+            local -a picked_args=()
+            local pline
+            while IFS= read -r pline; do
+                [ -n "$pline" ] && picked_args+=("--import-id" "$pline")
+            done <<< "$picked"
+            if [ "${#picked_args[@]}" -eq 0 ]; then
+                echo "No candidates selected; nothing applied." >&2
+                return 0
+            fi
+            sel_args=("${picked_args[@]}")
+        else
+            echo "Non-interactive 'mcp import --apply' needs an explicit selection." >&2
+            echo "Examples:" >&2
+            echo "  devbox mcp import --apply --server context7" >&2
+            echo "  devbox mcp import --apply --import-id imp-abcdef123456" >&2
+            echo "  devbox mcp import --apply --all-applicable" >&2
+            echo "See 'devbox mcp import' (dry-run) for names and import IDs." >&2
+            return 2
+        fi
+    fi
+
+    if [ "$json" = true ]; then
+        _run_py apply-json "${_scope_args[@]}" "${sel_args[@]}"
+        return $?
+    fi
+    _run_py apply-text "${_scope_args[@]}" "${sel_args[@]}"
+}
+
+# Interactive multi-select picker for applicable candidates. Lists applicable
+# (container-placement) candidates with a number, reads a space/comma-separated
+# selection from the TTY, and prints the chosen import IDs (one per line) on
+# stdout for the caller. Prompts go to stderr so stdout stays clean. Returns
+# non-zero only on a hard error; an empty selection prints nothing and succeeds.
+_apply_picker() {
+    local applicable
+    applicable="$(_run_py list-applicable "$@")"
+    if [ -z "$applicable" ]; then
+        echo "No applicable (container) candidates to import." >&2
+        return 1
+    fi
+
+    local -a ids=() names=() scopes=()
+    local id name scope
+    while IFS=$'\t' read -r id name scope; do
+        [ -n "$id" ] || continue
+        ids+=("$id")
+        names+=("$name")
+        scopes+=("$scope")
+    done <<< "$applicable"
+
+    echo "Select MCP servers to import (Container-safe candidates):" >&2
+    local i
+    for i in "${!ids[@]}"; do
+        printf '  %2d) %-24s %-12s %s\n' \
+            "$((i + 1))" "${names[$i]}" "${scopes[$i]}" "${ids[$i]}" >&2
+    done
+    printf 'Enter numbers (space/comma separated), or blank to cancel: ' >&2
+
+    local reply
+    IFS= read -r reply || reply=""
+    reply="${reply//,/ }"
+
+    local token idx
+    for token in $reply; do
+        case "$token" in
+            ''|*[!0-9]*)
+                echo "Ignoring invalid selection '$token'." >&2
+                continue
+                ;;
+        esac
+        idx="$((token - 1))"
+        if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#ids[@]}" ]; then
+            echo "Ignoring out-of-range selection '$token'." >&2
+            continue
+        fi
+        printf '%s\n' "${ids[$idx]}"
+    done
 }
 
 cmd_list() {

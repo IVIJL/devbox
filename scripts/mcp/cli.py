@@ -44,6 +44,20 @@ from .render import (
 from .runner import RunnerError, run as runner_run
 from .identity import NotInsideContainerError
 from .writer import RenderWriteError, write_plan
+from .lifecycle import (
+    DoctorReport,
+    EffectiveList,
+    FixResult,
+    LifecycleError,
+    RemoveResult,
+    ToggleResult,
+    apply_doctor_fixes,
+    effective_list,
+    remove_server,
+    run_doctor,
+    server_has_secrets,
+    set_enabled,
+)
 
 
 def _emit(payload: dict) -> int:
@@ -664,6 +678,359 @@ def _render_written_text(plan: RenderPlan, written: list[str]) -> int:
     return 0
 
 
+def _render_effective_table(result: EffectiveList) -> int:
+    """Readable effective MCP profile table (issue 08 `devbox mcp list`).
+
+    Columns: NAME, SCOPE, STATUS, PLACEMENT, RUNTIME, SOURCE (decision 22). A
+    Project entry shadowing a same-named global entry is marked on the global
+    row. SECRET-FREE: every column is non-secret identity; env values never
+    appear. PLACEMENT is ``container`` for every devbox profile entry (v1 only
+    stores Container MCP servers).
+    """
+    if not result.entries:
+        sys.stdout.write(
+            "No devbox MCP profile servers. Import inherited servers with "
+            "'devbox mcp import --apply' first.\n"
+        )
+        return 0
+
+    rows: list[tuple[str, str, str, str, str, str]] = []
+    for e in result.entries:
+        scope_label = e.scope
+        if e.project_key:
+            scope_label = f"{e.scope}:{e.project_key.rsplit('/', 1)[-1]}"
+        status = e.status
+        if e.shadowed:
+            status = f"{status} (shadowed)"
+        source = e.source_provider or "-"
+        rows.append(
+            (
+                e.name,
+                scope_label,
+                status,
+                "container",
+                e.runtime,
+                source,
+            )
+        )
+
+    headers = ("NAME", "SCOPE", "STATUS", "PLACEMENT", "RUNTIME", "SOURCE")
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def _fmt(cells: tuple[str, ...]) -> str:
+        return "  ".join(
+            cell.ljust(widths[i]) for i, cell in enumerate(cells)
+        ).rstrip()
+
+    sys.stdout.write(_fmt(headers) + "\n")
+    for row in rows:
+        sys.stdout.write(_fmt(row) + "\n")
+    if any(e.shadowed for e in result.entries):
+        sys.stdout.write(
+            "\nA (shadowed) global entry is overridden by a Project entry of the "
+            "same name for the current Project.\n"
+        )
+    return 0
+
+
+def _render_toggle_text(result: ToggleResult, enabled: bool) -> int:
+    """Human-readable enable/disable summary (SECRET-FREE)."""
+    verb = "enabled" if enabled else "disabled"
+    scope_label = result.scope
+    if result.project_key:
+        scope_label = f"{result.scope} ({result.project_key})"
+    if result.no_op:
+        sys.stdout.write(
+            f"MCP server {result.name!r} is already {verb} in the {scope_label} "
+            "profile; no change.\n"
+        )
+        return 0
+    if result.created_override:
+        sys.stdout.write(
+            f"Disabled MCP server {result.name!r} for the {scope_label} profile "
+            "via a Project override; the global entry is unchanged and still "
+            "available in other projects.\n"
+        )
+        # Codex has no per-project MCP namespace, so a project-only disable of a
+        # globally-rendered server cannot be enforced for Codex (it stays offered
+        # in the single global Codex table). Claude enforces it via the project
+        # record shadow. Be honest about the Codex limitation rather than imply a
+        # complete disable.
+        sys.stdout.write(
+            "  note: this Project disable is enforced for Claude Code only; "
+            "Codex has no per-project MCP scope, so the server remains offered "
+            "in Codex. Use 'devbox mcp disable {name} --global' to disable it "
+            "everywhere.\n".format(name=result.name)
+        )
+    else:
+        sys.stdout.write(
+            f"{verb.capitalize()} MCP server {result.name!r} in the "
+            f"{scope_label} profile.\n"
+        )
+    return 0
+
+
+def _render_remove_text(result: RemoveResult) -> int:
+    """Human-readable remove summary (SECRET-FREE)."""
+    scope_label = result.scope
+    if result.project_key:
+        scope_label = f"{result.scope} ({result.project_key})"
+    if result.removed:
+        sys.stdout.write(
+            f"Removed devbox MCP server {result.name!r} from the {scope_label} "
+            "profile.\n"
+        )
+    else:
+        # The profile entry was already gone; this run only cleaned up an
+        # orphaned scoped secret block.
+        sys.stdout.write(
+            f"No {scope_label} profile entry for {result.name!r} (already "
+            "removed); cleaned up its orphaned secrets.\n"
+        )
+    if result.secrets_purged:
+        if result.purged_secret_keys:
+            sys.stdout.write(
+                "Purged scoped secret store keys: "
+                f"{', '.join(result.purged_secret_keys)} (values not shown).\n"
+            )
+        else:
+            sys.stdout.write("No scoped secrets to purge.\n")
+    else:
+        sys.stdout.write(
+            "Left any scoped secrets in place (pass --purge to delete them).\n"
+        )
+    sys.stdout.write(
+        "Inherited/manual agent MCP entries were not touched.\n"
+    )
+    return 0
+
+
+_SEVERITY_TAG = {"error": "ERROR", "warning": "WARN ", "info": "INFO "}
+
+
+def _render_doctor_text(report: DoctorReport) -> int:
+    """Human-readable doctor report (SECRET-FREE).
+
+    Lists each finding with its severity, message, and a concrete repair
+    command. Exit code is 1 when any ERROR finding is present, else 0.
+    """
+    where = "inside a devbox Container" if report.inside_container else "on the host"
+    sys.stdout.write(f"devbox mcp doctor ({where}):\n")
+    if not report.findings:
+        sys.stdout.write("  All checks passed. No problems detected.\n")
+        return 0
+    for f in report.findings:
+        tag = _SEVERITY_TAG.get(f.severity, f.severity.upper())
+        sys.stdout.write(f"  [{tag}] {f.message}\n")
+        if f.repair:
+            sys.stdout.write(f"          repair: {f.repair}\n")
+    fixable = [f for f in report.findings if f.fixable]
+    if fixable:
+        sys.stdout.write(
+            "\nSome problems can be fixed safely with 'devbox mcp doctor --fix'.\n"
+        )
+    return 0 if report.ok else 1
+
+
+def _render_fix_text(result: FixResult) -> int:
+    """Human-readable doctor --fix summary (SECRET-FREE)."""
+    if result.actions:
+        sys.stdout.write("Applied safe fixes:\n")
+        for action in result.actions:
+            sys.stdout.write(f"  - {action}\n")
+    else:
+        sys.stdout.write("No safe fixes were needed.\n")
+    if result.remaining:
+        sys.stdout.write("\nRemaining problems (not safely auto-fixable):\n")
+        for f in result.remaining:
+            tag = _SEVERITY_TAG.get(f.severity, f.severity.upper())
+            sys.stdout.write(f"  [{tag}] {f.message}\n")
+            if f.repair:
+                sys.stdout.write(f"          repair: {f.repair}\n")
+    has_error = any(f.severity == "error" for f in result.remaining)
+    return 1 if has_error else 0
+
+
+class _LifecycleScope:
+    """Scope flags for the lifecycle commands: optional --project, --global."""
+
+    def __init__(self) -> None:
+        self.project_key: Optional[str] = None
+        self.is_global: bool = False
+        self.purge: bool = False
+        self.positional: list[str] = []
+
+
+def _parse_lifecycle_scope(argv: list[str]) -> Optional[_LifecycleScope]:
+    """Parse enable/disable/remove flags. Returns None on a parse error."""
+    out = _LifecycleScope()
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--global":
+            out.is_global = True
+        elif arg == "--purge":
+            out.purge = True
+        elif arg == "--project":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: --project requires a value\n")
+                return None
+            out.project_key = argv[i]
+        elif arg.startswith("--project="):
+            value = arg[len("--project="):]
+            if not value:
+                sys.stderr.write("mcp.cli: --project requires a non-empty value\n")
+                return None
+            out.project_key = value
+        elif arg.startswith("-"):
+            sys.stderr.write(f"mcp.cli: unknown argument {arg!r}\n")
+            return None
+        else:
+            out.positional.append(arg)
+        i += 1
+    return out
+
+
+def _resolve_lifecycle_scope(
+    scope: _LifecycleScope,
+) -> Optional[tuple[str, Optional[str]]]:
+    """Map the parsed flags to (scope, project_key), or None on conflict.
+
+    ``--global`` selects global scope; a ``--project <key>`` selects project
+    scope keyed by that FULL project key (the shell dispatcher resolves the
+    token to a Claude record key before invoking). They are mutually exclusive.
+    With neither, default to global scope (a bare 'enable foo' targets the
+    global profile, matching how a global import lands).
+    """
+    if scope.is_global and scope.project_key:
+        sys.stderr.write(
+            "mcp.cli: --global and --project are mutually exclusive\n"
+        )
+        return None
+    if scope.project_key:
+        return ("project", scope.project_key)
+    return ("global", None)
+
+
+def _cmd_list(argv: list[str], as_json: bool) -> int:
+    """`devbox mcp list` effective view. Scope flags reuse the shared parser."""
+    scope = _parse_scope(argv)
+    if scope is None:
+        return 2
+    try:
+        result = effective_list(
+            project_keys=scope.project_keys or None,
+            all_projects=scope.all_projects,
+        )
+    except LifecycleError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 1
+    if as_json:
+        return _emit(result.to_dict())
+    return _render_effective_table(result)
+
+
+def _cmd_toggle(argv: list[str], enabled: bool, as_json: bool) -> int:
+    """`devbox mcp enable|disable <name>` profile-state toggle."""
+    scope = _parse_lifecycle_scope(argv)
+    if scope is None:
+        return 2
+    if len(scope.positional) != 1:
+        sys.stderr.write(
+            "mcp.cli: enable/disable take exactly one server name\n"
+        )
+        return 2
+    resolved = _resolve_lifecycle_scope(scope)
+    if resolved is None:
+        return 2
+    scope_name, project_key = resolved
+    name = scope.positional[0]
+    try:
+        result = set_enabled(name, scope_name, project_key, enabled)
+    except LifecycleError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 1
+    if as_json:
+        return _emit(result.to_dict())
+    return _render_toggle_text(result, enabled)
+
+
+def _cmd_remove(argv: list[str], as_json: bool) -> int:
+    """`devbox mcp remove <name>` profile-entry removal (purge opt-in)."""
+    scope = _parse_lifecycle_scope(argv)
+    if scope is None:
+        return 2
+    if len(scope.positional) != 1:
+        sys.stderr.write("mcp.cli: remove takes exactly one server name\n")
+        return 2
+    resolved = _resolve_lifecycle_scope(scope)
+    if resolved is None:
+        return 2
+    scope_name, project_key = resolved
+    name = scope.positional[0]
+    try:
+        result = remove_server(name, scope_name, project_key, purge=scope.purge)
+    except LifecycleError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 1
+    if as_json:
+        return _emit(result.to_dict())
+    return _render_remove_text(result)
+
+
+def _cmd_remove_secret_check(argv: list[str]) -> int:
+    """Report whether a remove target has scoped secrets (one key NAME per line).
+
+    Used by the shell dispatcher to decide whether to prompt for confirmation
+    before a non-purge remove would orphan a secret block. SECRET-FREE: prints
+    key NAMES only, never values. Output is empty when there are no secrets.
+    """
+    scope = _parse_lifecycle_scope(argv)
+    if scope is None:
+        return 2
+    if len(scope.positional) != 1:
+        sys.stderr.write("mcp.cli: remove-secret-check takes one server name\n")
+        return 2
+    resolved = _resolve_lifecycle_scope(scope)
+    if resolved is None:
+        return 2
+    scope_name, project_key = resolved
+    for key in server_has_secrets(scope.positional[0], scope_name, project_key):
+        sys.stdout.write(key + "\n")
+    return 0
+
+
+def _cmd_doctor(argv: list[str], as_json: bool) -> int:
+    """`devbox mcp doctor [--fix]` diagnostics."""
+    do_fix = False
+    rest: list[str] = []
+    for arg in argv:
+        if arg == "--fix":
+            do_fix = True
+        else:
+            rest.append(arg)
+    if rest:
+        sys.stderr.write(
+            f"mcp.cli: unexpected argument(s) for doctor: {' '.join(rest)}\n"
+        )
+        return 2
+    report = run_doctor()
+    if do_fix:
+        fix = apply_doctor_fixes(report)
+        if as_json:
+            _emit(fix.to_dict())
+            return 1 if any(f.severity == "error" for f in fix.remaining) else 0
+        return _render_fix_text(fix)
+    if as_json:
+        _emit(report.to_dict())
+        return 0 if report.ok else 1
+    return _render_doctor_text(report)
+
+
 def _run_wrapper(argv: list[str]) -> int:
     """Parse the wrapper args and launch the named server (never returns on OK).
 
@@ -819,6 +1186,28 @@ def main(argv: list[str]) -> int:
             payload["written"] = written
             return _emit(payload)
         return _render_written_text(plan, written)
+    if command == "list-json":
+        return _cmd_list(rest, as_json=True)
+    if command == "list-text":
+        return _cmd_list(rest, as_json=False)
+    if command == "enable-json":
+        return _cmd_toggle(rest, enabled=True, as_json=True)
+    if command == "enable-text":
+        return _cmd_toggle(rest, enabled=True, as_json=False)
+    if command == "disable-json":
+        return _cmd_toggle(rest, enabled=False, as_json=True)
+    if command == "disable-text":
+        return _cmd_toggle(rest, enabled=False, as_json=False)
+    if command == "remove-json":
+        return _cmd_remove(rest, as_json=True)
+    if command == "remove-text":
+        return _cmd_remove(rest, as_json=False)
+    if command == "remove-secret-check":
+        return _cmd_remove_secret_check(rest)
+    if command == "doctor-json":
+        return _cmd_doctor(rest, as_json=True)
+    if command == "doctor-text":
+        return _cmd_doctor(rest, as_json=False)
     if command == "run":
         # The devbox-mcp-run wrapper core. Args: [--project <key>] <server>.
         return _run_wrapper(rest)

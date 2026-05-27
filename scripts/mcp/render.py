@@ -85,6 +85,14 @@ class ProfileServer:
     secret_env_keys: list[str] = field(default_factory=list)
     renderable: bool = True
     skip_reason: str = ""
+    # A Project-scoped DISABLE OVERRIDE for a server that is ENABLED globally
+    # (issue 08). The override carries no command of its own; it exists only to
+    # SHADOW the global ``devbox-<name>`` entry inside its project's Claude
+    # record so the otherwise-global server is not offered there. The rendered
+    # entry still calls the wrapper with ``--project <key>``; the wrapper resolves
+    # the project profile, finds ``enabled: false``, and refuses — which is the
+    # enforcement. Never set for global servers.
+    disabled_override: bool = False
 
 
 @dataclass
@@ -173,9 +181,15 @@ def _disambiguated_names(servers: list[ProfileServer]) -> dict[int, str]:
     so they stay stable. The wrapper argument passed alongside still carries the
     original source name plus scope so issue 07 can launch the right slot.
     """
-    # Count how many servers want each bare rendered name.
+    # Count how many servers want each bare rendered name. A Project DISABLE
+    # OVERRIDE is excluded from the count and ALWAYS keeps the bare name: it must
+    # SHADOW the global ``devbox-<name>`` entry inside its project's Claude
+    # record (same name, different record location), so disambiguating it would
+    # defeat the override entirely.
     bare_counts: dict[str, int] = {}
     for srv in servers:
+        if srv.disabled_override:
+            continue
         bare_counts[rendered_name(srv.name)] = bare_counts.get(
             rendered_name(srv.name), 0
         ) + 1
@@ -184,7 +198,10 @@ def _disambiguated_names(servers: list[ProfileServer]) -> dict[int, str]:
     used: set[str] = set()
     for idx, srv in enumerate(servers):
         bare = rendered_name(srv.name)
-        if bare_counts[bare] <= 1:
+        if srv.disabled_override:
+            names[idx] = bare
+            continue
+        if bare_counts.get(bare, 0) <= 1:
             names[idx] = bare
             used.add(bare)
             continue
@@ -258,28 +275,51 @@ def _profile_servers_from(
     project_key: str,
     renderable: bool = True,
     skip_reason: str = "",
+    disabled_override_names: Optional[set[str]] = None,
 ) -> list[ProfileServer]:
     """Load one profile file and return its enabled servers as ProfileServers.
 
     A server is considered enabled unless it carries an explicit ``"enabled":
-    false`` flag (enable/disable lands in a later issue; until then everything is
-    enabled). Reads NAMES only — no secret value is ever in the profile, so
+    false`` flag. Reads NAMES only — no secret value is ever in the profile, so
     nothing to redact here.
 
     ``renderable``/``skip_reason`` mark a whole profile whose servers cannot be
     rendered into a launchable agent entry (see ``ProfileServer``); the flags are
     stamped onto every server the file yields.
+
+    ``disabled_override_names`` (project scope only) is the set of names that are
+    a Project DISABLE OVERRIDE of an ENABLED global server: a disabled,
+    command-less stub written by ``devbox mcp disable <name> --project <p>``.
+    These are normally dropped (disabled), but for these names we EMIT a
+    ``disabled_override`` ProfileServer so render can shadow the global
+    ``devbox-<name>`` entry in this project's Claude record (the wrapper then
+    refuses to launch it for the project — that is the enforcement).
     """
     profile = load_profile(path)
     out: list[ProfileServer] = []
     servers = profile.get("servers", {})
     if not isinstance(servers, dict):
         return out
+    overrides = disabled_override_names or set()
     for name in sorted(servers):
         spec = servers[name]
         if not isinstance(spec, dict):
             continue
         if spec.get("enabled") is False:
+            # A disabled project stub that overrides an enabled global server is
+            # emitted as a shadow (so the global entry is suppressed in this
+            # project); every other disabled server is simply not rendered.
+            if scope == "project" and name in overrides and "command" not in spec:
+                out.append(
+                    ProfileServer(
+                        name=str(name),
+                        scope=scope,
+                        project_key=project_key,
+                        renderable=renderable,
+                        skip_reason=skip_reason,
+                        disabled_override=True,
+                    )
+                )
             continue
         env_keys = spec.get("envKeys")
         secret_env_keys = spec.get("secretEnvKeys")
@@ -328,6 +368,9 @@ def collect_profile_servers(project_keys: Optional[list[str]] = None) -> list[Pr
     servers.extend(
         _profile_servers_from(os.path.join(root, "profile.json"), "global", "")
     )
+    # Names of ENABLED global servers: a Project disable override only matters
+    # (needs to shadow) when the same name is actually offered globally.
+    enabled_global = {s.name for s in servers if s.scope == "global"}
 
     projects_dir = os.path.join(root, "projects")
     if project_keys:
@@ -335,7 +378,12 @@ def collect_profile_servers(project_keys: Optional[list[str]] = None) -> list[Pr
 
         for key in project_keys:
             path = project_profile_path(key)
-            servers.extend(_profile_servers_from(path, "project", key))
+            servers.extend(
+                _profile_servers_from(
+                    path, "project", key,
+                    disabled_override_names=enabled_global,
+                )
+            )
         return servers
 
     if os.path.isdir(projects_dir):
@@ -355,7 +403,12 @@ def collect_profile_servers(project_keys: Optional[list[str]] = None) -> list[Pr
             # a wrapper entry that parses but cannot launch.
             key = _project_key_from_profile(path)
             if key:
-                servers.extend(_profile_servers_from(path, "project", key))
+                servers.extend(
+                    _profile_servers_from(
+                        path, "project", key,
+                        disabled_override_names=enabled_global,
+                    )
+                )
             else:
                 label = _project_key_for_profile(filename, projects_dir)
                 servers.extend(

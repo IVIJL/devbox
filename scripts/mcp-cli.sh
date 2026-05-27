@@ -78,7 +78,15 @@ Subcommands:
 
 Read-only commands in this version:
   devbox mcp import [scope] [--json]            Dry-run discovery report.
+  devbox mcp list [scope] [--json]              Effective MCP profile view
+      (global + Project; a Project entry shadows a same-named global one for
+      the current Project). --all shows global plus every project profile.
   devbox mcp list --inherited [scope] [--json]  Detected Inherited MCP servers.
+  devbox mcp doctor [--fix] [--json]            Diagnose MCP profile / render /
+      runtime problems and print concrete repair commands. --fix performs only
+      safe local fixes (re-render, create missing MCP dirs, repair the wrapper
+      symlink); it never installs packages, allows domains, purges runtime, or
+      enables host-only servers.
   devbox mcp render --dry-run [--project <p>] [--json]
       Preview the Claude Code / Codex config devbox would render from the
       profile. Rendered names are 'devbox-' prefixed and call the wrapper
@@ -102,7 +110,18 @@ Apply (write) path:
   unknown, and excluded candidates are shown but not applied. No Claude Code or
   Codex config is modified yet.
 
-Scope flags (import / list --inherited):
+Profile management (mutating; auto-render unless --no-render):
+  devbox mcp enable  <name> [--global|--project <p>]   Resume rendering a server.
+  devbox mcp disable <name> [--global|--project <p>]   Keep the definition but
+      stop rendering it. A Project disable of a global server creates a
+      Project-only override; the global entry is left unchanged.
+  devbox mcp remove  <name> [--global|--project <p>] [--purge] [--no-render]
+      Delete a devbox-managed profile entry for one scope. Never touches
+      inherited/manual agent config. Scoped secrets are deleted only with
+      --purge (or interactive confirmation); a Project remove never touches
+      global secrets. With no scope flag the command targets the global profile.
+
+Scope flags (import / list):
   (default)                 Current Project record + global Claude config.
   --project <name-or-path>  Scan one explicit Project (repeatable).
   --all                     Scan every known Claude project record.
@@ -498,15 +517,6 @@ cmd_list() {
         shift
     done
 
-    # This slice only implements the inherited view. The effective-profile
-    # view (default `devbox mcp list`) needs profile state, which is a later
-    # issue.
-    if [ "$inherited" != true ]; then
-        echo "Usage: devbox mcp list --inherited [--all|--project <name-or-path>] [--json]" >&2
-        echo "The effective-profile view of 'devbox mcp list' is not implemented yet." >&2
-        return 2
-    fi
-
     local scope_out
     if ! scope_out="$(_build_scope_args "mcp list" "$all" "${projects[@]+"${projects[@]}"}")"; then
         return 2
@@ -517,15 +527,27 @@ cmd_list() {
         [ -n "$line" ] && scope_args+=("$line")
     done <<< "$scope_out"
 
-    if [ "$json" = true ]; then
-        _run_py list-inherited-json "${scope_args[@]}"
+    if [ "$inherited" = true ]; then
+        # Readable inherited table (issue 04): provider, scope, status/placement,
+        # runtime, and source columns. Same candidate shape and scope as import,
+        # no writes.
+        if [ "$json" = true ]; then
+            _run_py list-inherited-json "${scope_args[@]}"
+            return $?
+        fi
+        _run_py list-inherited-text "${scope_args[@]}"
         return $?
     fi
 
-    # Readable inherited table (issue 04): provider, scope, status/placement,
-    # runtime, and source columns. Same candidate shape and scope as import,
-    # no writes.
-    _run_py list-inherited-text "${scope_args[@]}"
+    # Effective MCP profile view (issue 08): global + Project entries, with a
+    # Project entry shadowing a same-named global entry for the current Project.
+    # --all shows global plus every project profile. Reads profile state only;
+    # no writes. NAME/SCOPE/STATUS/PLACEMENT/RUNTIME/SOURCE columns.
+    if [ "$json" = true ]; then
+        _run_py list-json "${scope_args[@]}"
+        return $?
+    fi
+    _run_py list-text "${scope_args[@]}"
 }
 
 cmd_render() {
@@ -607,6 +629,226 @@ cmd_render() {
     _run_py "$py_cmd_text" "${scope_args[@]+"${scope_args[@]}"}"
 }
 
+# Parse the shared scope flags for the lifecycle commands (enable / disable /
+# remove). Resolves an optional `--project <name-or-path>` token to a Claude
+# record key and validates mutual exclusion with `--global`. Outputs, one per
+# line, the resolved Python args (e.g. `--project`, `<key>`, or `--global`)
+# followed by the positional server name. Returns non-zero on a parse error
+# (message already on stderr). `--purge` (remove only) is forwarded verbatim.
+#   $1  subcommand label for error messages
+#   $2  "true"/"false" — whether --purge is accepted for this command
+#   $3.. the raw subcommand argv
+_lifecycle_collect() {
+    local label="$1" allow_purge="$2"
+    shift 2
+    local is_global=false purge=false project_token="" name=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --global) is_global=true ;;
+            --purge)
+                if [ "$allow_purge" != true ]; then
+                    echo "'$label' does not accept --purge." >&2
+                    return 2
+                fi
+                purge=true
+                ;;
+            --project)
+                shift
+                if [ "$#" -eq 0 ]; then
+                    echo "'$label --project' requires a name or path." >&2
+                    return 2
+                fi
+                project_token="$1"
+                ;;
+            --project=*)
+                project_token="${1#--project=}"
+                if [ -z "$project_token" ]; then
+                    echo "'$label --project=' requires a non-empty name or path." >&2
+                    return 2
+                fi
+                ;;
+            -*)
+                echo "Unknown flag for '$label': $1" >&2
+                return 2
+                ;;
+            *)
+                if [ -n "$name" ]; then
+                    echo "'$label' takes exactly one server name." >&2
+                    return 2
+                fi
+                name="$1"
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$name" ]; then
+        echo "'$label' requires a server name." >&2
+        return 2
+    fi
+    if [ "$is_global" = true ] && [ -n "$project_token" ]; then
+        echo "'$label': --global and --project are mutually exclusive." >&2
+        return 2
+    fi
+
+    if [ -n "$project_token" ]; then
+        local key
+        if ! key="$(_resolve_project_key "$project_token")"; then
+            return 2
+        fi
+        printf '%s\n%s\n' "--project" "$key"
+    elif [ "$is_global" = true ]; then
+        printf '%s\n' "--global"
+    fi
+    [ "$purge" = true ] && printf '%s\n' "--purge"
+    printf '%s\n' "$name"
+}
+
+# Read a newline-delimited arg list (from _lifecycle_collect) into the named
+# array. Empty lines are dropped.
+_read_lines_into() {
+    local -n _dest="$1"
+    local payload="$2"
+    local line
+    _dest=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && _dest+=("$line")
+    done <<< "$payload"
+}
+
+cmd_enable() {
+    local json=false no_render=false
+    local -a raw=()
+    local a
+    for a in "$@"; do
+        case "$a" in
+            -h|--help) _usage; return 0 ;;
+            --json) json=true ;;
+            --no-render) no_render=true ;;
+            *) raw+=("$a") ;;
+        esac
+    done
+    local out rc
+    out="$(_lifecycle_collect "mcp enable" false "${raw[@]+"${raw[@]}"}")"
+    rc=$?
+    [ "$rc" -ne 0 ] && return "$rc"
+    local -a args=()
+    _read_lines_into args "$out"
+    if [ "$json" = true ]; then
+        _run_py enable-json "${args[@]}" || return $?
+        _maybe_auto_render "$no_render" true
+        return $?
+    fi
+    _run_py enable-text "${args[@]}" || return $?
+    _maybe_auto_render "$no_render" false
+}
+
+cmd_disable() {
+    local json=false no_render=false
+    local -a raw=()
+    local a
+    for a in "$@"; do
+        case "$a" in
+            -h|--help) _usage; return 0 ;;
+            --json) json=true ;;
+            --no-render) no_render=true ;;
+            *) raw+=("$a") ;;
+        esac
+    done
+    local out rc
+    out="$(_lifecycle_collect "mcp disable" false "${raw[@]+"${raw[@]}"}")"
+    rc=$?
+    [ "$rc" -ne 0 ] && return "$rc"
+    local -a args=()
+    _read_lines_into args "$out"
+    if [ "$json" = true ]; then
+        _run_py disable-json "${args[@]}" || return $?
+        _maybe_auto_render "$no_render" true
+        return $?
+    fi
+    _run_py disable-text "${args[@]}" || return $?
+    _maybe_auto_render "$no_render" false
+}
+
+cmd_remove() {
+    local json=false no_render=false
+    local -a raw=()
+    local a
+    for a in "$@"; do
+        case "$a" in
+            -h|--help) _usage; return 0 ;;
+            --json) json=true ;;
+            --no-render) no_render=true ;;
+            *) raw+=("$a") ;;
+        esac
+    done
+    local out rc
+    out="$(_lifecycle_collect "mcp remove" true "${raw[@]+"${raw[@]}"}")"
+    rc=$?
+    [ "$rc" -ne 0 ] && return "$rc"
+    local -a args=()
+    _read_lines_into args "$out"
+
+    # Runtime/secret purge is never implicit (ADR 0013 decision 20). If --purge
+    # was not passed but the server has scoped secrets, require an interactive
+    # confirmation; refuse non-interactively so a scripted remove never silently
+    # leaves (or, with a future runtime, deletes) credential state unreviewed.
+    local has_purge=false
+    local arg
+    for arg in "${args[@]}"; do
+        [ "$arg" = "--purge" ] && has_purge=true
+    done
+    if [ "$has_purge" != true ]; then
+        local secret_keys
+        secret_keys="$(_run_py remove-secret-check "${args[@]}")" || return $?
+        if [ -n "$secret_keys" ]; then
+            local key_list
+            # Join the newline-delimited key NAMES into a readable, comma-free
+            # single line for the prompt (names only; never values).
+            key_list="$(printf '%s' "$secret_keys" | tr '\n' ' ')"
+            echo "Server has scoped secret(s) in the devbox secret store: ${key_list}" >&2
+            echo "Removing the profile entry will leave these secrets orphaned." >&2
+            if [ -t 0 ] && [ -t 1 ]; then
+                printf 'Also purge the stored secret(s)? [y/N] ' >&2
+                local reply
+                IFS= read -r reply || reply=""
+                case "$reply" in
+                    y|Y|yes|YES) args+=("--purge") ;;
+                    *) echo "Keeping secrets; removing profile entry only." >&2 ;;
+                esac
+            else
+                echo "Re-run with --purge to delete them, or accept they remain." >&2
+            fi
+        fi
+    fi
+
+    if [ "$json" = true ]; then
+        _run_py remove-json "${args[@]}" || return $?
+        _maybe_auto_render "$no_render" true
+        return $?
+    fi
+    _run_py remove-text "${args[@]}" || return $?
+    _maybe_auto_render "$no_render" false
+}
+
+cmd_doctor() {
+    local json=false
+    local -a args=()
+    local a
+    for a in "$@"; do
+        case "$a" in
+            --json) json=true ;;
+            -h|--help) _usage; return 0 ;;
+            *) args+=("$a") ;;
+        esac
+    done
+    if [ "$json" = true ]; then
+        _run_py doctor-json "${args[@]+"${args[@]}"}"
+        return $?
+    fi
+    _run_py doctor-text "${args[@]+"${args[@]}"}"
+}
+
 # Placeholder for subcommands that are planned but not part of this slice.
 # Listing them in --help sets user expectations; invoking them must fail
 # clearly rather than silently no-op.
@@ -629,10 +871,14 @@ main() {
     esac
     shift
     case "$sub" in
-        import) cmd_import "$@" ;;
-        list)   cmd_list "$@" ;;
-        render) cmd_render "$@" ;;
-        doctor|add|install|enable|disable|remove)
+        import)  cmd_import "$@" ;;
+        list)    cmd_list "$@" ;;
+        render)  cmd_render "$@" ;;
+        enable)  cmd_enable "$@" ;;
+        disable) cmd_disable "$@" ;;
+        remove)  cmd_remove "$@" ;;
+        doctor)  cmd_doctor "$@" ;;
+        add|install)
             _not_implemented "$sub"
             ;;
         *)

@@ -78,7 +78,8 @@ Subcommands:
   render      Preview (--dry-run) or re-render devbox-managed entries into
               Claude Code / Codex config. This version supports --dry-run only.
   doctor      Diagnose MCP profile / render / runtime problems.
-  add         Add a new Devbox MCP server from an explicit command spec.
+  add         Record a new Devbox MCP server from an explicit command spec
+              (scope is always an explicit choice; never silent global).
   install     Materialize an existing profile entry into persistent runtime.
   enable      Resume rendering a previously disabled MCP server.
   disable     Keep a definition but stop rendering it.
@@ -145,6 +146,22 @@ Install (materialize) path:
       harvest log is produced immediately; --keep-window leaves it open. On a
       blocked network failure the command points at 'devbox blocked' and shows
       the exact rerun command.
+
+Add (record a new server) path:
+  devbox mcp add <name> [--global|--project <p>] [--no-render] [--json] -- <command spec...>
+      Record a NEW Devbox MCP server straight from a command spec after '--'
+      (e.g. 'npx -y @upstash/context7-mcp@latest', 'uvx my-mcp-tool',
+      'docker run -i --rm -e API_KEY=... image'). The spec is classified and
+      probed like an imported server: a host-only / unknown / remote spec is
+      refused with a clear reason. Scope is ALWAYS explicit (ADR 0013 never
+      silently promotes to global): --global or --project <p> set it
+      non-interactively; in a TTY with no scope flag, the same project picker as
+      the import wizard offers global or any devbox Project (current
+      pre-highlighted); without a TTY and no scope flag it fails with examples.
+      Inline secret env (a Docker '-e KEY=VALUE' whose KEY/VALUE looks like a
+      credential) is written to the scope-correct 0600 secret store; values are
+      never echoed. A successful add auto-renders unless --no-render. Distinct
+      from 'import' (discovers inherited) and 'install' (materializes runtime).
 
 Scope flags (import / list):
   (default)                 Current Project record + global Claude config.
@@ -1393,14 +1410,212 @@ cmd_install() {
     return "$rc"
 }
 
-# Placeholder for subcommands that are planned but not part of this slice.
-# Listing them in --help sets user expectations; invoking them must fail
-# clearly rather than silently no-op.
-_not_implemented() {
-    local sub="$1"
-    echo "'devbox mcp $sub' is planned but not implemented yet." >&2
-    echo "Run 'devbox mcp --help' to see the available commands." >&2
-    return 2
+# =============================================================================
+# add (record a new Devbox MCP server) — ADR 0013 amendment, issue 13
+# =============================================================================
+# `devbox mcp add <name> [--global|--project <p>] -- <command spec...>` records
+# an EXPLICIT new server (distinct from `import`, which discovers inherited
+# ones). Scope is always an explicit decision: a flag sets it non-interactively;
+# in a TTY with no flag the SAME project picker the import wizard uses offers
+# global + every devbox Project (current pre-highlighted); without a TTY and no
+# flag it fails with examples. A picked Project resolves to its absolute host key
+# through issue 11's shared resolver/enumerator — never a bare name.
+
+# True when a resolved project key names an INITIALIZED devbox Project — i.e. it
+# appears in issue 11's volume-gated enumerator (Claude-known AND has a
+# `devbox-<name>-history` volume), the same set the interactive picker offers.
+# Compares the FULL path (not just the basename): two different paths can share
+# a basename, so a basename match would wrongly accept an unrelated path. Both
+# sides are canonicalized with `readlink -f` so a symlink difference between
+# `_resolve_project_key`'s key and Claude's stored record key still matches.
+#   $1  the resolved absolute project key
+_project_target_exists() {
+    local want tname tkey canon
+    want="$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")"
+    while IFS=$'\t' read -r tname tkey; do
+        [ -n "$tkey" ] || continue
+        canon="$(readlink -f "$tkey" 2>/dev/null || printf '%s' "$tkey")"
+        [ "$canon" = "$want" ] && return 0
+    done < <(_run_py project-targets-text)
+    return 1
+}
+
+# Interactive scope picker for `add`: offers a synthetic "global" row first, then
+# every devbox Project (issue 11's enumerator), with the CURRENT directory's
+# Project pre-highlighted when it is among the targets. Prints the resolved
+# scope args (one per line: "--global", or "--project" then the absolute key) on
+# stdout; all interaction is on /dev/tty. Returns non-zero on cancel.
+#   $1  the server name (for the prompt)
+_add_scope_picker() {
+    local name="$1"
+    local targets
+    # Let stderr through so basename collisions are visible (same rationale as
+    # the import wizard's project picker).
+    targets="$(_run_py project-targets-text)"
+
+    # The current directory's Project key, used to pre-highlight its row.
+    local cwd_key
+    cwd_key="$(readlink -f "$PWD" 2>/dev/null || printf '%s' "$PWD")"
+
+    # A sentinel key marks the synthetic global row so _row_key recovers it.
+    local global_key='<global>'
+    local -a menu=()
+    menu+=("$(printf '%-20s' "global")"$'\t'"$global_key")
+
+    # Build the Project rows. The current directory's Project, when present, is
+    # held out as the pre-highlighted FIRST option (passed via --first-option)
+    # rather than added to the menu body, so it is not listed twice (the picker
+    # prepends first-options to the item list).
+    local default_row="" tname tkey
+    while IFS=$'\t' read -r tname tkey; do
+        [ -n "$tkey" ] || continue
+        local row
+        row="$(printf '%-20s' "$tname")"$'\t'"$tkey"
+        if [ "$tkey" = "$cwd_key" ]; then
+            default_row="$row"
+            continue
+        fi
+        menu+=("$row")
+    done <<< "$targets"
+
+    local picked
+    if [ -n "$default_row" ]; then
+        picked="$(printf '%s\n' "${menu[@]}" | picker::one \
+            --prompt "Pick the scope for '$name'" \
+            --header "global, or a devbox Project (current is the default)" \
+            --first-option "$default_row")" \
+            || { echo "No scope chosen for '$name'; nothing added." >&2; return 2; }
+    else
+        picked="$(printf '%s\n' "${menu[@]}" | picker::one \
+            --prompt "Pick the scope for '$name'" \
+            --header "global, or a devbox Project (q to cancel)")" \
+            || { echo "No scope chosen for '$name'; nothing added." >&2; return 2; }
+    fi
+
+    local key
+    key="$(_row_key "$picked")"
+    if [ "$key" = "$global_key" ]; then
+        printf '%s\n' "--global"
+        return 0
+    fi
+    if [ -z "$key" ]; then
+        echo "No scope chosen for '$name'; nothing added." >&2
+        return 2
+    fi
+    printf '%s\n%s\n' "--project" "$key"
+}
+
+cmd_add() {
+    local json=false no_render=false is_global=false
+    local project_token="" name="" saw_dashdash=false
+    local -a spec=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -h|--help) _usage; return 0 ;;
+            --) saw_dashdash=true; shift; spec=("$@"); break ;;
+            --json) json=true ;;
+            --no-render) no_render=true ;;
+            --global) is_global=true ;;
+            --project)
+                shift
+                if [ "$#" -eq 0 ]; then
+                    echo "'mcp add --project' requires a name or path." >&2
+                    return 2
+                fi
+                project_token="$1"
+                ;;
+            --project=*)
+                project_token="${1#--project=}"
+                if [ -z "$project_token" ]; then
+                    echo "'mcp add --project=' requires a non-empty name or path." >&2
+                    return 2
+                fi
+                ;;
+            -*)
+                echo "Unknown flag for 'mcp add': $1" >&2
+                return 2
+                ;;
+            *)
+                if [ -n "$name" ]; then
+                    echo "'mcp add' takes one server name before '--' (got: $1)." >&2
+                    return 2
+                fi
+                name="$1"
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$name" ]; then
+        echo "'mcp add' requires a server name." >&2
+        echo "Usage: devbox mcp add <name> [--global|--project <p>] -- <command spec...>" >&2
+        return 2
+    fi
+    if [ "$is_global" = true ] && [ -n "$project_token" ]; then
+        echo "'mcp add': --global and --project are mutually exclusive." >&2
+        return 2
+    fi
+    if [ "$saw_dashdash" != true ] || [ "${#spec[@]}" -eq 0 ]; then
+        echo "'mcp add' requires a command spec after '--'." >&2
+        echo "Example: devbox mcp add context7 --global -- npx -y @upstash/context7-mcp@latest" >&2
+        return 2
+    fi
+
+    # Resolve the scope into the Python-core scope args. The scope is ALWAYS an
+    # explicit decision (ADR 0013: never silently promote to global).
+    local -a scope_args=()
+    if [ "$is_global" = true ]; then
+        scope_args=("--global")
+    elif [ -n "$project_token" ]; then
+        local key
+        if ! key="$(_resolve_project_key "$project_token")"; then
+            return 2
+        fi
+        # Gate the explicit --project on the SAME criterion the interactive
+        # picker uses: the key must be an INITIALIZED devbox Project (issue 11
+        # enumerator — Claude-known AND existing -history volume). Otherwise add
+        # would write a project profile devbox cannot run (ADR 0013: init the
+        # Project first, then re-run).
+        if ! _project_target_exists "$key"; then
+            echo "'mcp add --project': '$project_token' is not an initialized devbox Project." >&2
+            echo "It must be known to Claude and have a devbox volume; initialize it first, then re-run." >&2
+            return 2
+        fi
+        scope_args=("--project" "$key")
+    elif [ -t 0 ] && [ -t 1 ]; then
+        # Interactive: pick global or a devbox Project (same picker as import).
+        local picker_out picker_rc
+        picker_out="$(_add_scope_picker "$name")"
+        picker_rc=$?
+        if [ "$picker_rc" -ne 0 ]; then
+            return "$picker_rc"
+        fi
+        local line
+        while IFS= read -r line; do
+            [ -n "$line" ] && scope_args+=("$line")
+        done <<< "$picker_out"
+    else
+        echo "Non-interactive 'mcp add' needs an explicit scope." >&2
+        echo "Examples:" >&2
+        echo "  devbox mcp add context7 --global -- npx -y @upstash/context7-mcp@latest" >&2
+        echo "  devbox mcp add myserver --project myapp -- uvx my-mcp-tool" >&2
+        return 2
+    fi
+
+    local py_cmd
+    if [ "$json" = true ]; then
+        py_cmd="add-json"
+    else
+        py_cmd="add-text"
+    fi
+
+    if [ "$json" = true ]; then
+        _run_py "$py_cmd" "${scope_args[@]}" "$name" -- "${spec[@]}" || return $?
+        _maybe_auto_render "$no_render" true
+        return $?
+    fi
+    _run_py "$py_cmd" "${scope_args[@]}" "$name" -- "${spec[@]}" || return $?
+    _maybe_auto_render "$no_render" false
 }
 
 # --- Dispatch ----------------------------------------------------------------
@@ -1423,9 +1638,7 @@ main() {
         remove)  cmd_remove "$@" ;;
         doctor)  cmd_doctor "$@" ;;
         install) cmd_install "$@" ;;
-        add)
-            _not_implemented "$sub"
-            ;;
+        add)     cmd_add "$@" ;;
         *)
             echo "Unknown mcp subcommand: $sub" >&2
             _usage >&2

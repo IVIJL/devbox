@@ -29,6 +29,7 @@ import sys
 from typing import Optional
 
 from . import import_result, inherited_list_result
+from .add import AddError, add_server
 from .apply import (
     ApplyConflictError,
     ScopeOverride,
@@ -1263,6 +1264,102 @@ def _run_wrapper(argv: list[str]) -> int:
         return 1
 
 
+def _cmd_add(argv: list[str], as_json: bool) -> int:
+    """`add-{json,text}`: record a new Devbox MCP server from a command spec.
+
+    Args, in order: ``<scope-flag> <name> -- <command spec...>`` where the
+    scope flag is ``--global`` or ``--project <abs-key>`` (the shell front-end
+    has ALREADY resolved the scope to an explicit decision — this core never
+    defaults a scope). The command spec after ``--`` is the literal launch
+    command. The spec is parsed, classified, and written to the scope-correct
+    profile + secret store. SECRET-FREE output (copied KEY NAMES only).
+    """
+    scope = ""
+    project_key = ""
+    name = ""
+    spec: list[str] = []
+    i = 0
+    saw_dashdash = False
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            saw_dashdash = True
+            spec = argv[i + 1:]
+            break
+        if arg == "--global":
+            scope = "global"
+        elif arg == "--project":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: add --project requires a value\n")
+                return 2
+            scope = "project"
+            project_key = argv[i]
+        elif arg.startswith("--project="):
+            scope = "project"
+            project_key = arg[len("--project="):]
+        elif arg.startswith("-"):
+            sys.stderr.write(f"mcp.cli: add: unknown flag {arg!r}\n")
+            return 2
+        elif not name:
+            name = arg
+        else:
+            sys.stderr.write(
+                f"mcp.cli: add takes one server name before '--' (got {arg!r})\n"
+            )
+            return 2
+        i += 1
+
+    if not name:
+        sys.stderr.write("mcp.cli: add requires a server name\n")
+        return 2
+    if not scope:
+        sys.stderr.write("mcp.cli: add requires a resolved scope (--global/--project)\n")
+        return 2
+    if not saw_dashdash or not spec:
+        sys.stderr.write(
+            "mcp.cli: add requires a command spec after '--'\n"
+        )
+        return 2
+
+    try:
+        override = ScopeOverride(scope=scope, project_key=project_key)
+    except ValueError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 2
+
+    try:
+        result = add_server(name, spec, override)
+    except AddError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 2
+
+    if as_json:
+        return _emit(result.to_dict())
+
+    scope_label = result.scope
+    if result.project_key:
+        scope_label = f"{result.scope} ({result.project_key})"
+    sys.stdout.write(f"Added {result.name}\n")
+    sys.stdout.write(f"  scope    : {scope_label}\n")
+    sys.stdout.write(f"  placement: {result.placement}\n")
+    sys.stdout.write(f"  command  : {' '.join(result.argv)}\n")
+    sys.stdout.write(f"  profile  : {result.profile_path}\n")
+    if result.copied_secret_keys:
+        sys.stdout.write(
+            "  secrets  : stored "
+            f"{', '.join(result.copied_secret_keys)} to {result.secrets_path} "
+            "(values not shown)\n"
+        )
+    else:
+        sys.stdout.write("  secrets  : none stored\n")
+    sys.stdout.write(
+        "\nProfile updated. Agent config (Claude Code / Codex) is written by the "
+        "render step that follows (use --no-render to skip it).\n"
+    )
+    return 0
+
+
 def _cmd_project_targets(argv: list[str], as_json: bool) -> int:
     """`project-targets-{json,text}`: enumerate importable devbox Project targets.
 
@@ -1449,6 +1546,10 @@ def main(argv: list[str]) -> int:
         return _cmd_install(rest, as_json=True)
     if command == "install-text":
         return _cmd_install(rest, as_json=False)
+    if command == "add-json":
+        return _cmd_add(rest, as_json=True)
+    if command == "add-text":
+        return _cmd_add(rest, as_json=False)
     if command == "run":
         # The devbox-mcp-run wrapper core. Args: [--project <key>] <server>.
         return _run_wrapper(rest)

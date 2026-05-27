@@ -216,7 +216,15 @@ In a TTY, `import --apply` opens a guided **wizard**: an `fzf` multi-select of t
 
 Apply otherwise preserves the source scope (a globally-configured server imports global; a project-scoped one imports for that project) — that stays the only behaviour for the **non-interactive** path (explicit `--server`/`--import-id`/`--all-applicable`, or no TTY), with no prompts. Switching a server's scope copies its secrets to the chosen scope's `0600` store. Inherited secret env *values* can be copied into a scoped secret store; the summary reports which env **key names** were copied, never their values. Host-only, unknown, and excluded (remote/hosted) candidates are shown but not applied. A successful apply auto-renders unless you pass `--no-render`.
 
-**2. Add a brand-new devbox MCP server** that was never in a host agent — `devbox mcp add ...` records an explicit new server (distinct from `import`, which discovers inherited ones). You choose its scope explicitly; devbox never silently promotes a new server to global.
+**2. Add a brand-new devbox MCP server** that was never in a host agent — `devbox mcp add <name> -- <command spec>` records an explicit new server (distinct from `import`, which discovers inherited ones, and `install`, which materializes runtime). The spec after `--` is the literal launch command:
+
+```bash
+devbox mcp add context7 --global -- npx -y @upstash/context7-mcp@latest
+devbox mcp add myserver --project myapp -- uvx my-mcp-tool
+devbox mcp add gh --global -- docker run -i --rm -e GITHUB_TOKEN=... ghcr.io/github/github-mcp-server
+```
+
+The spec is classified and probed like an imported server, so a host-only / unknown / remote-connector command is **refused** with a clear reason rather than recorded. Scope is **always an explicit choice** — `--global` or `--project <p>` set it non-interactively; in a TTY with no scope flag you pick from the same project picker the import wizard uses (global, or any initialized devbox Project, with the current one pre-highlighted); without a TTY and no scope flag, add fails with examples. devbox never silently promotes a new server to global. An inline secret env value (a Docker `-e KEY=VALUE` whose name or value looks like a credential) is written to the scope-correct `0600` secret store and never echoed. A successful add auto-renders unless you pass `--no-render`.
 
 ### Profile management
 

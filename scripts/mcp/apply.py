@@ -21,8 +21,9 @@ itself (TTY picker vs ``--server`` / ``--import-id``) is resolved by the caller
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 from .merge import MergedCandidate
 from .profile import (
@@ -41,6 +42,9 @@ from .source_values import read_nonsecret_values, read_secret_values
 
 # Only this placement can be applied in v1 (ADR 0013: Container MCP only).
 APPLICABLE_PLACEMENT = "container"
+
+# Valid override scopes (ADR 0013 amendment: interactive scope override).
+_OVERRIDE_SCOPES = ("global", "project")
 
 # Placeholder the providers substitute for an argv token that carries a
 # credential (see ``mcp.providers.claude._REDACTED``). Such a token cannot be
@@ -163,23 +167,103 @@ class ApplyConflictError(ValueError):
     """
 
 
-def _slot_key(m: MergedCandidate) -> tuple[str, str, str]:
-    """The profile slot a candidate would occupy: (scope, project key, name)."""
-    cand = m.candidate
-    return (cand.source_scope, cand.source_project or "", cand.name)
+@dataclass(frozen=True)
+class ScopeOverride:
+    """An explicit apply target that overrides a candidate's inherited scope.
+
+    ADR 0013 amendment ("Import keeps inherited scope by default, but offers an
+    interactive override"): the apply wizard may redirect a server to a scope
+    other than the one it was discovered in. Two valid shapes:
+
+      * ``scope="global"`` -> write the global profile + global secret store,
+        regardless of the candidate's source scope. ``project_key`` is ignored.
+      * ``scope="project"`` + a non-empty absolute ``project_key`` -> write that
+        Project's profile + that Project's secret store. The key is the absolute
+        host path (the render key), resolved by the project picker / resolver
+        (``mcp.projects``), never a bare sanitized name.
+
+    No override (``None`` passed to the apply functions) preserves today's
+    inherited-scope behavior byte-for-byte. Validated at construction so a
+    malformed override fails before any write.
+    """
+
+    scope: str
+    project_key: str = ""
+
+    def __post_init__(self) -> None:
+        if self.scope not in _OVERRIDE_SCOPES:
+            raise ValueError(
+                f"invalid override scope {self.scope!r}; "
+                f"expected one of {_OVERRIDE_SCOPES}"
+            )
+        if self.scope == "project":
+            if not self.project_key:
+                raise ValueError(
+                    "a project-scope override requires an absolute project key"
+                )
+            # The key must be an ABSOLUTE host path: render uses it verbatim as
+            # the Claude `projects` map key, which Claude keys by absolute path
+            # (ADR 0004). A relative value (e.g. a bare display name like "App")
+            # would write a Project profile that render can never match to a real
+            # Claude record, silently failing to apply the server. Reject it here
+            # so the wizard / `add` picker can only pass a resolved absolute key.
+            if not os.path.isabs(self.project_key):
+                raise ValueError(
+                    "a project-scope override requires an ABSOLUTE project key "
+                    f"(got {self.project_key!r}); pass the resolved host path, "
+                    "not a bare Project name"
+                )
 
 
-def apply_candidate(m: MergedCandidate) -> AppliedServer:
-    """Apply one applicable candidate to the scope-correct profile + secrets.
+def _effective_scope(
+    m: MergedCandidate, override: Optional[ScopeOverride]
+) -> tuple[str, str]:
+    """Resolve the (scope, project_key) an apply will actually write.
 
-    Preserves inherited scope: a global source writes the global profile; a
-    project source writes the Project profile keyed by the source project. Any
-    flagged secret env values are copied into the matching scoped secret store
-    (0600). Returns a secret-free outcome.
+    With no override, the candidate's inherited scope/project is preserved
+    exactly (project_key is "" for global). With an override, the chosen scope
+    wins: global drops any project key; project carries the override's absolute
+    key. This single resolver is used for the slot key, the profile path, and the
+    secret store path so all three stay consistent.
     """
     cand = m.candidate
-    scope = cand.source_scope
-    project_key = cand.source_project or ""
+    if override is None:
+        return (cand.source_scope, cand.source_project or "")
+    if override.scope == "global":
+        return ("global", "")
+    return ("project", override.project_key)
+
+
+def _slot_key(
+    m: MergedCandidate, override: Optional[ScopeOverride] = None
+) -> tuple[str, str, str]:
+    """The profile slot a candidate would occupy: (scope, project key, name).
+
+    Computed from the EFFECTIVE scope (post-override) so the slot-conflict guard
+    fires when two selected candidates collide on the same target after their
+    scopes are overridden — not just on their inherited scopes.
+    """
+    scope, project_key = _effective_scope(m, override)
+    return (scope, project_key, m.candidate.name)
+
+
+def apply_candidate(
+    m: MergedCandidate, override: Optional[ScopeOverride] = None
+) -> AppliedServer:
+    """Apply one applicable candidate to the scope-correct profile + secrets.
+
+    With no override, preserves inherited scope: a global source writes the
+    global profile; a project source writes the Project profile keyed by the
+    source project. With a ``ScopeOverride``, the CHOSEN scope wins instead
+    (ADR 0013 amendment): ``global`` writes the global profile + global secret
+    store; ``project`` + an absolute key writes that Project's profile + that
+    Project's secret store. Either way, any flagged secret env VALUES are copied
+    into the secret store matching the EFFECTIVE scope, so a project->global
+    switch lands the credential in the global store (and vice versa). Returns a
+    secret-free outcome.
+    """
+    cand = m.candidate
+    scope, project_key = _effective_scope(m, override)
 
     # 1. Secret VALUES (in memory only) for the names flagged secret. Every
     #    declared secret key MUST resolve to a value, or we refuse to write an
@@ -195,7 +279,7 @@ def apply_candidate(m: MergedCandidate) -> AppliedServer:
         import_id=m.import_id,
         scope=scope,
         project_key=project_key,
-        profile_path=profile_path(scope, cand.source_project),
+        profile_path=profile_path(scope, project_key or None),
         copied_secret_keys=copied_keys,
     )
 
@@ -234,7 +318,7 @@ def apply_candidate(m: MergedCandidate) -> AppliedServer:
     #    if its save fails, the secret block is rolled back to its PRIOR state
     #    (not merely deleted) so a re-import that fails leaves the existing
     #    server's credentials intact rather than wiping them.
-    s_path = secrets_path(scope, cand.source_project)
+    s_path = secrets_path(scope, project_key or None)
     prior_block = read_server_secrets(s_path, cand.name)
     store_server_secrets(s_path, cand.name, secret_values)
     if secret_values:
@@ -249,23 +333,39 @@ def apply_candidate(m: MergedCandidate) -> AppliedServer:
     return applied
 
 
-def apply_selection(selected: list[MergedCandidate]) -> ApplyResult:
+def apply_selection(
+    selected: list[MergedCandidate],
+    overrides: Optional[dict[str, ScopeOverride]] = None,
+) -> ApplyResult:
     """Apply a list of already-chosen candidates; skip the non-applicable ones.
 
     Applicable (``container``) candidates are written; everything else is
     recorded in ``skipped`` with a reason so the caller's summary stays honest
     rather than silently dropping a selection the user made.
 
+    ``overrides`` is an optional ``import_id -> ScopeOverride`` map (ADR 0013
+    amendment). A candidate listed there is applied to the overridden scope
+    instead of its inherited one; a candidate absent from the map keeps its
+    inherited scope (byte-for-byte the previous behavior). Passing ``None`` /
+    an empty map preserves the inherited scope for everything.
+
     Raises ``ApplyConflictError`` BEFORE writing anything if two applicable
-    selected candidates would occupy the same profile slot (same name+scope with
-    different specs). Writing both would overwrite one entry while reporting both
-    as applied; refusing keeps the profile consistent with the selection.
+    selected candidates would occupy the same EFFECTIVE profile slot (same
+    name+scope+project AFTER any override). Writing both would overwrite one
+    entry while reporting both as applied; refusing keeps the profile consistent
+    with the selection. The guard uses the post-override slot so a conflict
+    introduced by overriding two servers onto the same target is still caught.
     """
-    # Pre-flight: reject same-slot collisions among the applicable selection.
+    overrides = overrides or {}
+
+    # Pre-flight: reject same-slot collisions among the applicable selection,
+    # using the EFFECTIVE (post-override) slot for each candidate.
     by_slot: dict[tuple[str, str, str], list[MergedCandidate]] = {}
     for m in selected:
         if is_applicable(m):
-            by_slot.setdefault(_slot_key(m), []).append(m)
+            by_slot.setdefault(
+                _slot_key(m, overrides.get(m.import_id)), []
+            ).append(m)
     for (scope, project, name), members in by_slot.items():
         if len(members) > 1:
             ids = ", ".join(mm.import_id for mm in members)
@@ -288,7 +388,9 @@ def apply_selection(selected: list[MergedCandidate]) -> ApplyResult:
             )
             continue
         try:
-            result.applied.append(apply_candidate(m))
+            result.applied.append(
+                apply_candidate(m, overrides.get(m.import_id))
+            )
         except MissingSecretsError as exc:
             # Could not recover the promised secret(s): skip rather than write a
             # profile entry the secret store cannot back. Names only — never

@@ -34,6 +34,7 @@ from .candidate import Candidate
 from .classify import classify_candidate
 from .merge import MergedCandidate, merge_candidates
 from . import onboarding
+from .projects import VolumeProbe, enumerate_project_targets
 from .providers import ClaudeProvider, CodexProvider
 from .render import (
     DEVBOX_PREFIX,
@@ -1191,6 +1192,56 @@ def _run_wrapper(argv: list[str]) -> int:
         return 1
 
 
+def _cmd_project_targets(argv: list[str], as_json: bool) -> int:
+    """`project-targets-{json,text}`: enumerate importable devbox Project targets.
+
+    The machine-readable enumerator the import wizard / `mcp add` pickers (issues
+    12-13) drive: the intersection of Claude's project records with existing
+    ``devbox-<name>-history`` marker volumes, plus any basename collisions
+    surfaced for disambiguation. Accepts an optional ``--docker-bin <path>`` so the shell
+    front-end can point the volume probe at a specific docker/podman binary.
+    Output is secret-free directory metadata.
+    """
+    docker_bin = "docker"
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--docker-bin":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: --docker-bin requires a value\n")
+                return 2
+            docker_bin = argv[i]
+        elif arg.startswith("--docker-bin="):
+            docker_bin = arg[len("--docker-bin="):]
+        else:
+            sys.stderr.write(f"mcp.cli: unknown argument {arg!r}\n")
+            return 2
+        i += 1
+
+    probe = VolumeProbe(docker_bin=docker_bin)
+    result = enumerate_project_targets(ClaudeProvider(), probe)
+    if as_json:
+        return _emit(result.to_dict())
+
+    if not result.targets and not result.collisions:
+        sys.stdout.write(
+            "No importable devbox Projects found. A Project must be known to "
+            "Claude AND have an initialized devbox-<name>-history volume.\n"
+        )
+        return 0
+    for t in result.targets:
+        # Tab-separated so the shell picker can split name from absolute path.
+        sys.stdout.write(f"{t.name}\t{t.project_key}\n")
+    for c in result.collisions:
+        sys.stderr.write(
+            f"mcp.cli: project name {c.name!r} is ambiguous "
+            f"({len(c.project_keys)} host paths sanitize to it): "
+            f"{', '.join(c.project_keys)}\n"
+        )
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         sys.stderr.write("mcp.cli: missing command\n")
@@ -1332,6 +1383,10 @@ def main(argv: list[str]) -> int:
         for key in ClaudeProvider().project_keys():
             sys.stdout.write(key + "\n")
         return 0
+    if command == "project-targets-json":
+        return _cmd_project_targets(rest, as_json=True)
+    if command == "project-targets-text":
+        return _cmd_project_targets(rest, as_json=False)
     if command == "onboarding-status":
         # One-time MCP onboarding eligibility (issue 10). The install/update
         # shell hook reads this to decide whether to offer the import wizard.

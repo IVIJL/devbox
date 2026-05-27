@@ -34,6 +34,13 @@ from .candidate import Candidate
 from .classify import classify_candidate
 from .merge import MergedCandidate, merge_candidates
 from .providers import ClaudeProvider, CodexProvider
+from .render import (
+    DEVBOX_PREFIX,
+    WRAPPER_COMMAND,
+    AgentPlan,
+    RenderPlan,
+    build_render_plan,
+)
 
 
 def _emit(payload: dict) -> int:
@@ -482,6 +489,105 @@ def _render_applicable_list(merged: list[MergedCandidate]) -> int:
     return 0
 
 
+def _render_agent_text(plan: AgentPlan) -> None:
+    """Human-readable render preview for one agent (SECRET-FREE).
+
+    Shows the planned devbox-managed entries (their prefixed name and the WRAPPER
+    command they call — never the raw MCP command, never a secret value), and
+    separates existing agent entries by ownership so the re-render contract is
+    visible: devbox would replace only its own ``devbox-`` entries and leave
+    inherited/manual entries untouched.
+    """
+    sys.stdout.write(f"\n{plan.agent} ({plan.config_path})\n")
+    if not plan.supported:
+        sys.stdout.write(f"  unsupported: {plan.unsupported_reason}\n")
+        return
+
+    if plan.planned:
+        sys.stdout.write("  planned devbox-managed entries:\n")
+        for entry in plan.planned:
+            scope_label = entry.scope
+            if entry.project_key:
+                scope_label = f"{entry.scope} ({entry.project_key})"
+            sys.stdout.write(f"    {entry.rendered_name}\n")
+            sys.stdout.write(f"      scope  : {scope_label}\n")
+            # The WRAPPER call, not the raw MCP command.
+            sys.stdout.write(f"      command: {' '.join(entry.argv)}\n")
+            if entry.env_keys:
+                # NAMES only — never values.
+                sys.stdout.write(f"      env    : {', '.join(entry.env_keys)}\n")
+            if entry.secret_env_keys:
+                sys.stdout.write(
+                    "      secrets: "
+                    f"{', '.join(entry.secret_env_keys)} (values not shown)\n"
+                )
+    else:
+        sys.stdout.write("  planned devbox-managed entries: none\n")
+
+    if plan.managed_existing:
+        sys.stdout.write(
+            "  existing devbox-managed (would be replaced on render): "
+            f"{', '.join(plan.managed_existing)}\n"
+        )
+    if plan.inherited_existing:
+        sys.stdout.write(
+            "  inherited/manual entries (never modified): "
+            f"{', '.join(plan.inherited_existing)}\n"
+        )
+
+
+def _render_plan_text(plan: RenderPlan) -> int:
+    """Human-readable dry-run render report across Claude Code and Codex.
+
+    SECRET-FREE: only env-variable NAMES and the wrapper command ever appear.
+    """
+    # Even with no enabled profile servers, a re-render still has work to do if
+    # the agent config carries stale devbox-managed entries: it would REMOVE
+    # them. Hiding that behind an early "nothing to render" message would make
+    # stale-entry cleanup invisible, so only short-circuit when there is also
+    # nothing managed to clean up in either agent.
+    has_stale_managed = bool(
+        plan.claude.managed_existing or plan.codex.managed_existing
+    )
+    # An UNSUPPORTED agent (e.g. Codex with no TOML parser) is itself reportable
+    # status: short-circuiting would hide that devbox could not even inspect that
+    # agent's config for stale entries. Only print the empty short-circuit when
+    # every agent is supported AND there is nothing to render or clean up.
+    any_unsupported = not plan.claude.supported or not plan.codex.supported
+    if not plan.servers and not has_stale_managed and not any_unsupported:
+        sys.stdout.write(
+            "No enabled MCP profile servers to render, and no devbox-managed "
+            "entries to clean up. Import or add servers first "
+            "(see 'devbox mcp import').\n"
+        )
+        return 0
+
+    if plan.servers:
+        sys.stdout.write(
+            f"Render preview for {len(plan.servers)} enabled MCP profile "
+            "server(s).\n"
+        )
+    else:
+        sys.stdout.write(
+            "No enabled MCP profile servers; a re-render would REMOVE the "
+            "stale devbox-managed entries shown below.\n"
+        )
+    sys.stdout.write(
+        f"Rendered names are '{DEVBOX_PREFIX}' prefixed and call the wrapper "
+        f"'{WRAPPER_COMMAND} <server>'.\n"
+    )
+
+    _render_agent_text(plan.claude)
+    _render_agent_text(plan.codex)
+
+    sys.stdout.write(
+        "\nDry-run only: no Claude Code or Codex config was modified.\n"
+        "Re-render replaces only devbox-managed (devbox-) entries; "
+        "inherited/manual entries are never touched.\n"
+    )
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         sys.stderr.write("mcp.cli: missing command\n")
@@ -529,6 +635,24 @@ def main(argv: list[str]) -> int:
         if scope is None:
             return 2
         return _render_applicable_list(_discover(scope))
+    if command in ("render-json", "render-text"):
+        # Render preview reuses the scope flags only to scope WHICH project
+        # profiles to read. ``--project`` selects explicit project keys; with no
+        # project flags, every project profile is previewed (the full
+        # devbox-managed render surface). ``--all`` / ``--no-global`` are not
+        # meaningful for a profile-driven preview and are rejected.
+        scope = _parse_scope(rest)
+        if scope is None:
+            return 2
+        if scope.all_projects or not scope.include_global:
+            sys.stderr.write(
+                "mcp.cli: render preview does not accept --all or --no-global\n"
+            )
+            return 2
+        plan = build_render_plan(scope.project_keys or None)
+        if command == "render-json":
+            return _emit(plan.to_dict())
+        return _render_plan_text(plan)
     if command == "project-keys":
         # Emit known Claude project record keys, one per line. These are
         # directory paths (Claude's own map keys) — not secret. Used by the

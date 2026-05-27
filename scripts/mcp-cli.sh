@@ -67,7 +67,8 @@ Subcommands:
               them as import candidates (dry-run; no writes).
   list        Show the effective MCP profile (use --inherited for detected
               Inherited MCP servers only).
-  render      Re-render devbox-managed entries into Claude Code / Codex config.
+  render      Preview (--dry-run) or re-render devbox-managed entries into
+              Claude Code / Codex config. This version supports --dry-run only.
   doctor      Diagnose MCP profile / render / runtime problems.
   add         Add a new Devbox MCP server from an explicit command spec.
   install     Materialize an existing profile entry into persistent runtime.
@@ -78,6 +79,13 @@ Subcommands:
 Read-only commands in this version:
   devbox mcp import [scope] [--json]            Dry-run discovery report.
   devbox mcp list --inherited [scope] [--json]  Detected Inherited MCP servers.
+  devbox mcp render --dry-run [--project <p>] [--json]
+      Preview the Claude Code / Codex config devbox would render from the
+      profile. Rendered names are 'devbox-' prefixed and call the wrapper
+      'devbox-mcp-run <server>' (never the raw command, never secret values).
+      Re-render would replace only devbox-managed entries; inherited/manual
+      agent MCP entries are never modified. Codex is previewed against its
+      verified TOML shape, or reported unsupported when no TOML parser exists.
 
 Apply (write) path:
   devbox mcp import --apply [scope]             Apply selected candidates.
@@ -486,6 +494,67 @@ cmd_list() {
     _run_py list-inherited-text "${scope_args[@]}"
 }
 
+cmd_render() {
+    # Render preview (issue 06): dry-run ONLY. This slice reports the planned
+    # Claude Code / Codex config without writing anything. The real write path
+    # (and the devbox-mcp-run wrapper) is a later issue, so a bare
+    # `devbox mcp render` (apply) is rejected with a clear message.
+    local dry_run=false
+    local json=false
+    local -a projects=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --dry-run) dry_run=true ;;
+            --json) json=true ;;
+            --project)
+                shift
+                if [ "$#" -eq 0 ]; then
+                    echo "'mcp render --project' requires a name or path." >&2
+                    return 2
+                fi
+                projects+=("$1")
+                ;;
+            --project=*) projects+=("${1#--project=}") ;;
+            -h|--help) _usage; return 0 ;;
+            -*)
+                echo "Unknown flag for 'mcp render': $1" >&2
+                return 2
+                ;;
+            *)
+                echo "Unexpected argument for 'mcp render': $1" >&2
+                return 2
+                ;;
+        esac
+        shift
+    done
+
+    if [ "$dry_run" != true ]; then
+        echo "'devbox mcp render' (apply) is planned but not implemented yet." >&2
+        echo "Use 'devbox mcp render --dry-run' to preview planned config." >&2
+        return 2
+    fi
+
+    # Resolve explicit --project tokens to Claude record keys; render then reads
+    # the matching project profile(s). With no --project, every project profile
+    # is previewed. --all/--no-global are not meaningful here.
+    local -a scope_args=()
+    if [ "${#projects[@]}" -gt 0 ]; then
+        local token key
+        for token in "${projects[@]}"; do
+            if ! key="$(_resolve_project_key "$token")"; then
+                return 1
+            fi
+            scope_args+=("--project" "$key")
+        done
+    fi
+
+    if [ "$json" = true ]; then
+        _run_py render-json "${scope_args[@]+"${scope_args[@]}"}"
+        return $?
+    fi
+    _run_py render-text "${scope_args[@]+"${scope_args[@]}"}"
+}
+
 # Placeholder for subcommands that are planned but not part of this slice.
 # Listing them in --help sets user expectations; invoking them must fail
 # clearly rather than silently no-op.
@@ -510,7 +579,8 @@ main() {
     case "$sub" in
         import) cmd_import "$@" ;;
         list)   cmd_list "$@" ;;
-        render|doctor|add|install|enable|disable|remove)
+        render) cmd_render "$@" ;;
+        doctor|add|install|enable|disable|remove)
             _not_implemented "$sub"
             ;;
         *)

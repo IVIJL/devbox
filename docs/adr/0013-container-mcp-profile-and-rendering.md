@@ -222,3 +222,71 @@ messages.
 - `devbox mcp doctor` with placement explanations and firewall guidance.
 - Optional repo-local MCP metadata if a team later wants shared non-secret
   recommendations.
+
+## Updates 2026-05-27 — interactive import wizard, scope override, and devbox-project resolution
+
+The first implementation (issues 01–10) shipped import-preserves-scope and a
+minimal numeric apply picker. Hands-on use surfaced two gaps that this
+amendment resolves. They are tracked as issues 11–13.
+
+### Import keeps inherited scope by default, but offers an interactive override
+
+The original decision was that import *preserves* the inherited scope (global
+source → global profile, project source → Project profile). That stays the
+**default and the only non-interactive behavior**. In an interactive TTY, the
+apply wizard now additionally lets the user **override the scope per server**:
+a binary toggle in both directions (project ↔ global). Non-interactive
+`--apply` (explicit `--server`/`--import-id`, or no TTY) keeps the
+preserve-inherited behavior unchanged — no new CI flags. Scoped secrets follow
+the *chosen* scope: switching to global copies the secret value into the
+global secret store, switching to project into that Project's store.
+
+Rationale: global MCP is a deliberate user choice (ADR 0013 already refused
+silent promotion). An interactive override gives that choice without breaking
+the deterministic non-interactive contract.
+
+### The wizard lives behind `--apply`, not on the dry-run preview
+
+`devbox mcp import` without `--apply` stays a **read-only dry-run preview**
+(unchanged). The interactive fzf wizard runs only on `devbox mcp import
+[--all] --apply` in a TTY. This preserves the "I can run import and nothing
+happens" guarantee; writes still require `--apply`.
+
+Wizard flow: fzf multi-select over the in-scope Container-safe candidates
+(falls back to the existing numeric menu when `fzf` is absent) → per selected
+server a scope toggle → a project picker **whenever the resulting scope is
+project** (source project pre-highlighted; for global→project there is no
+default, the user picks). Servers are then applied **continue-on-error**: each
+failure (missing secret value, slot conflict) is collected and reported in a
+final summary, and a **single** auto-render runs over the successfully applied
+servers.
+
+### A picked devbox Project resolves to its host path via Claude's project records
+
+Project-scoped profile entries must be keyed by the **absolute host path**,
+because rendering writes into Claude Code's `~/.claude.json` `projects` map,
+which is keyed by absolute path; a bare sanitized **Project** name is
+insufficient (two host paths can sanitize to the same name — see ADR 0005).
+
+There is no devbox-side registry of Project → host path. The authoritative
+source is **Claude's own `projects` map**: it stores every absolute path Claude
+has worked with, and because each Project is bind-mounted at its literal host
+path (ADR 0004), that path is valid both on the host and inside the
+**Container**. The project picker therefore offers the **intersection**:
+Claude project records whose corresponding `devbox-<name>-claude` volume
+exists. This guarantees both a usable host path (from Claude) and that the
+target is a real devbox **Project** that can actually run the server (from the
+volume). A directory Claude knows but devbox has not initialized is *not*
+offered — the user initializes it first and re-runs import. Basename
+collisions are surfaced for explicit disambiguation, never silently guessed
+(the existing `_resolve_project_key` behavior).
+
+### `devbox mcp add` is now scheduled and shares the resolver/picker
+
+`add` (decisions 11 and 17 in `local-plan-mcp.md`) was advertised in help/README
+but never implemented by issues 01–10 — a documentation/behavior gap. It is now
+scheduled as issue 13. Its interactive scope selection reuses the **same**
+project picker and host-path resolver as the import wizard (global, or pick any
+devbox Project with the current one pre-highlighted); `--project <name>`
+resolves through the shared resolver. The `add`/`status` help text is corrected
+to match reality as part of that work.

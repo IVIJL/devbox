@@ -18,6 +18,7 @@ from .candidate import (
     import_result,
     inherited_list_result,
 )
+from .classify import classify, classify_candidate
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -26,4 +27,6 @@ __all__ = [
     "Command",
     "import_result",
     "inherited_list_result",
+    "classify",
+    "classify_candidate",
 ]

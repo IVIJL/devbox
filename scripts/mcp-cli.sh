@@ -313,9 +313,10 @@ cmd_list() {
         return $?
     fi
 
-    # Reuse the import text renderer for the human-readable inherited view —
-    # same candidate shape, same scope, no writes.
-    _run_py import-text "${scope_args[@]}"
+    # Readable inherited table (issue 04): provider, scope, status/placement,
+    # runtime, and source columns. Same candidate shape and scope as import,
+    # no writes.
+    _run_py list-inherited-text "${scope_args[@]}"
 }
 
 # Placeholder for subcommands that are planned but not part of this slice.

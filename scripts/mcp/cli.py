@@ -30,6 +30,7 @@ from typing import Optional
 
 from . import import_result, inherited_list_result
 from .candidate import Candidate
+from .classify import classify_candidate
 from .merge import MergedCandidate, merge_candidates
 from .providers import ClaudeProvider, CodexProvider
 
@@ -95,6 +96,12 @@ def _discover(scope: _Scope) -> list[MergedCandidate]:
             all_projects=scope.all_projects,
         )
     )
+    # Evidence-based classification (issue 04). Providers leave non-excluded
+    # candidates as ``unknown``; the classifier assigns the real placement /
+    # confidence / reasons here, before merge, so the identity-merge step and
+    # both output paths (text + JSON) all see the classified result.
+    for cand in raw:
+        classify_candidate(cand)
     return merge_candidates(raw)
 
 
@@ -110,18 +117,31 @@ def _render_text(merged: list[MergedCandidate]) -> int:
         sys.stdout.write("No Inherited MCP servers detected in the selected scope.\n")
         return 0
 
-    importable = [
-        m for m in merged if m.candidate.classification.placement != "excluded"
-    ]
-    excluded = [
-        m for m in merged if m.candidate.classification.placement == "excluded"
-    ]
+    # v1 supports Container MCP servers only (ADR 0013). After classification,
+    # only ``container`` candidates are actually importable; ``host-only`` and
+    # ``unknown`` are detected and shown for visibility but are NOT importable
+    # in v1, and ``excluded`` (remote/hosted connectors) cannot be imported at
+    # all. The summary must reflect that split rather than calling every
+    # non-excluded candidate importable.
+    def _placement(m: MergedCandidate) -> str:
+        return m.candidate.classification.placement
+
+    container = [m for m in merged if _placement(m) == "container"]
+    host_only = [m for m in merged if _placement(m) == "host-only"]
+    unknown = [m for m in merged if _placement(m) == "unknown"]
+    excluded = [m for m in merged if _placement(m) == "excluded"]
     conflicts = [m for m in merged if m.conflict]
 
     summary = (
         f"Discovered {len(merged)} Inherited MCP server(s) "
-        f"({len(importable)} importable, {len(excluded)} excluded"
+        f"({len(container)} importable (container)"
     )
+    if host_only:
+        summary += f", {len(host_only)} host-only"
+    if unknown:
+        summary += f", {len(unknown)} unknown"
+    if excluded:
+        summary += f", {len(excluded)} excluded"
     if conflicts:
         summary += f", {len(conflicts)} in conflict"
     summary += "):\n"
@@ -157,11 +177,114 @@ def _render_text(merged: list[MergedCandidate]) -> int:
                 "    conflict : same name+scope as a different spec; "
                 f"choose by import id ({', '.join(m.conflict_with)})\n"
             )
-        if cand.classification.placement == "excluded":
-            reason = "; ".join(cand.classification.reasons) or "unsupported"
-            sys.stdout.write(f"    excluded : {reason}\n")
+        # Classification (issue 04): placement + confidence for every candidate,
+        # plus the evidence reasons that justify it. Secret-safe — reasons only
+        # ever name env keys, never their values.
+        cls = cand.classification
+        confidence = f"/{cls.confidence}" if cls.confidence else ""
+        sys.stdout.write(f"    placement: {cls.placement}{confidence}\n")
+        for reason in cls.reasons:
+            sys.stdout.write(f"    reason   : {reason}\n")
     sys.stdout.write(
         "\nDry-run only: no MCP profile or agent config was modified.\n"
+    )
+    return 0
+
+
+def _runtime_label(cand: Candidate) -> str:
+    """Coarse runtime family for the inherited table's RUNTIME column.
+
+    Derived from argv[0] only (the launcher), never from secret-bearing args.
+    """
+    if not cand.command.argv:
+        return "-"
+    base = cand.command.argv[0].rsplit("/", 1)[-1].lower()
+    node = {"npx", "npm", "pnpm", "yarn", "bunx", "node"}
+    python = {"uvx", "uv", "python", "python3", "pipx"}
+    docker = {"docker", "podman"}
+    if base in node:
+        return "node"
+    if base in python:
+        return "python"
+    if base in docker:
+        return "docker"
+    return base or "-"
+
+
+def _render_inherited_table(merged: list[MergedCandidate]) -> int:
+    """Readable table of Inherited MCP candidates (issue 04 list --inherited).
+
+    Columns: NAME, PROVIDER, SCOPE, STATUS (placement/confidence, plus a
+    ``(conflict)`` marker when the merge step flagged competing specs in the
+    same name+scope slot), RUNTIME, SOURCE (plan question 22). The PROVIDER and
+    SOURCE columns preserve the full merged provenance: every contributing
+    provider and every config path are shown, not just the first, so a server
+    discovered by both Claude Code and Codex is not silently reduced to one.
+
+    Secret-safe: every column is derived from non-secret identity metadata —
+    env-variable values never appear; SOURCE shows the config file path(s) the
+    candidate was discovered in.
+    """
+    if not merged:
+        sys.stdout.write(
+            "No Inherited MCP servers detected in the selected scope.\n"
+        )
+        return 0
+
+    any_conflict = any(m.conflict for m in merged)
+
+    rows: list[tuple[str, str, str, str, str, str]] = []
+    for m in merged:
+        cand = m.candidate
+        scope_label = cand.source_scope
+        if cand.source_project:
+            scope_label = f"{scope_label}:{cand.source_project.rsplit('/', 1)[-1]}"
+        cls = cand.classification
+        status = cls.placement
+        if cls.confidence:
+            status = f"{cls.placement}/{cls.confidence}"
+        # A conflict means another candidate shares this name+scope with a
+        # different spec; the user must choose between import IDs (issue 05).
+        # The import text and JSON views already expose this — keep the table
+        # honest about it too rather than showing two identical-looking rows.
+        if m.conflict:
+            status = f"{status} (conflict)"
+        # Preserve all merged sources, not just the first: a server discovered
+        # by multiple providers carries one source per provider/path.
+        sources = (
+            "; ".join(f"{s.provider}:{s.source_path}" for s in m.sources)
+            or cand.source_path
+        )
+        rows.append(
+            (
+                cand.name,
+                ", ".join(m.providers),
+                scope_label,
+                status,
+                _runtime_label(cand),
+                sources,
+            )
+        )
+
+    headers = ("NAME", "PROVIDER", "SCOPE", "STATUS", "RUNTIME", "SOURCE")
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def _fmt(cells: tuple[str, ...]) -> str:
+        return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells)).rstrip()
+
+    sys.stdout.write(_fmt(headers) + "\n")
+    for row in rows:
+        sys.stdout.write(_fmt(row) + "\n")
+    if any_conflict:
+        sys.stdout.write(
+            "\nA (conflict) row shares its name+scope with a different spec; "
+            "use the import view's import IDs to choose between them.\n"
+        )
+    sys.stdout.write(
+        "\nInherited MCP servers only (read-only); no profile was written.\n"
     )
     return 0
 
@@ -183,6 +306,11 @@ def main(argv: list[str]) -> int:
         if scope is None:
             return 2
         return _render_text(_discover(scope))
+    if command == "list-inherited-text":
+        scope = _parse_scope(rest)
+        if scope is None:
+            return 2
+        return _render_inherited_table(_discover(scope))
     if command == "list-inherited-json":
         scope = _parse_scope(rest)
         if scope is None:

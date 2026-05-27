@@ -273,10 +273,14 @@ source is **Claude's own `projects` map**: it stores every absolute path Claude
 has worked with, and because each Project is bind-mounted at its literal host
 path (ADR 0004), that path is valid both on the host and inside the
 **Container**. The project picker therefore offers the **intersection**:
-Claude project records whose corresponding `devbox-<name>-claude` volume
-exists. This guarantees both a usable host path (from Claude) and that the
-target is a real devbox **Project** that can actually run the server (from the
-volume). A directory Claude knows but devbox has not initialized is *not*
+Claude project records whose corresponding per-project devbox volume exists.
+The marker volume is the canonical `devbox-<name>-history` volume (one of the
+`DEVBOX_PROJECT_VOLUME_SUFFIXES` in `lib/naming.sh`, created unconditionally
+for every Project), **not** `devbox-<name>-claude` — the latter is a legacy
+volume that `docker-run.sh` now removes as stale (`~/.claude` is bind-mounted
+directly), so gating on it would match nothing. This guarantees both a usable
+host path (from Claude) and that the target is a real devbox **Project** that
+can actually run the server (from the volume). A directory Claude knows but devbox has not initialized is *not*
 offered — the user initializes it first and re-runs import. Basename
 collisions are surfaced for explicit disambiguation, never silently guessed
 (the existing `_resolve_project_key` behavior).

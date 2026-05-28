@@ -58,28 +58,33 @@ iptables -A OUTPUT -o lo -j ACCEPT
 # Create ipset with CIDR support
 ipset create "$IPSET_NAME" hash:net
 
-# Fetch GitHub meta information and aggregate + add their IP ranges
+# Fetch GitHub meta information and aggregate + add their IP ranges.
+# Non-fatal: the GitHub IPs are only needed for git/gh operations against
+# github.com from inside the container — the container itself boots fine
+# without them. Failure here (anonymous rate limit on api.github.com,
+# network issue, malformed response) prints a warning and skips the
+# ipset prefill so the container can still start. Run
+# `sudo devbox-firewall-reload` once GitHub is reachable again to
+# populate the ipset retroactively.
 echo "Fetching GitHub IP ranges..."
-gh_ranges=$(curl -s https://api.github.com/meta)
+GITHUB_IPS_LOADED=0
+gh_ranges=$(curl -s --max-time 10 https://api.github.com/meta || true)
 if [ -z "$gh_ranges" ]; then
-    echo "ERROR: Failed to fetch GitHub IP ranges"
-    exit 1
+    echo "WARNING: Failed to fetch GitHub IP ranges — git/gh against github.com will fail until firewall reload"
+elif ! echo "$gh_ranges" | jq -e '.web and .api and .git' >/dev/null 2>&1; then
+    echo "WARNING: GitHub API response missing required fields (likely anonymous rate limit on shared public IP) — git/gh against github.com will fail until firewall reload"
+else
+    echo "Processing GitHub IPs..."
+    while read -r cidr; do
+        if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+            echo "WARNING: Invalid CIDR range from GitHub meta: $cidr (skipped)"
+            continue
+        fi
+        echo "Adding GitHub range $cidr"
+        ipset add "$IPSET_NAME" "$cidr"
+    done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q)
+    GITHUB_IPS_LOADED=1
 fi
-
-if ! echo "$gh_ranges" | jq -e '.web and .api and .git' >/dev/null; then
-    echo "ERROR: GitHub API response missing required fields"
-    exit 1
-fi
-
-echo "Processing GitHub IPs..."
-while read -r cidr; do
-    if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-        echo "ERROR: Invalid CIDR range from GitHub meta: $cidr"
-        exit 1
-    fi
-    echo "Adding GitHub range $cidr"
-    ipset add "$IPSET_NAME" "$cidr"
-done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q)
 
 # =============================================================================
 # Allowed domains — all resolved dynamically via dnsmasq
@@ -197,11 +202,19 @@ else
     echo "Firewall verification passed - unable to reach https://www.google.com as expected"
 fi
 
-if ! curl --connect-timeout 5 https://api.github.com/zen >/dev/null 2>&1; then
-    echo "ERROR: Firewall verification failed - unable to reach https://api.github.com"
-    exit 1
+# Only assert GitHub reachability if the meta fetch above actually
+# populated the ipset. When the fetch was skipped (rate limit / network),
+# api.github.com is *expected* to be blocked by the catch-all REJECT, so
+# the positive assertion would always fail.
+if [ "$GITHUB_IPS_LOADED" -eq 1 ]; then
+    if ! curl --connect-timeout 5 https://api.github.com/zen >/dev/null 2>&1; then
+        echo "ERROR: Firewall verification failed - unable to reach https://api.github.com"
+        exit 1
+    else
+        echo "Firewall verification passed - able to reach https://api.github.com as expected"
+    fi
 else
-    echo "Firewall verification passed - able to reach https://api.github.com as expected"
+    echo "Firewall verification skipped for GitHub - IPs not loaded (run sudo devbox-firewall-reload once GitHub is reachable)"
 fi
 
 # DNS pinning check — external resolvers must be unreachable so every

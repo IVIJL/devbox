@@ -162,6 +162,31 @@ _Avoid_: existing MCP server, user MCP server
 An **MCP server** that devbox has explicitly added to a **MCP profile**.
 _Avoid_: managed MCP server
 
+**MCP broker**:
+A long-running process, run as the **devbox-mcp** account, that spawns
+**Container MCP servers** on demand and injects their credentials. Started by
+the entrypoint root phase before the privilege drop, so the agent cannot launch
+or read it. See ADR 0014.
+
+**MCP relay**:
+The `devbox-mcp-run` command rendered into agent config. Runs as the agent user,
+connects to the **MCP broker**'s socket, and proxies stdio for one server; it
+never sees credential values.
+_Avoid_: MCP wrapper (the rendered command relays to the broker; it no longer
+launches the server directly)
+
+**devbox-mcp**:
+The unprivileged Container service account that runs **Container MCP servers**
+and is the only non-root identity allowed to read the **MCP secret store**.
+Distinct from the agent user (`node`).
+_Avoid_: MCP user, mcp-runner
+
+**MCP secret store**:
+The credential values for **MCP servers**, kept host-side and delivered to the
+**MCP broker** only — never readable by the agent user inside the **Container**.
+The **MCP profile** is secret-free and references these by name.
+_Avoid_: MCP credentials file, secrets config
+
 ### Project / container
 
 **Project**:
@@ -216,6 +241,12 @@ _Avoid_: identity sentinel, container marker, devbox marker file
 - An **Inherited MCP server** is not automatically a **Devbox MCP server**.
   Devbox first classifies it and proposes how it should enter the **MCP
   profile**.
+- The **MCP broker** runs **Container MCP servers** as **devbox-mcp**; the
+  agent reaches them only through an **MCP relay**, so credentials in the **MCP
+  secret store** never enter the agent user's reach (ADR 0014).
+- The **MCP profile** is delivered into the **Container** live (read-only mount);
+  the **MCP secret store** is staged privately for **devbox-mcp** and refreshed
+  into a running **Container** by `devbox mcp reload`, not by a restart.
 
 ## Example dialogue
 

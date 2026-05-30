@@ -65,9 +65,76 @@ if [ "$(id -u)" = "0" ]; then
     # is LDH-sanitised upstream per ADR 0005, but defence-in-depth keeps
     # any future relaxation of the sanitiser from producing malformed JSON).
     mkdir -p /etc/devbox
-    jq -n --arg project "${DEVBOX_PROJECT_NAME:-unknown}" '{project: $project}' \
+    # projectKey is the FULL host-path key for this Container's Project (ADR
+    # 0014 issue 15): the MCP broker uses it to bind Project-scoped requests to
+    # exactly this Container, defeating a basename collision between two Projects
+    # (e.g. /work/a/api vs /work/b/api). It is the same absolute host path
+    # docker-run.sh mounts the project at and exports as DEVBOX_PROJECT_HOST_PATH
+    # — non-secret identity metadata. Absent for non-project invocations; the
+    # broker then falls back to the (weaker) Project-name guard. Emitted only
+    # when set so existing identity-file readers ignoring it are unaffected.
+    jq -n \
+        --arg project "${DEVBOX_PROJECT_NAME:-unknown}" \
+        --arg projectKey "${DEVBOX_PROJECT_HOST_PATH:-}" \
+        '{project: $project} + (if $projectKey == "" then {} else {projectKey: $projectKey} end)' \
         > /etc/devbox/identity.json
     chmod 0644 /etc/devbox/identity.json
+
+    # Container MCP broker (ADR 0014, issue 15). Start the always-on broker as
+    # the dedicated unprivileged `devbox-mcp` account BEFORE dropping PID 1 to
+    # node, so MCP servers run behind a UID boundary the agent cannot cross.
+    #
+    # The drop MUST reset the full credential set, not just the UID:
+    #   --reuid alone would leave the broker with root's GID and supplementary
+    #   groups, re-exposing group-readable root-owned files — the opposite of
+    #   what a credential-isolation component needs. --regid devbox-mcp
+    #   --init-groups sets the primary group to devbox-mcp and reinitialises
+    #   supplementary groups from /etc/group for that account, so the broker
+    #   holds ONLY devbox-mcp's own groups (ADR 0014). Owned by devbox-mcp, the
+    #   broker is unsignalable / unptraceable by node.
+    #
+    # The socket dir is created here (root) and handed to devbox-mcp so the
+    # broker can create its socket; it lives OUTSIDE any 0700 secret dir
+    # (connecting exposes only a stdio pipe, no credential). 0750 group-owned
+    # devbox-mcp lets node (a member of the devbox-mcp group) traverse to the
+    # socket without granting world access. The broker always runs, even with no
+    # profile, so a server imported into a running Container works next session.
+    #
+    # The PRIVATE staged secret dir is created 0700 devbox-mcp:devbox-mcp — node
+    # cannot traverse it. It is EMPTY in this issue (issue 16 stages per-server
+    # secrets here, root-side, into 0400 devbox-mcp files); the broker reads
+    # secret VALUES only from here, never from the node-owned profile mount, so a
+    # secret-declaring server cleanly reports missing env until issue 16.
+    if id devbox-mcp >/dev/null 2>&1; then
+        install -d -o devbox-mcp -g devbox-mcp -m 0750 /run/devbox-mcp
+        install -d -o devbox-mcp -g devbox-mcp -m 0700 /run/devbox-mcp/secrets
+        # setpriv switches credentials but PRESERVES the (root) environment, so
+        # the broker — and every MCP server it spawns as devbox-mcp — would
+        # otherwise inherit root's HOME and npm settings and try to write under
+        # node-owned/root-owned paths. `env -i` starts from a clean slate and we
+        # set exactly devbox-mcp's runtime env:
+        #   * HOME + npm/npx cache under devbox-mcp's own writable HOME, so
+        #     on-demand `npx` MCP servers run under the service account;
+        #   * XDG_CONFIG_HOME -> the bind-mounted host MCP PROFILE so
+        #     mcp.profile.config_root() reads the same (secret-free) store the
+        #     host writes — NOT an empty store under devbox-mcp's HOME;
+        #   * DEVBOX_MCP_SECRETS_DIR -> the private staged secret dir above, the
+        #     ONLY place the broker reads secret VALUES from;
+        #   * a minimal PATH including npm-global bin (npx/node) + system dirs.
+        setpriv --reuid=devbox-mcp --regid=devbox-mcp --init-groups \
+            -- env -i \
+                HOME=/home/devbox-mcp \
+                USER=devbox-mcp \
+                LOGNAME=devbox-mcp \
+                XDG_CONFIG_HOME=/home/node/.config \
+                DEVBOX_MCP_SECRETS_DIR=/run/devbox-mcp/secrets \
+                npm_config_cache=/home/devbox-mcp/.npm \
+                XDG_CACHE_HOME=/home/devbox-mcp/.cache \
+                PATH=/usr/local/share/npm-global/bin:/usr/local/bin:/usr/bin:/bin \
+                /usr/local/bin/devbox-mcp-broker &
+    else
+        echo "devbox: WARNING: devbox-mcp account missing; MCP broker not started." >&2
+    fi
 
     exec setpriv --reuid=node --regid=node --init-groups -- "$0" "$@"
 fi

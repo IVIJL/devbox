@@ -68,6 +68,34 @@ def project_name() -> Optional[str]:
     return str(name) if isinstance(name, str) and name else None
 
 
+def project_key() -> Optional[str]:
+    """The active Project's FULL host-path key from the identity file, or None.
+
+    ADR 0014 issue 15: the broker serves only THIS Container's Project. The
+    Project profile/secret stores are keyed by the absolute host path (not the
+    bare name), so the broker needs the full key — not just ``project`` (the
+    sanitized name) — to bind a Project-scoped request to exactly this Container
+    and reject another Project whose basename happens to collide. The entrypoint
+    writes ``projectKey`` into the identity file when the host path is known.
+
+    Best-effort, non-secret identity metadata only; any IO/parse error or a
+    missing field degrades to None (the broker then falls back to the weaker
+    sanitized-name guard rather than crashing).
+    """
+    path = identity_path()
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    key = data.get("projectKey")
+    return str(key) if isinstance(key, str) and key else None
+
+
 def require_container() -> None:
     """Gate: raise NotInsideContainerError unless we are inside a Container.
 

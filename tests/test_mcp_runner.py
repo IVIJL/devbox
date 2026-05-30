@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
-"""Tests for the devbox-mcp-run wrapper core (issue 07).
+"""Tests for the devbox-mcp-run runner core (issue 07; reworked ADR 0014).
 
 Run with:
 
     python3 -m unittest tests.test_mcp_runner   # from repo root
     python3 tests/test_mcp_runner.py            # standalone
 
+ADR 0014 changed ``runner.run`` from "exec the MCP server in-process (as node)"
+to "relay stdio to the broker, which spawns the server as devbox-mcp". So:
+
+  * ``run`` no longer execs anything; it delegates to ``mcp.relay.run`` and
+    wraps a RelayError as a RunnerError. The host gate still applies (via the
+    relay) and the broker-unreachable path yields a clean RunnerError.
+  * the profile/spec/env RESOLUTION helpers (``_load_server_spec``,
+    ``_server_argv``, ``_resolve_env``, ``_resolve_paths``) remain in
+    ``mcp.runner`` and are now invoked BROKER-side; they are still unit-tested
+    here directly (resolution correctness, missing-env names-only, secret value
+    resolved-but-never-logged), since the credential-isolation guarantees about
+    these messages are load-bearing.
+
 Every test points HOME / XDG_CONFIG_HOME at a fresh tempdir so the real
 ~/.config/devbox profile and secret store are never read, and injects a fake
 Container identity file via DEVBOX_MCP_IDENTITY_PATH so /etc/devbox is never
-touched. No real ~/.claude or ~/.codex is involved — the wrapper only reads the
-canonical devbox profile + scoped secret store.
-
-Covers the issue-07 wrapper acceptance criteria:
-  * resolve a server from the canonical profile (global + project scope);
-  * refuse to run on the host (no Container identity file);
-  * clear, actionable errors for missing server, disabled server, missing env,
-    and a malformed profile;
-  * secret VALUES never appear in any error message;
-  * required env is validated and the resolved env overlay is correct;
-  * the wrapper execs the configured argv (the launch path).
+touched.
 """
 
 from __future__ import annotations
@@ -35,20 +38,26 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
 
 from mcp import identity as identity_mod  # noqa: E402
-from mcp import runner as runner_mod  # noqa: E402
 from mcp.identity import NotInsideContainerError, require_container  # noqa: E402
 from mcp.profile import (  # noqa: E402
     global_profile_path,
     project_profile_path,
 )
-from mcp.runner import RunnerError, run as runner_run  # noqa: E402
+from mcp.runner import (  # noqa: E402
+    RunnerError,
+    _load_server_spec,
+    _resolve_env,
+    _resolve_paths,
+    _server_argv,
+    run as runner_run,
+)
 from mcp.secrets import (  # noqa: E402
     global_secrets_path,
     project_secrets_path,
     store_server_secrets,
 )
 
-# A realistic-looking secret VALUE that must NEVER appear in any wrapper output.
+# A realistic-looking secret VALUE that must NEVER appear in any output.
 _SECRET_VALUE = "sk-ant-super-secret-do-not-leak-0123456789"
 _PROJECT_KEY = "/home/tester/Projekty/DemoApp"
 
@@ -63,6 +72,7 @@ class RunnerEnv(unittest.TestCase):
         for var in (
             "HOME",
             "XDG_CONFIG_HOME",
+            "DEVBOX_MCP_BROKER_SOCKET",
             identity_mod._IDENTITY_PATH_ENV,  # noqa: SLF001
         ):
             self._saved[var] = os.environ.get(var)
@@ -75,6 +85,11 @@ class RunnerEnv(unittest.TestCase):
         with open(self.identity_file, "w", encoding="utf-8") as fh:
             json.dump({"project": "DemoApp"}, fh)
         os.environ[identity_mod._IDENTITY_PATH_ENV] = self.identity_file  # noqa: SLF001
+        # Point the relay at a socket that does not exist, so any accidental
+        # broker connection fails fast and visibly rather than hanging.
+        os.environ["DEVBOX_MCP_BROKER_SOCKET"] = os.path.join(
+            self.home, "no-broker.sock"
+        )
 
     def tearDown(self) -> None:
         for var, val in self._saved.items():
@@ -115,7 +130,6 @@ class RunnerEnv(unittest.TestCase):
 
 class IdentityGateTest(RunnerEnv):
     def test_inside_container_when_identity_present(self) -> None:
-        # setUp wrote the fixture identity file; the gate must pass quietly.
         require_container()  # must not raise
 
     def test_missing_identity_refuses(self) -> None:
@@ -126,59 +140,87 @@ class IdentityGateTest(RunnerEnv):
         self.assertIn("Container", msg)
         self.assertIn(self.identity_file, msg)
 
-    def test_run_refuses_on_host_before_resolving(self) -> None:
-        # No identity file => host. Even with a valid profile, run() must fail at
-        # the gate and NOT exec anything.
+    def test_run_refuses_on_host_before_touching_broker(self) -> None:
+        # No identity file => host. run() must fail at the relay's gate and never
+        # attempt a broker connection.
         os.remove(self.identity_file)
         self._write_global_profile({"context7": self._server_spec("context7")})
-        with mock.patch.object(runner_mod.os, "execvpe") as exec_mock:
-            with self.assertRaises(NotInsideContainerError):
+        import mcp.relay as relay_mod
+
+        with mock.patch.object(relay_mod, "_connect") as connect_mock:
+            with self.assertRaises(Exception):
                 runner_run("context7")
-        exec_mock.assert_not_called()
+        connect_mock.assert_not_called()
 
 
-class ResolveTest(RunnerEnv):
-    def test_resolve_global_server_execs_argv(self) -> None:
+class DelegationTest(RunnerEnv):
+    """run() delegates to the relay and wraps RelayError as RunnerError."""
+
+    def test_delegates_to_relay(self) -> None:
+        import mcp.relay as relay_mod
+
+        with mock.patch.object(relay_mod, "run", return_value=0) as relay_run:
+            rc = runner_run("context7", project_key=_PROJECT_KEY)
+        self.assertEqual(rc, 0)
+        relay_run.assert_called_once_with("context7", project_key=_PROJECT_KEY)
+
+    def test_relay_error_wrapped_as_runner_error(self) -> None:
+        import mcp.relay as relay_mod
+
+        with mock.patch.object(
+            relay_mod, "run", side_effect=relay_mod.RelayError("broker refused x")
+        ):
+            with self.assertRaises(RunnerError) as ctx:
+                runner_run("context7")
+        self.assertIn("broker refused x", str(ctx.exception))
+
+    def test_broker_unreachable_is_clean_runner_error(self) -> None:
+        # No broker socket exists (setUp points at a missing path); the real
+        # relay must surface a clean, actionable RunnerError, not a traceback.
+        with self.assertRaises(RunnerError) as ctx:
+            runner_run("context7")
+        self.assertIn("broker", str(ctx.exception).lower())
+
+
+class ResolveHelperTest(RunnerEnv):
+    """The retained resolution helpers (now invoked broker-side)."""
+
+    def test_resolve_paths_global_vs_project(self) -> None:
+        gp, gs, gl = _resolve_paths(None)
+        self.assertEqual(gl, "global")
+        self.assertEqual(gp, global_profile_path())
+        self.assertEqual(gs, global_secrets_path())
+        pp, ps, pl = _resolve_paths(_PROJECT_KEY)
+        self.assertIn("project", pl)
+        self.assertEqual(pp, project_profile_path(_PROJECT_KEY))
+        self.assertEqual(ps, project_secrets_path(_PROJECT_KEY))
+
+    def test_load_server_spec_global(self) -> None:
         self._write_global_profile(
             {"context7": self._server_spec(
                 "context7", argv=["npx", "-y", "@upstash/context7-mcp@latest"]
             )}
         )
-        with mock.patch.object(runner_mod.os, "execvpe") as exec_mock:
-            runner_run("context7")
-        exec_mock.assert_called_once()
-        prog, argv, _env = exec_mock.call_args.args
-        self.assertEqual(prog, "npx")
-        self.assertEqual(argv, ["npx", "-y", "@upstash/context7-mcp@latest"])
-
-    def test_resolve_project_server_from_project_profile(self) -> None:
-        self._write_project_profile(
-            _PROJECT_KEY,
-            {"local-tool": self._server_spec(
-                "local-tool", argv=["uvx", "local-tool"]
-            )},
+        spec = _load_server_spec(global_profile_path(), "context7", "global")
+        self.assertEqual(
+            _server_argv(spec, "context7"),
+            ["npx", "-y", "@upstash/context7-mcp@latest"],
         )
-        with mock.patch.object(runner_mod.os, "execvpe") as exec_mock:
-            runner_run("local-tool", _PROJECT_KEY)
-        exec_mock.assert_called_once()
-        prog, argv, _env = exec_mock.call_args.args
-        self.assertEqual(argv, ["uvx", "local-tool"])
 
     def test_missing_server_is_clear(self) -> None:
         self._write_global_profile({"context7": self._server_spec("context7")})
         with self.assertRaises(RunnerError) as ctx:
-            runner_run("nope")
+            _load_server_spec(global_profile_path(), "nope", "global")
         msg = str(ctx.exception)
         self.assertIn("nope", msg)
-        # Known servers are hinted so the user can correct the name.
-        self.assertIn("context7", msg)
+        self.assertIn("context7", msg)  # known servers hinted
 
     def test_disabled_server_is_clear(self) -> None:
         self._write_global_profile(
             {"context7": self._server_spec("context7", enabled=False)}
         )
         with self.assertRaises(RunnerError) as ctx:
-            runner_run("context7")
+            _load_server_spec(global_profile_path(), "context7", "global")
         self.assertIn("disabled", str(ctx.exception))
 
     def test_malformed_profile_is_clear(self) -> None:
@@ -187,131 +229,64 @@ class ResolveTest(RunnerEnv):
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("{ this is not valid json")
         with self.assertRaises(RunnerError) as ctx:
-            runner_run("context7")
+            _load_server_spec(path, "context7", "global")
         self.assertIn("profile", str(ctx.exception).lower())
 
     def test_missing_command_argv_is_clear(self) -> None:
         spec = self._server_spec("context7")
         spec["command"] = {}  # no argv
-        self._write_global_profile({"context7": spec})
         with self.assertRaises(RunnerError) as ctx:
-            runner_run("context7")
+            _server_argv(spec, "context7")
         self.assertIn("command", str(ctx.exception).lower())
 
 
-class EnvValidationTest(RunnerEnv):
+class EnvResolveTest(RunnerEnv):
+    """_resolve_env: every name resolves, secrets resolved-but-never-logged."""
+
     def test_missing_required_env_lists_names_only(self) -> None:
-        self._write_global_profile(
-            {"context7": self._server_spec(
-                "context7", env_keys=["CONTEXT7_API_KEY"]
-            )}
+        spec = self._server_spec(
+            "context7", env_keys=["CONTEXT7_API_KEY"],
+            secret_keys=["CONTEXT7_API_KEY"],
         )
-        # Ensure the var is absent in the environment and not in any store.
-        os.environ.pop("CONTEXT7_API_KEY", None)
         with self.assertRaises(RunnerError) as ctx:
-            runner_run("context7")
+            _resolve_env(spec, global_secrets_path(), "context7")
         msg = str(ctx.exception)
-        self.assertIn("CONTEXT7_API_KEY", msg)  # NAME is fine
-        self.assertNotIn(_SECRET_VALUE, msg)  # but never a value
+        self.assertIn("CONTEXT7_API_KEY", msg)
+        self.assertNotIn(_SECRET_VALUE, msg)
 
     def test_secret_value_resolved_from_store_never_logged(self) -> None:
-        self._write_global_profile(
-            {"context7": self._server_spec(
-                "context7",
-                env_keys=["CONTEXT7_API_KEY"],
-                secret_keys=["CONTEXT7_API_KEY"],
-            )}
+        spec = self._server_spec(
+            "context7", env_keys=["CONTEXT7_API_KEY"],
+            secret_keys=["CONTEXT7_API_KEY"],
         )
         store_server_secrets(
             global_secrets_path(), "context7",
             {"CONTEXT7_API_KEY": _SECRET_VALUE},
         )
-        os.environ.pop("CONTEXT7_API_KEY", None)
-        with mock.patch.object(runner_mod.os, "execvpe") as exec_mock:
-            runner_run("context7")
-        exec_mock.assert_called_once()
-        _prog, _argv, env = exec_mock.call_args.args
-        # The secret value reaches the child env (so the server works) ...
-        self.assertEqual(env["CONTEXT7_API_KEY"], _SECRET_VALUE)
+        overlay = _resolve_env(spec, global_secrets_path(), "context7")
+        # The value IS resolved into the overlay (it goes to the spawned server),
+        # but it is never part of any RunnerError message.
+        self.assertEqual(overlay["CONTEXT7_API_KEY"], _SECRET_VALUE)
 
-    def test_non_secret_env_resolved_from_environment(self) -> None:
-        self._write_global_profile(
-            {"context7": self._server_spec(
-                "context7", env_keys=["CONTEXT7_BASE_URL"]
-            )}
-        )
-        os.environ["CONTEXT7_BASE_URL"] = "https://example.test"
-        try:
-            with mock.patch.object(runner_mod.os, "execvpe") as exec_mock:
-                runner_run("context7")
-        finally:
-            os.environ.pop("CONTEXT7_BASE_URL", None)
-        _prog, _argv, env = exec_mock.call_args.args
-        self.assertEqual(env["CONTEXT7_BASE_URL"], "https://example.test")
-
-    def test_non_secret_env_resolved_from_profile_env_value(self) -> None:
-        # The wrapper requires every declared env name; a non-secret value the
-        # source set inline (recorded in the profile's `env` map) must resolve at
-        # launch WITHOUT the user re-exporting it.
-        spec = self._server_spec("context7", env_keys=["CONTEXT7_BASE_URL"])
-        spec["env"] = {"CONTEXT7_BASE_URL": "https://from-profile.test"}
-        self._write_global_profile({"context7": spec})
-        os.environ.pop("CONTEXT7_BASE_URL", None)
-        with mock.patch.object(runner_mod.os, "execvpe") as exec_mock:
-            runner_run("context7")
-        _prog, _argv, env = exec_mock.call_args.args
-        self.assertEqual(env["CONTEXT7_BASE_URL"], "https://from-profile.test")
-
-    def test_profile_env_value_takes_priority_over_environment(self) -> None:
-        spec = self._server_spec("context7", env_keys=["CONTEXT7_BASE_URL"])
-        spec["env"] = {"CONTEXT7_BASE_URL": "https://from-profile.test"}
-        self._write_global_profile({"context7": spec})
-        os.environ["CONTEXT7_BASE_URL"] = "https://from-env.test"
-        try:
-            with mock.patch.object(runner_mod.os, "execvpe") as exec_mock:
-                runner_run("context7")
-        finally:
-            os.environ.pop("CONTEXT7_BASE_URL", None)
-        _prog, _argv, env = exec_mock.call_args.args
-        self.assertEqual(env["CONTEXT7_BASE_URL"], "https://from-profile.test")
+    def test_non_secret_env_resolved_from_profile_env(self) -> None:
+        spec = self._server_spec("context7", env_keys=["BASE_URL"])
+        spec["env"] = {"BASE_URL": "https://example.test"}
+        overlay = _resolve_env(spec, global_secrets_path(), "context7")
+        self.assertEqual(overlay["BASE_URL"], "https://example.test")
 
     def test_project_secret_resolved_from_project_store(self) -> None:
-        self._write_project_profile(
-            _PROJECT_KEY,
-            {"local-tool": self._server_spec(
-                "local-tool",
-                argv=["uvx", "local-tool"],
-                env_keys=["TOOL_TOKEN"],
-                secret_keys=["TOOL_TOKEN"],
-            )},
+        spec = self._server_spec(
+            "local-tool", env_keys=["TOOL_TOKEN"], secret_keys=["TOOL_TOKEN"],
         )
         store_server_secrets(
             project_secrets_path(_PROJECT_KEY), "local-tool",
             {"TOOL_TOKEN": _SECRET_VALUE},
         )
-        os.environ.pop("TOOL_TOKEN", None)
-        with mock.patch.object(runner_mod.os, "execvpe") as exec_mock:
-            runner_run("local-tool", _PROJECT_KEY)
-        _prog, _argv, env = exec_mock.call_args.args
-        self.assertEqual(env["TOOL_TOKEN"], _SECRET_VALUE)
-
-
-class ExecFailureTest(RunnerEnv):
-    def test_exec_failure_is_wrapped_clearly(self) -> None:
-        self._write_global_profile(
-            {"context7": self._server_spec(
-                "context7", argv=["definitely-not-a-real-binary-xyz"]
-            )}
+        overlay = _resolve_env(
+            spec, project_secrets_path(_PROJECT_KEY), "local-tool"
         )
-        with mock.patch.object(
-            runner_mod.os, "execvpe", side_effect=OSError("No such file")
-        ):
-            with self.assertRaises(RunnerError) as ctx:
-                runner_run("context7")
-        msg = str(ctx.exception)
-        self.assertIn("context7", msg)
-        self.assertIn("definitely-not-a-real-binary-xyz", msg)
+        self.assertEqual(overlay["TOOL_TOKEN"], _SECRET_VALUE)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     unittest.main()

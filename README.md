@@ -191,6 +191,12 @@ Harvest logs persist at `/var/log/devbox/allow-for/<container>-<timestamp>.log` 
 
 **v1 supports Container MCP servers only.** A server that runs *inside* the Container (e.g. an `npx`/`uvx`/`docker` launcher) can be imported and launched. **Host MCP servers** — ones that need host credential stores, desktop/OS APIs, browser state, or absolute host paths — are *detected and explained* but **not launched**: crossing that boundary deserves its own design and is deferred.
 
+### Credential isolation
+
+A Container MCP server's secrets are hidden **from the agent**. Servers don't run as your agent user (`node`); they run under a dedicated unprivileged account, `devbox-mcp`, behind an always-on broker. The rendered `devbox-mcp-run <server>` command is a thin **relay**: it connects to the broker as `node`, names the server it wants, and proxies stdio. The broker validates the name against your in-scope profile and spawns the server as `devbox-mcp`, injecting that server's credentials as environment. The agent only ever sees the tool stream — never the credential, because it never becomes the server process and cannot read another UID's `/proc/<pid>/environ`. See [ADR 0014](docs/adr/0014-container-mcp-broker-and-secret-isolation.md).
+
+**Scope of the guarantee — agent, not peers.** This protects secrets from the *agent*, not from *other MCP servers*. All servers share the one `devbox-mcp` UID, and a secret is delivered the only way a server consumes one (an env var), so a server can read a peer server's secret via `/proc/<pid>/environ`. Closing that would need per-server UIDs, which require runtime privilege that [ADR 0003](docs/adr/0003-privileged-entrypoint-no-sudo-in-container.md) deliberately removes — so peer-to-peer isolation is an **accepted non-goal**: treat every Container MCP server you import as sharing one trust domain. Only import servers you'd trust with each other's credentials.
+
 ### Onboarding
 
 A fresh interactive install, and the first `devbox update` after MCP support shipped, offer to scan your existing Claude Code / Codex MCP servers for import. The offer fires **once**: it only appears when no devbox MCP profile exists yet *and* you have not already seen or dismissed it. The seen/dismissed marker lives at `~/.config/devbox/mcp/state.json` (outside the profile), so deleting profile files does not re-trigger the prompt. Non-interactive installs and updates never prompt or open a picker — they print a concise follow-up command (`devbox mcp import`) instead. Later updates show only a short reminder.

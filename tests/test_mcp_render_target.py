@@ -31,6 +31,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys
@@ -129,7 +130,7 @@ class WriteTargetTest(_HomeEnv):
     def test_write_lands_in_config_dir_and_not_host_native(self) -> None:
         with open(self.host_native, "w", encoding="utf-8") as fh:
             json.dump({"mcpServers": {"manual": {"command": "x"}}, "k": 1}, fh)
-        host_before = open(self.host_native, encoding="utf-8").read()
+        host_before = Path(self.host_native).read_text(encoding="utf-8")
 
         plan = build_claude_plan([_server("context7")])
         write_claude(plan)
@@ -141,7 +142,9 @@ class WriteTargetTest(_HomeEnv):
         self.assertIn("devbox-context7", written["mcpServers"])
 
         # The host's own ~/.claude.json is byte-stable (no devbox- entry).
-        self.assertEqual(open(self.host_native, encoding="utf-8").read(), host_before)
+        self.assertEqual(
+            Path(self.host_native).read_text(encoding="utf-8"), host_before
+        )
         host_data = json.loads(host_before)
         self.assertNotIn("devbox-context7", host_data["mcpServers"])
 
@@ -223,9 +226,9 @@ class MigrationCleanupTest(_HomeEnv):
         # A host-native file with NO devbox- entries must not be rewritten.
         with open(self.host_native, "w", encoding="utf-8") as fh:
             json.dump({"mcpServers": {"manual": {"command": "x"}}, "k": 1}, fh)
-        before = open(self.host_native, encoding="utf-8").read()
+        before = Path(self.host_native).read_text(encoding="utf-8")
         write_claude(build_claude_plan([_server("context7")]))
-        self.assertEqual(open(self.host_native, encoding="utf-8").read(), before)
+        self.assertEqual(Path(self.host_native).read_text(encoding="utf-8"), before)
 
     def test_no_cleanup_when_target_equals_host_native(self) -> None:
         # When the injected target IS the host-native file (e.g. running in a

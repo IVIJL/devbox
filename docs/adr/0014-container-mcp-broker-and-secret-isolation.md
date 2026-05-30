@@ -148,6 +148,40 @@ residual-root surface ADR 0003 removes — re-staging is **host-initiated**:
   **subsequently spawned** servers — a running process keeps its environment.
   "Live" means "the next session gets the new secret without a Container restart."
 
+### Trust boundary: the agent, not peer servers (explicit non-goal)
+
+The isolation this ADR buys is **agent → server**: the agent user `node` cannot
+read a Container MCP server's credentials. It is **not** server → server. Every
+spawned server runs under the **same** `devbox-mcp` UID as the broker and as
+every other server, and a secret is delivered the only way an MCP server
+consumes one — as an environment variable. Same-UID processes can read each
+other's `/proc/<pid>/environ` (the DAC check passes for an equal UID, and Yama
+`ptrace_scope` gates only `PTRACE_MODE_ATTACH`, never the `MODE_READ` an
+`environ` read uses), so once a secret is in one server's environment a *peer*
+`devbox-mcp` server can read it. No amount of staged-file hardening changes this:
+unlinking the staged copy protects the file at rest, but the live secret is still
+in the running server's `/proc`.
+
+Closing this would require per-server **distinct UIDs** so `/proc/environ` and
+ptrace become cross-UID protected — but switching a spawned child to another UID
+needs privilege (CAP_SETUID / a setuid helper / root), which **ADR 0003 forbids**
+at runtime (the only root phase is container start; by spawn time PID 1 is already
+`node`). We therefore **accept** this limitation rather than reintroduce a
+privileged runtime path:
+
+- Container MCP servers are tools the user deliberately imported into their own
+  profile; they share one trust domain. The primary threat (the *agent* reading
+  server secrets, e.g. an agent that runs an untrusted server and then reads its
+  token) is what the `devbox-mcp` boundary closes, and it does.
+- Peer-server isolation is a deliberate **non-goal** of this slice, documented as
+  such here and in the user-facing README MCP section. The cheap in-broker
+  mitigations are still applied (the broker strips its own `DEVBOX_MCP_SECRETS_DIR`
+  / socket pointers from each child's environment so it never *volunteers* the
+  staged-store path), but they are defense-in-depth, not a guarantee.
+- If a future requirement needs true peer isolation, it is a separate decision
+  that must revisit ADR 0003 (e.g. a narrowly-scoped privileged spawn helper or
+  per-server UID pool) — not folded silently into this broker.
+
 ## Considered options
 
 - **Scoped setuid launcher (node → devbox-mcp).** A setuid-to-unprivileged-account
@@ -182,3 +216,7 @@ residual-root surface ADR 0003 removes — re-staging is **host-initiated**:
   Container; it never auto-propagates to already-running server processes.
 - ADR 0003's invariants are preserved unchanged: no NOPASSWD sudoers, no setuid
   bridges, no persistent or residual root inside the Container.
+- Credential isolation is **agent → server only**, not server → server (see the
+  trust-boundary subsection): peers share the `devbox-mcp` UID and can read each
+  other's secrets via `/proc/<pid>/environ`. This is an accepted non-goal,
+  documented here and in the README MCP section.

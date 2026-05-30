@@ -1,23 +1,24 @@
-"""The ``devbox-mcp-run`` wrapper core (ADR 0013, issue 07).
+"""The ``devbox-mcp-run`` wrapper core (ADR 0013, issue 07; reworked ADR 0014).
 
 Rendered agent config never calls a raw MCP command — it calls this wrapper
 (``devbox-mcp-run <server>`` for a global server, or
 ``devbox-mcp-run --project <full-project-key> <server>`` for a Project-scoped
 one). The wrapper is the stable control point ADR 0013 decision 27 asks for:
-agent config keeps calling ``devbox-mcp-run`` even if devbox later swaps an
-``npx`` launch for a persistent binary.
+agent config keeps calling ``devbox-mcp-run`` even though ADR 0014 changed what
+it does under the hood.
 
-What the wrapper does, in order:
+ADR 0013 had this wrapper EXEC the MCP server directly (as the agent user
+``node``). ADR 0014 moves the server behind a UID boundary: the wrapper is now a
+stdio<->socket **relay** that hands the request to the always-on broker, which
+spawns the server as the unprivileged ``devbox-mcp`` account. The agent never
+becomes the server process and never sees its environment. The relay logic
+lives in ``mcp.relay``; ``run`` here delegates to it so ``mcp.cli run`` keeps a
+single, stable entry point.
 
-  1. **Container identity gate** — refuse to run on the host BEFORE touching a
-     profile or launching anything (`mcp.identity`).
-  2. **Resolve** the named server from the scope-correct canonical profile
-     (global profile, or the Project profile for the passed full project key).
-  3. **Validate** required env: every declared env NAME must have a value,
-     sourced from the scoped secret store (`mcp.secrets`) for secret keys or
-     the inherited environment for non-secret keys. Values are NEVER logged.
-  4. **exec** the configured argv with the resolved env merged in, so the MCP
-     server inherits this process's stdio (the agent talks to it directly).
+The helper functions below (profile/spec resolution, env overlay) are retained
+and SHARED with the broker (``mcp.broker`` imports ``_server_argv`` /
+``_resolve_env``): the broker is the side that now resolves the spec and spawns
+the server, so the scope/env logic lives in one tested place.
 
 Error states are clear and actionable (missing server, disabled server,
 missing env, malformed profile, missing identity). Secret VALUES never appear
@@ -29,7 +30,6 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from .identity import require_container
 from .profile import global_profile_path, load_profile, project_profile_path
 from .secrets import (
     global_secrets_path,
@@ -172,32 +172,23 @@ def _resolve_env(
 
 
 def run(server_name: str, project_key: Optional[str] = None) -> int:
-    """Resolve and launch one MCP server through the wrapper.
+    """Relay one MCP server's stdio through the broker (ADR 0014).
 
-    Never returns on success — it ``exec``s the MCP command so the server
-    inherits this process's stdio (the agent speaks MCP to it directly). On any
-    actionable failure it raises ``RunnerError`` with a SECRET-FREE message.
+    This no longer execs the server in-process. Under ADR 0014 the server runs
+    under the ``devbox-mcp`` UID behind the always-on broker, so the agent never
+    becomes the server process and never sees its environment. ``run`` delegates
+    to the relay (``mcp.relay``), which connects to the broker socket, names the
+    requested server, and proxies stdio. The profile/spec resolution and env
+    overlay live in this module's helpers and are now performed broker-side.
+
+    Returns an exit code (0 on a clean session). Raises ``RunnerError`` with a
+    SECRET-FREE message on any actionable failure (host guard, broker
+    unreachable, server refused).
     """
-    # 1. Container identity gate — refuse on the host before anything else.
-    require_container()
+    from .relay import RelayError
+    from .relay import run as relay_run
 
-    profile_path, secrets_path, scope_label = _resolve_paths(project_key)
-    spec = _load_server_spec(profile_path, server_name, scope_label)
-    argv = _server_argv(spec, server_name)
-    overlay = _resolve_env(spec, secrets_path, server_name)
-
-    # Merge the resolved env over the inherited environment and exec. exec
-    # replaces this process so the MCP server owns stdio; on success this call
-    # does not return.
-    child_env = dict(os.environ)
-    child_env.update(overlay)
     try:
-        os.execvpe(argv[0], argv, child_env)
-    except OSError as exc:
-        raise RunnerError(
-            f"failed to launch MCP server {server_name!r} "
-            f"(command {argv[0]!r}): {exc}"
-        ) from exc
-    # os.execvpe never returns on success; this line is unreachable but keeps a
-    # well-typed return for static checkers.
-    return 0  # pragma: no cover
+        return relay_run(server_name, project_key=project_key)
+    except RelayError as exc:
+        raise RunnerError(str(exc)) from exc

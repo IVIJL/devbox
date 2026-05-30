@@ -160,12 +160,21 @@ def store_server_secrets(
 def read_server_secrets(path: str, server_name: str) -> Optional[dict[str, str]]:
     """Return the stored secret block for one server, or None if absent.
 
-    Used to snapshot the prior block before a replace/purge so it can be
-    restored if a later step (profile commit) fails. NEVER log the result.
+    Used both to snapshot the prior block before a replace/purge (host side) and
+    by the Container MCP broker to resolve a server's staged secrets (ADR 0014).
+    A MISSING file degrades to None. An UNREADABLE file (``PermissionError`` — a
+    file owned by a different UID, which the broker must never be able to read
+    from the node-owned mount) ALSO degrades to None rather than raising, so a
+    cross-UID secret store never crashes the broker; the caller then treats the
+    secret as unavailable (a secret-declaring server reports missing env). NEVER
+    log the result.
     """
     if not os.path.isfile(path):
         return None
-    store = load_secrets(path)
+    try:
+        store = load_secrets(path)
+    except PermissionError:
+        return None
     block = store["servers"].get(server_name)
     if not isinstance(block, dict):
         return None

@@ -86,6 +86,35 @@ RUN mkdir -p /usr/local/share/npm-global && \
 
 ARG USERNAME=node
 
+# devbox-mcp service account (ADR 0014, issue 15). A dedicated UNPRIVILEGED
+# account, distinct from the agent user `node` (UID 1000), under which the MCP
+# broker runs and spawns MCP servers. The whole point is credential isolation:
+# because servers run as devbox-mcp, the agent (node) cannot read their
+# /proc/<pid>/environ (mode 0400, owned by the process UID) nor signal/ptrace
+# them. devbox-mcp gets:
+#   * its own writable HOME so per-account state has somewhere to live;
+#   * a writable npm/npx cache so on-demand `npx` MCP servers run under it
+#     without polluting node's cache or needing write access to node's HOME;
+#   * NO sudo and NO membership in any privileged group (ADR 0003: no path back
+#     to root from inside the Container).
+# `node` is added to the `devbox-mcp` group ONLY so it can connect to the broker
+# socket, which lives in the runtime dir `/run/devbox-mcp` (0750 group
+# devbox-mcp), NOT in this HOME. The service-account HOME is therefore kept
+# 0700 OWNER-only: node never needs to enter it, and a group-traversable HOME
+# would let node list/read group-readable files an MCP server might drop there
+# (npm/npx state, tokens, caches) — defeating the UID boundary. Group membership
+# grants the agent nothing here: devbox-mcp-private files stay 0400/0700
+# OWNER-only, and node only ever traverses `/run/devbox-mcp` to the socket.
+# `.config` is pre-created (writable) so a spawned MCP server's XDG_CONFIG_HOME
+# (which the broker points at this HOME, not node's profile mount) has a home.
+RUN groupadd --system devbox-mcp && \
+    useradd --system --gid devbox-mcp --create-home \
+        --home-dir /home/devbox-mcp --shell /usr/sbin/nologin devbox-mcp && \
+    usermod -aG devbox-mcp node && \
+    mkdir -p /home/devbox-mcp/.npm /home/devbox-mcp/.cache /home/devbox-mcp/.config && \
+    chown -R devbox-mcp:devbox-mcp /home/devbox-mcp && \
+    chmod 0700 /home/devbox-mcp
+
 
 # Create workspace and config directories
 RUN mkdir -p /workspace /home/node/.claude \
@@ -339,6 +368,9 @@ COPY lib/allow-for.sh /usr/local/share/devbox/lib/allow-for.sh
 # validates required env without logging values, and execs the MCP command.
 COPY scripts/mcp/ /usr/local/share/devbox/mcp/
 COPY scripts/mcp-run.sh /usr/local/bin/devbox-mcp-run
+# Container MCP broker launcher (ADR 0014, issue 15). Runs the Python broker as
+# devbox-mcp (started from the entrypoint root phase before the node drop).
+COPY scripts/mcp-broker.sh /usr/local/bin/devbox-mcp-broker
 COPY init-firewall.sh /usr/local/bin/
 COPY scripts/setup-chezmoi.sh /usr/local/bin/
 COPY scripts/n scripts/nx /usr/local/bin/
@@ -382,7 +414,16 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/stop-agent-browser-host-allow \
     /usr/local/bin/agent-browser \
     /usr/local/bin/devbox-mcp-run \
+    /usr/local/bin/devbox-mcp-broker \
     /usr/local/bin/devbox-identity-context.sh
+
+# The MCP runtime (Python package + launchers) must be readable+executable by
+# BOTH node (relay) and devbox-mcp (broker). It is copied root-owned with
+# default 0644/0755 (world-readable), so devbox-mcp can `import mcp` and exec
+# the broker. ADR 0013's `install`-materialised runtime (issue 09) likewise
+# lands world-readable, so it stays executable by devbox-mcp; nothing here is
+# secret (the profile is references-only, secrets live in a separate store).
+RUN chmod -R a+rX /usr/local/share/devbox/mcp
 
 # Sudo with password — prevents AI agents from modifying firewall rules
 # Password is injected via --mount=type=secret (never stored in image layers/metadata)

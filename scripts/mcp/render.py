@@ -43,7 +43,7 @@ from typing import Any, Optional
 
 from .profile import config_root, load_profile
 from .providers import codex as codex_provider
-from .providers.claude import default_config_path as claude_default_config_path
+from .providers.claude import render_target_path as claude_render_target_path
 
 # The devbox-managed name prefix. An agent MCP entry whose name starts with this
 # is owned by devbox; anything else is inherited/manual and must never be
@@ -521,8 +521,14 @@ def build_claude_plan(
     ``CLAUDE_CONFIG_DIR`` form inside a Container) keys MCP entries by name under
     a ``mcpServers`` object — the same shape the Claude import provider reads.
     Render is supported for Claude in all cases (no parser dependency).
+
+    When ``config_path`` is None the target is ``render_target_path()`` — the
+    Container-visible ``~/.claude/.claude.json`` the agent actually reads (ADR
+    0014), NOT the host-native discovery ``default_config_path``. The injectable
+    ``config_path`` is kept for tests. Discovery (``import``) still reads the
+    host config; only render is retargeted.
     """
-    path = config_path or claude_default_config_path()
+    path = config_path or claude_render_target_path()
     plan = AgentPlan(agent="claude-code", config_path=path)
     plan.planned = _planned_entries(servers)
     managed, inherited = _split_ownership(_read_existing_agent_names_claude(path))

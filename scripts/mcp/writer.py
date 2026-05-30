@@ -35,6 +35,7 @@ import re
 from typing import Any
 
 from .providers import codex as codex_provider
+from .providers.claude import default_config_path as claude_default_config_path
 from .render import DEVBOX_PREFIX, AgentPlan, PlannedEntry, is_devbox_managed
 
 
@@ -57,6 +58,56 @@ def _atomic_write(path: str, text: str) -> None:
 
 
 # -- Claude Code (JSON) -------------------------------------------------------
+
+
+def _strip_devbox_from_claude_file(path: str) -> None:
+    """Strip ONLY ``devbox-``-prefixed entries from a Claude config at ``path``.
+
+    Migration cleanup (ADR 0014). Render now targets the Container-visible
+    ``~/.claude/.claude.json`` (config-dir form), but a user who ran the previous
+    render path has ``devbox-`` entries in the host-native ``~/.claude.json``.
+    Left behind, host Claude Code keeps offering container-only relay commands
+    that cannot reach the broker. This removes those orphans from the OTHER file,
+    touching only ``devbox-``-owned keys (top-level and per-project), leaving all
+    inherited/manual entries and every other key byte-for-byte unchanged. A
+    no-op when the file is absent, unreadable, not an object, or has no
+    ``devbox-`` entries (so it never rewrites a clean file).
+    """
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        # Never let a stale/unparseable host file break the real render write.
+        return
+    if not isinstance(data, dict):
+        return
+
+    changed = False
+
+    block = data.get("mcpServers")
+    if isinstance(block, dict):
+        kept = {n: v for n, v in block.items() if not is_devbox_managed(n)}
+        if len(kept) != len(block):
+            data["mcpServers"] = kept
+            changed = True
+
+    projects = data.get("projects")
+    if isinstance(projects, dict):
+        for record in projects.values():
+            if not isinstance(record, dict):
+                continue
+            proj_block = record.get("mcpServers")
+            if not isinstance(proj_block, dict):
+                continue
+            kept = {n: v for n, v in proj_block.items() if not is_devbox_managed(n)}
+            if len(kept) != len(proj_block):
+                record["mcpServers"] = kept
+                changed = True
+
+    if changed:
+        _atomic_write(path, json.dumps(data, indent=2, sort_keys=False) + "\n")
 
 
 def _claude_entry(entry: PlannedEntry) -> dict[str, Any]:
@@ -163,6 +214,17 @@ def write_claude(plan: AgentPlan) -> None:
         data["projects"] = projects
 
     _atomic_write(path, json.dumps(data, indent=2, sort_keys=False) + "\n")
+
+    # Migration cleanup (ADR 0014): render now targets the Container-visible
+    # config-dir form, but a previous render left ``devbox-`` entries in the
+    # host-native ``~/.claude.json`` that discovery prefers. Strip those orphans
+    # from that OTHER file so host Claude Code stops offering dead relay commands.
+    # Only runs when the host-native discovery path differs from the file we just
+    # wrote (the in-Container case where they coincide skips this; the file was
+    # already fully rewritten above).
+    host_native = claude_default_config_path()
+    if os.path.abspath(host_native) != os.path.abspath(path):
+        _strip_devbox_from_claude_file(host_native)
 
 
 # -- Codex (TOML) -------------------------------------------------------------

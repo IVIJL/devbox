@@ -126,12 +126,47 @@ def default_config_path() -> str:
     Returns the first probed location that exists; if none exist yet, returns
     the highest-priority candidate so callers still have a stable path to
     report. See ``candidate_config_paths`` for the probe order.
+
+    This is the DISCOVERY path (reading what the user has). The RENDER target
+    is computed separately by ``render_target_path`` — see that function for the
+    split.
     """
     candidates = candidate_config_paths()
     for path in candidates:
         if os.path.isfile(path):
             return path
     return candidates[0]
+
+
+def render_target_path() -> str:
+    """Return the Container-visible Claude config that the agent actually reads.
+
+    Discovery and render are SPLIT (ADR 0014):
+
+      * Discovery uses ``default_config_path`` / ``candidate_config_paths``,
+        which probe ``$CLAUDE_CONFIG_DIR`` first and then host-native
+        ``~/.claude.json``, because that is where the user's existing servers
+        live and ``import`` must find them.
+      * Render uses THIS function. The Container runs Claude Code with
+        ``CLAUDE_CONFIG_DIR=/home/node/.claude`` and ``docker-run.sh``
+        bind-mounts the host ``~/.claude`` directory onto ``/home/node/.claude``
+        (``-v "$HOME/.claude:/home/node/.claude"``), so inside the Container the
+        agent reads ``~/.claude/.claude.json`` — the config-dir form. devbox's
+        ``devbox-``-prefixed entries must land there, regardless of whether a
+        host-native ``~/.claude.json`` exists (otherwise they are written where
+        the Container never reads them).
+
+    Deliberately does NOT honor ``$CLAUDE_CONFIG_DIR``. ``devbox`` render runs
+    on the HOST, where the user may point their OWN host Claude Code at a
+    ``CLAUDE_CONFIG_DIR`` that is NOT the directory bind-mounted into the
+    Container; honoring it would again write where the Container never reads,
+    re-introducing the exact bug this split fixes. The bind-mount source is
+    always the host ``~/.claude`` directory, so the render target is always
+    ``~/.claude/.claude.json``. When render happens to run INSIDE a Container,
+    ``~/.claude`` already equals ``CLAUDE_CONFIG_DIR``, so the result matches.
+    """
+    home = os.path.expanduser("~")
+    return os.path.join(home, ".claude", ".claude.json")
 
 
 def _name_marks_secret(stem: str) -> bool:

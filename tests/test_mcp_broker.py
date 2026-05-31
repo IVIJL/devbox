@@ -94,15 +94,33 @@ class ProtocolTests(unittest.TestCase):
     def test_request_round_trip_global(self):
         line = protocol.encode_request("context7", None)
         self.assertTrue(line.endswith(b"\n"))
-        server, project = protocol.decode_request(line.rstrip(b"\n"))
+        server, project, cwd = protocol.decode_request(line.rstrip(b"\n"))
         self.assertEqual(server, "context7")
         self.assertIsNone(project)
+        self.assertIsNone(cwd)
 
     def test_request_round_trip_project(self):
         line = protocol.encode_request("ctx", "/work/app")
-        server, project = protocol.decode_request(line.rstrip(b"\n"))
+        server, project, cwd = protocol.decode_request(line.rstrip(b"\n"))
         self.assertEqual(server, "ctx")
         self.assertEqual(project, "/work/app")
+        self.assertIsNone(cwd)
+
+    def test_request_round_trip_carries_cwd(self):
+        line = protocol.encode_request("ctx", "/work/app", "/work/app/sub")
+        server, project, cwd = protocol.decode_request(line.rstrip(b"\n"))
+        self.assertEqual(server, "ctx")
+        self.assertEqual(project, "/work/app")
+        self.assertEqual(cwd, "/work/app/sub")
+
+    def test_decode_request_omitted_cwd_is_none(self):
+        # Backward compatible: an older relay omits 'cwd' entirely.
+        _server, _project, cwd = protocol.decode_request(b'{"server":"ctx"}')
+        self.assertIsNone(cwd)
+
+    def test_decode_request_rejects_non_string_cwd(self):
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.decode_request(b'{"server":"ctx","cwd":123}')
 
     def test_reply_round_trip(self):
         ok, err = protocol.decode_reply(
@@ -292,7 +310,7 @@ class BrokerSpawnBuildTests(_EnvIsolation, unittest.TestCase):
                 },
                 fh,
             )
-        argv, env = broker._build_spawn("ctx", None)
+        argv, env, _cwd = broker._build_spawn("ctx", None)
         self.assertEqual(argv, ["mycmd", "--flag"])
         self.assertEqual(env["BASE_URL"], "https://example.test")
 
@@ -310,7 +328,7 @@ class BrokerSpawnBuildTests(_EnvIsolation, unittest.TestCase):
                 {"version": 1, "servers": {"ctx": {"command": {"argv": ["mycmd"]}}}},
                 fh,
             )
-        _argv, env = broker._build_spawn("ctx", None)
+        _argv, env, _cwd = broker._build_spawn("ctx", None)
         self.assertEqual(env["XDG_CONFIG_HOME"], os.path.join(home, ".config"))
         # And specifically NOT the broker's profile-mount XDG_CONFIG_HOME.
         self.assertNotEqual(env["XDG_CONFIG_HOME"], self._tmp.name)
@@ -328,7 +346,7 @@ class BrokerSpawnBuildTests(_EnvIsolation, unittest.TestCase):
                 {"version": 1, "servers": {"ctx": {"command": {"argv": ["mycmd"]}}}},
                 fh,
             )
-        _argv, env = broker._build_spawn("ctx", None)
+        _argv, env, _cwd = broker._build_spawn("ctx", None)
         self.assertNotIn(broker._SECRETS_DIR_ENV, env)
         self.assertNotIn(broker._SOCKET_PATH_ENV, env)
 
@@ -351,7 +369,7 @@ class BrokerSpawnBuildTests(_EnvIsolation, unittest.TestCase):
                 },
                 fh,
             )
-        _argv, env = broker._build_spawn("ctx", None)
+        _argv, env, _cwd = broker._build_spawn("ctx", None)
         self.assertEqual(env["XDG_CONFIG_HOME"], "/explicit/cfg")
 
     def test_build_spawn_resolves_secret_from_staged_store(self):
@@ -385,7 +403,7 @@ class BrokerSpawnBuildTests(_EnvIsolation, unittest.TestCase):
             self.secrets_dir, os.path.basename(global_secrets_path())
         )
         store_server_secrets(staged, "ctx", {"API_KEY": secret})
-        _argv, env = broker._build_spawn("ctx", None)
+        _argv, env, _cwd = broker._build_spawn("ctx", None)
         self.assertEqual(env["API_KEY"], secret)
 
     def test_build_spawn_ignores_secret_in_profile_mount(self):
@@ -455,7 +473,7 @@ class BrokerSpawnBuildTests(_EnvIsolation, unittest.TestCase):
                 {"version": 1, "servers": {"free": {"command": {"argv": ["ok"]}}}},
                 fh,
             )
-        argv, _env = broker._build_spawn("free", None)
+        argv, _env, _cwd = broker._build_spawn("free", None)
         self.assertEqual(argv, ["ok"])
         # Secret-declaring server: clean missing-env refusal, not a crash.
         with open(os.path.join(self.cfg_root, "profile.json"), "w") as fh:
@@ -521,6 +539,55 @@ class BrokerSpawnBuildTests(_EnvIsolation, unittest.TestCase):
         # A clean missing-env refusal, not a traceback.
         self.assertIn("API_KEY", str(ctx.exception))
 
+    def test_build_spawn_uses_relay_supplied_cwd(self):
+        # The relay forwards the agent session's cwd; _build_spawn returns it as
+        # the spawn cwd so a project-local server resolves relative paths there
+        # (not the broker's startup dir).
+        sess = os.path.join(self._tmp.name, "session-dir")
+        os.makedirs(sess, exist_ok=True)
+        with open(os.path.join(self.cfg_root, "profile.json"), "w") as fh:
+            json.dump(
+                {"version": 1, "servers": {"ctx": {"command": {"argv": ["mycmd"]}}}},
+                fh,
+            )
+        _argv, _env, cwd = broker._build_spawn("ctx", None, sess)
+        self.assertEqual(cwd, sess)
+
+    def test_build_spawn_falls_back_when_cwd_missing(self):
+        # A relay that omits the cwd (older relay) -> None, so Popen keeps the
+        # broker's own cwd rather than failing the spawn.
+        with open(os.path.join(self.cfg_root, "profile.json"), "w") as fh:
+            json.dump(
+                {"version": 1, "servers": {"ctx": {"command": {"argv": ["mycmd"]}}}},
+                fh,
+            )
+        _argv, _env, cwd = broker._build_spawn("ctx", None, None)
+        self.assertIsNone(cwd)
+
+    def test_build_spawn_falls_back_when_cwd_not_a_directory(self):
+        # A relay-supplied cwd that does not name a usable directory must NOT
+        # fail the spawn — it falls back to None (the broker's own cwd).
+        missing = os.path.join(self._tmp.name, "does-not-exist")
+        with open(os.path.join(self.cfg_root, "profile.json"), "w") as fh:
+            json.dump(
+                {"version": 1, "servers": {"ctx": {"command": {"argv": ["mycmd"]}}}},
+                fh,
+            )
+        _argv, _env, cwd = broker._build_spawn("ctx", None, missing)
+        self.assertIsNone(cwd)
+
+    def test_resolve_spawn_cwd_rejects_file_path(self):
+        # A path that exists but is a file, not a directory -> None.
+        f = os.path.join(self._tmp.name, "afile")
+        with open(f, "w") as fh:
+            fh.write("x")
+        self.assertIsNone(broker._resolve_spawn_cwd(f))
+
+    def test_resolve_spawn_cwd_accepts_usable_dir(self):
+        self.assertEqual(
+            broker._resolve_spawn_cwd(self._tmp.name), self._tmp.name
+        )
+
 
 class BrokerSocketRoundTripTests(_EnvIsolation, unittest.TestCase):
     """A real broker over a unix socket, serving a stub server, via the relay."""
@@ -535,7 +602,15 @@ class BrokerSocketRoundTripTests(_EnvIsolation, unittest.TestCase):
         # proxy through the socket.
         with open(os.path.join(self.cfg_root, "profile.json"), "w") as fh:
             json.dump(
-                {"version": 1, "servers": {"echo": {"command": {"argv": ["cat"]}}}},
+                {
+                    "version": 1,
+                    "servers": {
+                        "echo": {"command": {"argv": ["cat"]}},
+                        # `pwd` reports the spawn cwd, so a round trip proves the
+                        # broker honored the relay-supplied working directory.
+                        "pwd": {"command": {"argv": ["pwd"]}},
+                    },
+                },
                 fh,
             )
         self.sock_path = os.path.join(self._tmp.name, "broker.sock")
@@ -605,6 +680,31 @@ class BrokerSocketRoundTripTests(_EnvIsolation, unittest.TestCase):
             got += chunk
         client.close()
         self.assertEqual(got, payload)
+
+    def test_spawn_uses_relay_supplied_cwd_over_socket(self):
+        # End-to-end: a server spawned by the broker must run in the cwd the
+        # relay forwarded in the handshake (issue 15 spawn-cwd fix), not the
+        # broker's own startup dir.
+        sess = os.path.join(self._tmp.name, "session-dir")
+        os.makedirs(sess, exist_ok=True)
+        # realpath: macOS/temp dirs may be symlinked; pwd reports the real path.
+        expected = os.path.realpath(sess)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._start_broker()
+        client.connect(self.sock_path)
+        client.sendall(protocol.encode_request("pwd", None, sess))
+        ok, err = protocol.decode_reply(protocol.read_line(client.recv))
+        self.assertTrue(ok, err)
+        client.shutdown(socket.SHUT_WR)
+        got = b""
+        client.settimeout(5)
+        while True:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            got += chunk
+        client.close()
+        self.assertEqual(got.decode().strip(), expected)
 
     def test_refuse_out_of_scope_over_socket(self):
         self._start_broker()

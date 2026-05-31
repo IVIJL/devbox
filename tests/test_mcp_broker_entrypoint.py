@@ -201,13 +201,13 @@ class DockerRunMountTests(unittest.TestCase):
             self.text, r'DEVBOX_MCP_HOST_STORE="\$HOME/\.config/devbox/mcp"'
         )
 
-    def test_host_mcp_store_mounted_only_when_present(self):
-        # Mounted only when the host store dir exists (no imported servers ->
-        # nothing to mount).
-        self.assertRegex(
-            self.text,
-            r'if \[ -d "\$DEVBOX_MCP_HOST_STORE" \]',
-        )
+    def test_host_mcp_store_created_and_mounted_unconditionally(self):
+        # The host store is created up front and mounted UNCONDITIONALLY so a
+        # server imported into a RUNNING Container is visible to the broker on
+        # the next session without a restart (ADR 0014). A conditional mount
+        # would leave a Container started before any import with no live mount.
+        self.assertRegex(self.text, r'mkdir -p "\$DEVBOX_MCP_HOST_STORE"')
+        self.assertNotRegex(self.text, r'if \[ -d "\$DEVBOX_MCP_HOST_STORE" \]')
 
 
 if __name__ == "__main__":  # pragma: no cover

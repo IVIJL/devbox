@@ -148,9 +148,18 @@ def run(server_name: str, project_key: Optional[str] = None) -> int:
     require_container()
 
     path = socket_path()
+    # Capture the relay's working directory so the broker spawns the server with
+    # the agent SESSION's cwd, not the broker's long-lived startup dir. The old
+    # execvpe runner inherited the launching agent's cwd directly; the broker
+    # (issue 15) does not, so project-local MCP servers that resolve relative
+    # paths would otherwise break. cwd is not a secret — just a directory.
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = None
     sock = _connect(path)
     try:
-        sock.sendall(encode_request(server_name, project_key))
+        sock.sendall(encode_request(server_name, project_key, cwd))
         try:
             reply = read_line(sock.recv)
             ok, error = decode_reply(reply)

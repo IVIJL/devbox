@@ -41,24 +41,34 @@ class ProtocolError(RuntimeError):
     """A malformed or oversized handshake on the broker/relay socket."""
 
 
-def encode_request(server: str, project_key: Optional[str]) -> bytes:
-    """Encode a relay -> broker handshake request (server name + scope).
+def encode_request(
+    server: str, project_key: Optional[str], cwd: Optional[str] = None
+) -> bytes:
+    """Encode a relay -> broker handshake request (server name + scope + cwd).
 
     ``project_key`` is the absolute host path for a Project-scoped server, or
-    ``None``/empty for a global one. Only names cross the wire — never a value.
+    ``None``/empty for a global one. ``cwd`` is the relay's working directory so
+    the broker can spawn the server with the agent session's cwd rather than the
+    broker's own startup dir (project-local MCP commands rely on relative paths).
+    The cwd is NOT a secret — it is a working directory, carried so the spawned
+    server resolves relative paths against the session, not the broker. Only
+    names + the cwd cross the wire; never a credential value.
     """
     obj: dict[str, Any] = {"server": str(server)}
     if project_key:
         obj["project"] = str(project_key)
+    if cwd:
+        obj["cwd"] = str(cwd)
     return (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def decode_request(line: bytes) -> tuple[str, Optional[str]]:
-    """Decode a relay -> broker handshake into ``(server, project_key)``.
+def decode_request(line: bytes) -> tuple[str, Optional[str], Optional[str]]:
+    """Decode a relay -> broker handshake into ``(server, project_key, cwd)``.
 
     Raises :class:`ProtocolError` for anything that is not a JSON object with a
     non-empty string ``server`` field, so the broker rejects junk before it
-    touches a profile or spawns anything.
+    touches a profile or spawns anything. ``cwd`` is optional (older relays omit
+    it); the broker validates it before use and falls back to a safe default.
     """
     try:
         obj = json.loads(line.decode("utf-8"))
@@ -72,7 +82,10 @@ def decode_request(line: bytes) -> tuple[str, Optional[str]]:
     project = obj.get("project")
     if project is not None and not isinstance(project, str):
         raise ProtocolError("handshake 'project' must be a string when present")
-    return server, (project or None)
+    cwd = obj.get("cwd")
+    if cwd is not None and not isinstance(cwd, str):
+        raise ProtocolError("handshake 'cwd' must be a string when present")
+    return server, (project or None), (cwd or None)
 
 
 def encode_reply(ok: bool, error: Optional[str] = None) -> bytes:

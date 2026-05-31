@@ -3499,12 +3499,19 @@ DOCKER_ARGS+=(-v "$HOME/.codex:/home/node/.codex")
 # this mount, and the root phase stages the in-scope 0600 secret files out of it
 # into a devbox-mcp-private 0400 store. A plain node-readable mount would expose
 # the secrets to the agent (host 0600 -> node UID), so it MUST stay gated.
-# Mounted only when the host store exists (no MCP servers imported -> nothing to
-# mount; the broker then has an empty profile and stages nothing).
+# Mounted UNCONDITIONALLY: the host store is created up front (below) so the
+# bind-mount is always present. Without it, importing an MCP server into a
+# RUNNING Container (devbox mcp import/add creates the host store after start)
+# would leave the broker with an empty in-container mount and no way to see the
+# new profile until a restart — violating ADR 0014's guarantee that enable/
+# disable/add take effect next session with no restart. The store is a live
+# read-only mount, so a profile written on the host after start is visible to the
+# broker immediately. The host dir is created as the invoking user (matching the
+# other ~/.config/devbox dirs above), so no root-owned path appears; the
+# entrypoint root phase gates the in-container mount to devbox-mcp 0700 regardless.
 DEVBOX_MCP_HOST_STORE="$HOME/.config/devbox/mcp"
-if [ -d "$DEVBOX_MCP_HOST_STORE" ]; then
-    DOCKER_ARGS+=(-v "$DEVBOX_MCP_HOST_STORE:/run/devbox-mcp/host/devbox/mcp:ro")
-fi
+mkdir -p "$DEVBOX_MCP_HOST_STORE"
+DOCKER_ARGS+=(-v "$DEVBOX_MCP_HOST_STORE:/run/devbox-mcp/host/devbox/mcp:ro")
 
 # SSH config: --ssh-config uses full host config, otherwise devbox-specific config
 DEVBOX_SSH_CONFIG="$HOME/.config/devbox/ssh_config"

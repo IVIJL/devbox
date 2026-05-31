@@ -246,8 +246,30 @@ def _load_in_scope_spec(
     return spec, secrets_path
 
 
-def _build_spawn(server: str, requested_key: Optional[str]) -> tuple[list[str], dict]:
-    """Build the (argv, env) for a fresh, in-scope server spawn as devbox-mcp.
+def _resolve_spawn_cwd(requested_cwd: Optional[str]) -> Optional[str]:
+    """Validate the relay-supplied cwd, falling back to a safe default.
+
+    The relay sends the agent session's working directory so a project-local
+    server resolves relative paths against the session, not the broker's startup
+    dir. The cwd is not a secret, but it IS untrusted input from the relay, so we
+    only honor it when it names a directory the broker can actually enter
+    (``os.chdir`` would otherwise make the spawn fail). If the relay omits it or
+    it is not a usable directory, return ``None`` so ``Popen`` keeps the broker's
+    own cwd rather than failing the spawn — a safe, available default.
+    """
+    if not requested_cwd:
+        return None
+    if not os.path.isdir(requested_cwd):
+        return None
+    if not os.access(requested_cwd, os.R_OK | os.X_OK):
+        return None
+    return requested_cwd
+
+
+def _build_spawn(
+    server: str, requested_key: Optional[str], requested_cwd: Optional[str] = None
+) -> tuple[list[str], dict, Optional[str]]:
+    """Build the (argv, env, cwd) for a fresh, in-scope server spawn as devbox-mcp.
 
     The argv comes from the profile; the env is the broker's own environment
     plus the server's resolved env overlay. The overlay reads non-secret values
@@ -298,7 +320,12 @@ def _build_spawn(server: str, requested_key: Optional[str]) -> tuple[list[str], 
     home = child_env.get("HOME") or os.path.expanduser("~")
     child_env["XDG_CONFIG_HOME"] = os.path.join(home, ".config")
     child_env.update(overlay)
-    return argv, child_env
+    # Spawn the server in the agent session's cwd (relay-supplied) so project-
+    # local servers resolve relative paths against the session, not the broker's
+    # startup dir. _resolve_spawn_cwd validates it and falls back to None (keep
+    # the broker's own cwd) when it is missing or unusable.
+    spawn_cwd = _resolve_spawn_cwd(requested_cwd)
+    return argv, child_env, spawn_cwd
 
 
 def _pump(src_fd: int, dst_fd: int, on_eof=None) -> None:
@@ -409,7 +436,7 @@ def _handle(conn: socket.socket) -> None:
     try:
         try:
             line = read_line(conn.recv)
-            server, project_key = decode_request(line)
+            server, project_key, requested_cwd = decode_request(line)
         except ProtocolError as exc:
             conn.sendall(encode_reply(False, f"bad handshake: {exc}"))
             return
@@ -424,7 +451,9 @@ def _handle(conn: socket.socket) -> None:
         conn.settimeout(None)
 
         try:
-            argv, child_env = _build_spawn(server, project_key)
+            argv, child_env, spawn_cwd = _build_spawn(
+                server, project_key, requested_cwd
+            )
         except BrokerError as exc:
             conn.sendall(encode_reply(False, str(exc)))
             return
@@ -436,6 +465,7 @@ def _handle(conn: socket.socket) -> None:
                 stdout=subprocess.PIPE,
                 stderr=sys.stderr,
                 env=child_env,
+                cwd=spawn_cwd,
                 close_fds=True,
             )
         except OSError as exc:

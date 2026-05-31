@@ -204,7 +204,9 @@ class RelayRefusalTests(unittest.TestCase):
         msg = str(ctx.exception)
         self.assertIn("refused", msg.lower())
         self.assertIn("out of scope", msg)
-        self.assertEqual(stub.received_request, ("evil", None))
+        # The relay also forwards its cwd (3rd element) so the broker can spawn
+        # the server in the agent session's dir; assert only the names here.
+        self.assertEqual(stub.received_request[:2], ("evil", None))
 
 
 class RelayProxyTests(unittest.TestCase):
@@ -262,7 +264,9 @@ class RelayProxyTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(got, payload)
-        self.assertEqual(stub.received_request, ("echo", None))
+        self.assertEqual(stub.received_request[:2], ("echo", None))
+        # The relay forwards its working directory as the 3rd handshake element.
+        self.assertEqual(stub.received_request[2], os.getcwd())
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -64,6 +64,16 @@ HOST_WS_GID=1000
 # The remount targets the SAME absolute path as the source (ADR 0004 parity): we
 # bind the existing workspace onto itself with the idmap option. util-linux
 # applies X-mount.idmap to the new bind only, so the source view is untouched.
+#
+# Mapping DIRECTION (do not flip — verified empirically on the host, util-linux
+# 2.39.3, ext4): `X-mount.idmap=u:<from>:<to>` maps the backing/filesystem id
+# <from> to the id <to> seen inside the mount. The workspace files are backed by
+# host UID/GID 1000, and we want them to appear owned by devbox-mcp inside the
+# broker namespace, so <from>=host id, <to>=devbox-mcp id:
+#   u:1000:1001:1  -> view owner 1001:1001 (devbox-mcp, writable)  ✓
+#   u:1001:1000:1  -> view owner 65534    (overflow/nobody)        ✗
+# Requires util-linux >= 2.39 (the X-mount.idmap option); older `mount` (e.g.
+# 2.38.1) rejects it and remount_workspace_idmapped() falls back to read-only.
 build_idmap_mount_cmd() {
     local source="$1" mcp_uid="$2" mcp_gid="$3" host_uid="$4" host_gid="$5"
     printf '%s\n' \

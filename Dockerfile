@@ -13,6 +13,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     # Claude Code packages
     less git procps sudo zsh man-db unzip gnupg2 gh \
     iptables ipset iproute2 dnsutils aggregate jq nano vim dnsmasq iputils-ping socat \
+    # util-linux: setpriv (broker credential drop) + unshare/mount (ADR 0014
+    # issue 21 per-broker mount namespace + X-mount.idmap workspace remount).
+    # Already pulled in by the base image, listed here to make the broker's hard
+    # dependency explicit and survive a future slimmer base.
+    util-linux \
     # Rootless Docker prerequisites
     uidmap fuse-overlayfs slirp4netns \
     # User packages
@@ -383,6 +388,12 @@ COPY scripts/mcp-run.sh /usr/local/bin/devbox-mcp-run
 # Container MCP broker launcher (ADR 0014, issue 15). Runs the Python broker as
 # devbox-mcp (started from the entrypoint root phase before the node drop).
 COPY scripts/mcp-broker.sh /usr/local/bin/devbox-mcp-broker
+# Container MCP broker mount-namespace wrapper (ADR 0014 "Update 2026-05-31",
+# issue 21). Run as root inside `unshare --mount` from the entrypoint root phase:
+# idmap-remounts the workspace rw for devbox-mcp in a private namespace, then
+# execs the credential drop + broker. Needs util-linux `unshare`/`mount`/`setpriv`
+# (installed in Layer 1).
+COPY scripts/mcp-broker-namespace.sh /usr/local/bin/mcp-broker-namespace
 # Container MCP secret staging (ADR 0014, issue 16). Run as root from the
 # entrypoint root phase (and issue 17's `devbox mcp reload`) to copy the
 # in-scope secret stores out of the gated read-only host mount into the
@@ -432,6 +443,7 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/agent-browser \
     /usr/local/bin/devbox-mcp-run \
     /usr/local/bin/devbox-mcp-broker \
+    /usr/local/bin/mcp-broker-namespace \
     /usr/local/bin/stage-mcp-secrets \
     /usr/local/bin/devbox-identity-context.sh
 

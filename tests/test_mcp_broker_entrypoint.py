@@ -27,6 +27,7 @@ import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENTRYPOINT = os.path.join(REPO_ROOT, "scripts", "devbox-entrypoint.sh")
+NAMESPACE = os.path.join(REPO_ROOT, "scripts", "mcp-broker-namespace.sh")
 DOCKERFILE = os.path.join(REPO_ROOT, "Dockerfile")
 DOCKER_RUN = os.path.join(REPO_ROOT, "docker-run.sh")
 
@@ -39,11 +40,17 @@ def _read(path):
 class EntrypointBrokerTests(unittest.TestCase):
     def setUp(self):
         self.text = _read(ENTRYPOINT)
+        # The broker-launch internals (credential drop + clean devbox-mcp env)
+        # were hoisted into the namespace wrapper (issue 21) so they run INSIDE
+        # the per-broker mount namespace; assertions about them read it.
+        self.ns_text = _read(NAMESPACE)
 
     def test_broker_started_before_node_drop(self):
-        broker_idx = self.text.find("devbox-mcp-broker")
+        # The broker launch (now via the namespace wrapper) must come before the
+        # node drop in the entrypoint root phase.
+        broker_idx = self.text.find("mcp-broker-namespace")
         node_drop_idx = self.text.find("--reuid=node")
-        self.assertNotEqual(broker_idx, -1, "broker start missing")
+        self.assertNotEqual(broker_idx, -1, "broker namespace launch missing")
         self.assertNotEqual(node_drop_idx, -1, "node drop missing")
         self.assertLess(
             broker_idx, node_drop_idx, "broker must start before the node drop"
@@ -51,21 +58,22 @@ class EntrypointBrokerTests(unittest.TestCase):
 
     def test_broker_full_credential_reset(self):
         # The broker's setpriv must reset uid AND gid AND init-groups, not just
-        # uid — otherwise it retains root's groups (ADR 0014).
+        # uid — otherwise it retains root's groups (ADR 0014). This now lives in
+        # the namespace wrapper, which execs the drop inside the namespace.
         m = re.search(
             r"setpriv\s+--reuid=devbox-mcp\s+--regid=devbox-mcp\s+--init-groups",
-            self.text,
+            self.ns_text,
         )
         self.assertIsNotNone(
             m, "broker setpriv must use --reuid + --regid + --init-groups"
         )
 
     def test_broker_is_backgrounded(self):
-        # The broker is always-on; it must be backgrounded so the script
-        # proceeds to the node exec.
+        # The broker is always-on; the namespace wrapper that launches it must be
+        # backgrounded so the entrypoint proceeds to the node exec.
         self.assertRegex(
             self.text,
-            r"/usr/local/bin/devbox-mcp-broker\s*&",
+            r"/usr/local/bin/mcp-broker-namespace\s*&",
         )
 
     def test_node_drop_is_exec(self):
@@ -97,16 +105,17 @@ class EntrypointBrokerTests(unittest.TestCase):
         # The broker (and the servers it spawns) must run with devbox-mcp's own
         # HOME / npm cache, not root's inherited environment, so npx servers can
         # write their cache. `env -i` resets the environment before setting it.
-        self.assertIn("env -i", self.text)
-        self.assertRegex(self.text, r"HOME=/home/devbox-mcp")
-        self.assertRegex(self.text, r"npm_config_cache=/home/devbox-mcp/\.npm")
+        # This launch now lives in the namespace wrapper (issue 21).
+        self.assertIn("env -i", self.ns_text)
+        self.assertRegex(self.ns_text, r"HOME=/home/devbox-mcp")
+        self.assertRegex(self.ns_text, r"npm_config_cache=/home/devbox-mcp/\.npm")
 
     def test_broker_reads_profile_from_gated_mount(self):
         # XDG_CONFIG_HOME must point at the GATED host MCP store mount (ADR 0014
         # issue 16) so mcp.profile.config_root() (XDG + /devbox/mcp) reads the
         # live, secret-free profile through the devbox-mcp-only 0700 parent —
-        # never node's own config tree.
-        self.assertRegex(self.text, r"XDG_CONFIG_HOME=/run/devbox-mcp/host")
+        # never node's own config tree. Set in the namespace wrapper's launch.
+        self.assertRegex(self.ns_text, r"XDG_CONFIG_HOME=/run/devbox-mcp/host")
 
     def test_host_store_parent_chain_gated_0700_devbox_mcp(self):
         # The mount-point parents docker creates root:root 0755 must be re-owned
@@ -137,8 +146,10 @@ class EntrypointBrokerTests(unittest.TestCase):
             r"install -d -o devbox-mcp -g devbox-mcp -m 0700 "
             r"/run/devbox-mcp/secrets",
         )
+        # The broker is POINTED at that dir via DEVBOX_MCP_SECRETS_DIR in its
+        # launch env, which lives in the namespace wrapper (issue 21).
         self.assertRegex(
-            self.text, r"DEVBOX_MCP_SECRETS_DIR=/run/devbox-mcp/secrets"
+            self.ns_text, r"DEVBOX_MCP_SECRETS_DIR=/run/devbox-mcp/secrets"
         )
 
     def test_identity_records_full_project_key(self):
@@ -146,6 +157,70 @@ class EntrypointBrokerTests(unittest.TestCase):
         # broker can bind Project scope to exactly this Container.
         self.assertIn("projectKey", self.text)
         self.assertIn("DEVBOX_PROJECT_HOST_PATH", self.text)
+
+    def test_broker_wrapped_in_private_mount_namespace(self):
+        # ADR 0014 issue 21: the broker runs inside its OWN mount namespace
+        # (`unshare --mount --propagation private`) so the workspace can be
+        # idmap-remounted rw for devbox-mcp without touching node's view.
+        self.assertRegex(
+            self.text,
+            r"unshare --mount --propagation private",
+        )
+        # The namespace wrapper (which holds the idmap remount + the credential
+        # drop) is what unshare runs.
+        self.assertRegex(
+            self.text,
+            r"unshare --mount --propagation private\s+\\\s*"
+            r"-- /usr/local/bin/mcp-broker-namespace",
+        )
+
+    def test_broker_namespace_is_backgrounded(self):
+        # The broker (now via the namespace wrapper) is still always-on /
+        # backgrounded so the script proceeds to the node exec.
+        self.assertRegex(
+            self.text,
+            r"/usr/local/bin/mcp-broker-namespace\s*&",
+        )
+
+    def test_socket_dir_created_before_unshare(self):
+        # ORDERING IS LOAD-BEARING (issue 21): the /run/devbox-bridge socket dir
+        # must be created BEFORE the unshare, so the socket the broker creates in
+        # the inherited /run tmpfs stays visible/connectable from node's main
+        # namespace and the setgid dir still forces the bridge group/mode.
+        socket_dir_idx = self.text.find(
+            "install -d -o devbox-mcp -g devbox-bridge -m 2770 /run/devbox-bridge"
+        )
+        unshare_idx = self.text.find("unshare --mount --propagation private")
+        self.assertNotEqual(socket_dir_idx, -1, "socket dir setup missing")
+        self.assertNotEqual(unshare_idx, -1, "unshare missing")
+        self.assertLess(
+            socket_dir_idx,
+            unshare_idx,
+            "the bridge socket dir must be created before the unshare",
+        )
+
+    def test_secret_dirs_created_before_unshare(self):
+        # The /run/devbox-mcp secret/profile dirs (on inherited tmpfs) are also
+        # created before the unshare so they survive into the broker namespace.
+        secret_dir_idx = self.text.find(
+            "install -d -o devbox-mcp -g devbox-mcp -m 0700 /run/devbox-mcp/secrets"
+        )
+        unshare_idx = self.text.find("unshare --mount --propagation private")
+        self.assertNotEqual(secret_dir_idx, -1, "secret dir setup missing")
+        self.assertLess(
+            secret_dir_idx,
+            unshare_idx,
+            "the secret dirs must be created before the unshare",
+        )
+
+    def test_run_is_not_remounted(self):
+        # The namespace must NEVER remount /run, or the inherited sockets/secret
+        # tmpfs would be shadowed and the relay could not reach the broker. Guard
+        # the namespace wrapper (where mounts happen), matching a real `mount`
+        # COMMAND (line-leading, not the word "mounts" in prose) targeting /run.
+        self.assertNotRegex(
+            self.ns_text, r"(?m)^\s*mount\b[^\n]*\s/run(/|\b)"
+        )
 
 
 class DockerfileAccountTests(unittest.TestCase):
@@ -206,6 +281,21 @@ class DockerfileAccountTests(unittest.TestCase):
             self.text,
         )
         self.assertIn("/usr/local/bin/stage-mcp-secrets", self.text)
+
+    def test_broker_namespace_wrapper_shipped_and_executable(self):
+        # ADR 0014 issue 21: the mount-namespace wrapper (idmap remount +
+        # credential drop) ships on PATH and is chmod +x.
+        self.assertIn(
+            "COPY scripts/mcp-broker-namespace.sh "
+            "/usr/local/bin/mcp-broker-namespace",
+            self.text,
+        )
+        self.assertIn("/usr/local/bin/mcp-broker-namespace", self.text)
+
+    def test_util_linux_installed_for_unshare_mount_setpriv(self):
+        # The broker namespace needs util-linux unshare/mount/setpriv. It is
+        # listed explicitly so the dependency survives a slimmer base image.
+        self.assertIn("util-linux", self.text)
 
 
 class DockerRunMountTests(unittest.TestCase):

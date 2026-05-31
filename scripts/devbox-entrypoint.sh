@@ -143,35 +143,35 @@ if [ "$(id -u)" = "0" ]; then
             /usr/local/bin/stage-mcp-secrets || \
                 echo "devbox: WARNING: MCP secret staging failed; secret-bearing servers may report missing env." >&2
         fi
-        # setpriv switches credentials but PRESERVES the (root) environment, so
-        # the broker — and every MCP server it spawns as devbox-mcp — would
-        # otherwise inherit root's HOME and npm settings and try to write under
-        # node-owned/root-owned paths. `env -i` starts from a clean slate and we
-        # set exactly devbox-mcp's runtime env:
-        #   * HOME + npm/npx cache under devbox-mcp's own writable HOME, so
-        #     on-demand `npx` MCP servers run under the service account;
-        #   * XDG_CONFIG_HOME -> the GATED host MCP store mount so
-        #     mcp.profile.config_root() (XDG_CONFIG_HOME + /devbox/mcp) reads the
-        #     same (secret-free) profile the host writes, LIVE — enable/disable/
-        #     add take effect next session with no restart (ADR 0014). The mount
-        #     parent is 0700 devbox-mcp, so the broker traverses it but node
-        #     cannot; the broker reads only the secret-FREE profile here, never
-        #     the 0600 secret files (wrong UID). With no host store mounted this
-        #     path is absent and the broker cleanly sees an empty profile.
-        #   * DEVBOX_MCP_SECRETS_DIR -> the private staged secret dir above, the
-        #     ONLY place the broker reads secret VALUES from;
-        #   * a minimal PATH including npm-global bin (npx/node) + system dirs.
-        setpriv --reuid=devbox-mcp --regid=devbox-mcp --init-groups \
-            -- env -i \
-                HOME=/home/devbox-mcp \
-                USER=devbox-mcp \
-                LOGNAME=devbox-mcp \
-                XDG_CONFIG_HOME=/run/devbox-mcp/host \
-                DEVBOX_MCP_SECRETS_DIR=/run/devbox-mcp/secrets \
-                npm_config_cache=/home/devbox-mcp/.npm \
-                XDG_CACHE_HOME=/home/devbox-mcp/.cache \
-                PATH=/usr/local/share/npm-global/bin:/usr/local/bin:/usr/bin:/bin \
-                /usr/local/bin/devbox-mcp-broker &
+        # Launch the broker inside its OWN mount namespace so the project
+        # workspace can be re-mounted READ/WRITE for devbox-mcp without touching
+        # the host or node's view (ADR 0014 "Update 2026-05-31", issue 21).
+        #
+        # `unshare --mount --propagation private` gives the broker a private copy
+        # of the mount tree; mcp-broker-namespace then idmap-remounts the SAME
+        # absolute $DEVBOX_PROJECT_HOST_PATH there (host 1000:1000 -> devbox-mcp)
+        # and execs the credential-drop + broker. Because the remount is private,
+        # node's main-namespace workspace stays a plain direct bind (no overhead,
+        # host untouched); the servers the broker spawns INHERIT the namespace and
+        # see the workspace writable. On a non-idmap filesystem (Windows-mounted
+        # 9p/drvfs) the remount fails and the script falls back to the inherited
+        # read-only-effective bind, logging the downgrade (no silent fallback).
+        #
+        # ORDERING IS LOAD-BEARING: the /run/devbox-bridge socket dir + the
+        # /run/devbox-mcp secret/profile dirs are created ABOVE, BEFORE this
+        # unshare. They live on /run tmpfs inherited into the private namespace,
+        # so the broker socket the broker creates there stays visible/connectable
+        # from node's main namespace (the relay still reaches the broker) and the
+        # setgid /run/devbox-bridge dir still forces the socket's devbox-bridge
+        # group + 0660 mode. This script NEVER remounts /run.
+        #
+        # The credential reset + clean devbox-mcp env (issue 15) and the broker
+        # launch live in mcp-broker-namespace so they run INSIDE the namespace as
+        # devbox-mcp (ADR 0003: remount as root first, then exec setpriv — no
+        # setuid, no residual root; the namespace is kept alive by the broker
+        # running as devbox-mcp, which node cannot enter).
+        unshare --mount --propagation private \
+            -- /usr/local/bin/mcp-broker-namespace &
     else
         echo "devbox: WARNING: devbox-mcp account missing; MCP broker not started." >&2
     fi

@@ -220,13 +220,75 @@ privileged runtime path:
   trust-boundary subsection): peers share the `devbox-mcp` UID and can read each
   other's secrets via `/proc/<pid>/environ`. This is an accepted non-goal,
   documented here and in the README MCP section.
-- Spawned servers run as `devbox-mcp`, not as the agent user `node` (host UID
-  1000), so they have **no write access to the workspace** bind-mount (owned by
-  `node`/UID 1000) and **cannot read private `0600` project files**; ordinary
-  group/other-readable `0644` files they can still read. The v1 Container servers
-  (`context7`, `taskmaster-ai`) are read-only/API-based and do not touch the
-  workspace, so they are unaffected. **Filesystem-type servers that MUTATE the
-  workspace are not supported in this version.** This is the same trade-off
-  family as peer isolation above — running servers under `node` would re-expose
-  their secrets to the agent — and closing it is the same future decision
-  (per-server distinct UIDs requiring runtime privilege outside ADR 0003).
+- Spawned servers run as `devbox-mcp`, not as the agent user `node`. So that the
+  separate UID does not cost a server its access to the Container, `devbox-mcp` is
+  a **peer-equal citizen** of `node` — see the 2026-05-31 update below: the
+  workspace is reachable read/write via an idmapped mount, and the rootless Docker
+  socket via a Container-internal bridge group, while `node` and `devbox-mcp` stay
+  out of each other's private files. Credential isolation (the agent → server
+  guarantee above) is unchanged.
+
+## Update 2026-05-31 — the Container MCP server is a peer-equal citizen
+
+The decision above closes the *credential* boundary (the agent cannot read a
+server's secrets) but never specified the server's **access to the Container**.
+The first implementation (issues 14–17) therefore left `devbox-mcp` with only its
+own group, so a spawned server could neither write the workspace (owned by `node`,
+UID 1000) nor reach the rootless Docker socket (in `node`'s runtime dir) — and a
+review-round comment was briefly mis-documented as "filesystem servers that mutate
+the workspace are not supported". **That limitation is retracted.** The intended
+model is:
+
+> A Container MCP server is a **peer-equal citizen** of `node`: equally a full,
+> sudo-less user of the Container, with the *same practical reach into the
+> Container* as the agent. The only asymmetry is privacy — `node` cannot read the
+> server's secrets, and (symmetrically) neither identity sees into the other's
+> private files unless a resource is *deliberately* shared.
+
+This is a complement to the credential boundary, not a weakening of it: secrets stay
+`0400`/`0700` owner-only to `devbox-mcp`, `node`'s home stays owner-only to `node`,
+and only explicitly-shared resources cross. Mechanisms, each chosen so the **host is
+never touched** (no host-side group, no host permission changes):
+
+- **Bridge group — shared runtime sockets.** A Container-internal system group
+  (`devbox-bridge`) created in the Dockerfile **only inside the image** (never on
+  the host — the sockets live in `/run`, so the group never reaches host files and
+  needs no fixed/host-registered GID). Both `node` and `devbox-mcp` are members.
+  The broker socket and the Docker socket live in a neutral `/run` location owned
+  with group `devbox-bridge` (`0660`/`0770`), so each identity reaches the shared
+  sockets **without being a member of the other's primary group**. This removes the
+  previous `node ∈ devbox-mcp` cross-membership: neither account is in the other's
+  group anymore; they meet only at the bridge.
+- **Docker socket — placed in the shared location.** Rootless `dockerd` (run by
+  `node`) is pointed at a bridge-group-readable socket path (or its socket is
+  `chgrp devbox-bridge` + `g+rw` immediately after start), and `DOCKER_HOST` /
+  `XDG_RUNTIME_DIR` are propagated from the broker into each spawned child. This
+  brings **`docker`/`podman`-launcher MCP servers into scope** (npx/uvx/python
+  servers were never affected). Accepted trade-off: holding the Docker socket means
+  node-level Docker capability, so a server that uses Docker can act through the
+  rootless daemon as `node` would — Docker is a deliberately-shared tool.
+- **Workspace — idmapped bind-mount.** The workspace is exposed to `devbox-mcp`
+  through an idmapped mount so the `node`-owned (UID 1000) files appear owned by
+  `devbox-mcp` for read/write, **without altering the host files, their ownership,
+  or their permissions**. This needs nothing on the host and cannot be broken by an
+  on-host `chmod`/`chgrp`. Requires kernel ≥ 5.12 (the WSL2 6.6 kernel qualifies)
+  and Docker-runtime support for idmapped mounts — verified at build; the fallback
+  if unavailable is a fixed-GID `devbox-bridge` ownership on the workspace
+  (re-applied at container start), which is the only path that would touch host
+  file metadata.
+
+Consequences of this update:
+
+- The **host is untouched**: no new host group, no host permission changes. All
+  sharing is Container-internal (bridge group in `/run`, idmap at mount time).
+- **Mutual invisibility is preserved and slightly strengthened**: dropping
+  `node ∈ devbox-mcp` means `node` no longer even nominally shares the service
+  account's group; secrets remain owner-only, `node`-home remains owner-only.
+- `docker`/`podman`-launcher servers are **supported**; the v1 servers
+  (`context7`, `taskmaster-ai`) continue to work unchanged.
+- The round-2 README/ADR statement "no workspace writes / filesystem servers
+  unsupported" is **withdrawn** in both documents.
+- ADR 0003 is still honored: the bridge group, idmap, and Docker-socket placement
+  are all set up in the entrypoint **root phase before the `node` drop** or baked
+  into the image — no setuid, no NOPASSWD, no persistent/residual root, no runtime
+  privilege escalation by `node`.

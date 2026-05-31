@@ -178,8 +178,20 @@ launches the server directly)
 **devbox-mcp**:
 The unprivileged Container service account that runs **Container MCP servers**
 and is the only non-root identity allowed to read the **MCP secret store**.
-Distinct from the agent user (`node`).
+Distinct from the agent user (`node`), but a **peer-equal citizen** of it: a full,
+sudo-less Container user with the same practical reach (workspace read/write,
+rootless Docker) as the agent. The only asymmetry is privacy — `node` cannot read
+its secrets, and neither account sees the other's private files. See ADR 0014.
 _Avoid_: MCP user, mcp-runner
+
+**devbox-bridge**:
+A Container-internal group whose members are both `node` and **devbox-mcp**, used
+to share only the runtime sockets (the **MCP broker** socket and the rootless
+Docker socket) between the two accounts. It exists only inside the **Container**
+(never on the host) and replaces the earlier `node`-in-`devbox-mcp` cross-membership,
+so neither account belongs to the other's primary group. The workspace is shared
+separately via an idmapped mount, not via this group. See ADR 0014.
+_Avoid_: mcp group, shared group
 
 **MCP secret store**:
 The credential values for **MCP servers**, kept host-side and delivered to the
@@ -247,6 +259,11 @@ _Avoid_: identity sentinel, container marker, devbox marker file
 - The **MCP profile** is delivered into the **Container** live (read-only mount);
   the **MCP secret store** is staged privately for **devbox-mcp** and refreshed
   into a running **Container** by `devbox mcp reload`, not by a restart.
+- **devbox-mcp** and `node` are peer-equal: they share only the runtime sockets
+  (via the **devbox-bridge** group) and the workspace (via an idmapped mount);
+  everything else stays private to each account. None of this sharing touches the
+  host — the bridge group lives only in the **Container** and the idmapped mount
+  leaves host file ownership/permissions unchanged (ADR 0014).
 
 ## Example dialogue
 

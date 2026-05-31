@@ -461,9 +461,13 @@ cmd_import_apply() {
 
     if [ "$json" = true ]; then
         _run_py_secret_write apply-json "${_scope_args[@]}" "${sel_args[@]}" || return $?
-        _maybe_auto_render "$no_render" true || { _finish_secret_write; return $?; }
+        # Capture the render status BEFORE the cleanup so a failed auto-render is
+        # surfaced (the cleanup's own exit status would otherwise mask it and the
+        # JSON path would falsely report success).
+        _maybe_auto_render "$no_render" true
+        local render_rc=$?
         _finish_secret_write
-        return 0
+        return "$render_rc"
     fi
     _run_py_secret_write apply-text "${_scope_args[@]}" "${sel_args[@]}" || return $?
     _maybe_auto_render "$no_render" false
@@ -1821,9 +1825,13 @@ cmd_add() {
 
     if [ "$json" = true ]; then
         _run_py_secret_write "$py_cmd" "${scope_args[@]}" "$name" -- "${spec[@]}" || return $?
-        _maybe_auto_render "$no_render" true || { _finish_secret_write; return $?; }
+        # Capture the render status BEFORE the cleanup so a failed auto-render is
+        # surfaced (the cleanup's own exit status would otherwise mask it and the
+        # JSON path would falsely report success).
+        _maybe_auto_render "$no_render" true
+        local render_rc=$?
         _finish_secret_write
-        return 0
+        return "$render_rc"
     fi
     _run_py_secret_write "$py_cmd" "${scope_args[@]}" "$name" -- "${spec[@]}" || return $?
     _maybe_auto_render "$no_render" false
@@ -1862,4 +1870,9 @@ main() {
     esac
 }
 
-main "$@"
+# Run the dispatcher only when executed directly; when sourced (e.g. by a unit
+# test exercising an individual cmd_* function) the functions are defined but
+# main does not run.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    main "$@"
+fi

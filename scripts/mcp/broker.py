@@ -63,17 +63,22 @@ from .projects import sanitize_basename
 from .runner import RunnerError, _resolve_env, _server_argv
 from .secrets import global_secrets_path, project_secrets_path
 
-# Default broker socket. It lives in a node-CONNECTABLE location (not the 0700
-# secret dir): connecting exposes only a stdio pipe, never a credential. The
-# parent directory is created 0755 (traversable) but the socket itself is 0660
-# owned devbox-mcp:devbox-mcp so only those two accounts may connect — and the
-# agent reaches it via group membership (see ensure_socket_dir / the Dockerfile
-# adding `node` to the `devbox-mcp` group). Overridable via env ONLY for tests.
-DEFAULT_SOCKET_PATH = "/run/devbox-mcp/broker.sock"
+# Default broker socket. It lives on the NEUTRAL `devbox-bridge` runtime path
+# (ADR 0014, issue 19), NOT inside the 0700 devbox-mcp secret dir: connecting
+# exposes only a stdio pipe, never a credential. The parent dir is owned
+# devbox-mcp:devbox-bridge 0770 and the socket itself is 0660 group-owned
+# devbox-bridge, so the broker (devbox-mcp) owns/serves it and the relay (node)
+# reaches it via membership in `devbox-bridge` — WITHOUT node being in
+# devbox-mcp's primary group (the cross-membership was removed; see the
+# Dockerfile bridge group and the entrypoint root phase that creates this dir).
+# This is the SINGLE SOURCE OF TRUTH for the socket path: relay.py imports
+# socket_path() from here, the entrypoint creates this exact dir, and the
+# Dockerfile/launcher never hard-code the path. Overridable via env ONLY for tests.
+DEFAULT_SOCKET_PATH = "/run/devbox-bridge/broker.sock"
 _SOCKET_PATH_ENV = "DEVBOX_MCP_BROKER_SOCKET"
 
 # Socket mode: owner + group read/write, no world access. `node` connects via
-# its membership in the `devbox-mcp` group; no other account can reach it.
+# its membership in the `devbox-bridge` group; no other account can reach it.
 _SOCKET_MODE = 0o660
 
 # Root of the devbox-mcp-PRIVATE staged secret store the broker reads secret
@@ -97,7 +102,7 @@ _PROXY_CHUNK = 64 * 1024
 # in read_line() until the relay names a server. Without a deadline a client that
 # connects and sends nothing (slowloris) pins that thread + fd forever, and
 # repeating it exhausts the broker — an availability attack on the credential
-# control plane (reachable by node via the devbox-mcp group). 10s is ample for a
+# control plane (reachable by node via the devbox-bridge group). 10s is ample for a
 # local relay to send one short handshake line; the deadline is CLEARED once the
 # handshake completes, since the subsequent stdio proxy is legitimately idle for
 # long stretches between MCP messages.
@@ -488,10 +493,11 @@ def _bind_socket(path: str) -> socket.socket:
     """Create and bind the broker's unix socket cleanly (idempotent on restart).
 
     A stale socket file from a previous run is removed first so a restart never
-    fails with ``EADDRINUSE``. The socket file is then chmodded to ``0660`` so
-    only ``devbox-mcp`` and its group (which includes ``node``) can connect; no
-    world access. The containing directory is assumed to exist and be owned by
-    ``devbox-mcp`` (created by the entrypoint root phase before the drop).
+    fails with ``EADDRINUSE``. The socket file is then chmodded to ``0660``; the
+    containing dir is group-owned ``devbox-bridge`` 0770 (created by the
+    entrypoint root phase before the drop), so the relay (``node``, a member of
+    ``devbox-bridge``) connects and the broker (``devbox-mcp``) serves — without
+    either being in the other's primary group, and with no world access.
     """
     parent = os.path.dirname(path)
     if parent:

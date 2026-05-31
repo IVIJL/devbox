@@ -13,8 +13,9 @@ and correct, so the host validation has a precise contract to confirm:
   * the broker is backgrounded (always-on) and runs the devbox-mcp-broker
     launcher;
   * the Dockerfile creates an unprivileged devbox-mcp account with its own HOME
-    and npm/npx cache, adds node to the devbox-mcp group (socket reach only),
-    and grants devbox-mcp NO sudo;
+    and npm/npx cache, creates the Container-internal devbox-bridge group with
+    both node and devbox-mcp as members (the broker-socket bridge, replacing the
+    old node ∈ devbox-mcp cross-membership), and grants devbox-mcp NO sudo;
   * ADR 0003 invariants: no NOPASSWD sudoers entry is introduced for the broker.
 """
 
@@ -73,12 +74,23 @@ class EntrypointBrokerTests(unittest.TestCase):
             "exec setpriv --reuid=node --regid=node --init-groups", self.text
         )
 
-    def test_socket_dir_owned_by_devbox_mcp_not_secret_dir(self):
-        # The socket dir is created for devbox-mcp and is NOT a 0700 secret dir
-        # (node must be able to traverse to connect via its group membership).
+    def test_socket_dir_on_neutral_bridge_path(self):
+        # The broker socket dir lives on the NEUTRAL devbox-bridge path (ADR 0014
+        # issue 19), owned devbox-mcp:devbox-bridge mode 2770 (setgid) — NOT
+        # inside the 0700 devbox-mcp secret dir. node reaches it via the
+        # devbox-bridge group; the setgid bit makes the socket inherit that group.
         self.assertRegex(
             self.text,
-            r"install -d -o devbox-mcp -g devbox-mcp -m 0750 /run/devbox-mcp",
+            r"install -d -o devbox-mcp -g devbox-bridge -m 2770 /run/devbox-bridge",
+        )
+
+    def test_devbox_mcp_runtime_root_is_owner_only(self):
+        # The devbox-mcp runtime root holds secrets + the gated profile mount and
+        # must stay 0700 OWNER-only — node never traverses it (the bridge socket
+        # moved out to /run/devbox-bridge), so no group access here.
+        self.assertRegex(
+            self.text,
+            r"install -d -o devbox-mcp -g devbox-mcp -m 0700 /run/devbox-mcp\b",
         )
 
     def test_broker_launched_with_clean_devbox_mcp_env(self):
@@ -151,8 +163,19 @@ class DockerfileAccountTests(unittest.TestCase):
         self.assertIn("/home/devbox-mcp/.npm", self.text)
         self.assertIn("--home-dir /home/devbox-mcp", self.text)
 
-    def test_node_added_to_devbox_mcp_group_for_socket(self):
-        self.assertIn("usermod -aG devbox-mcp node", self.text)
+    def test_node_not_in_devbox_mcp_group(self):
+        # ADR 0014 (2026-05-31, issue 19): the node ∈ devbox-mcp cross-membership
+        # is REMOVED. node and devbox-mcp meet only at the bridge, never in each
+        # other's primary group.
+        self.assertNotRegex(self.text, r"usermod -aG devbox-mcp node")
+
+    def test_bridge_group_created_with_both_members(self):
+        # The Container-internal devbox-bridge group is created in the image with
+        # BOTH node and devbox-mcp as members — the only thing they share. It is
+        # never created on the host (the sockets live in /run).
+        self.assertIn("groupadd --system devbox-bridge", self.text)
+        self.assertIn("usermod -aG devbox-bridge node", self.text)
+        self.assertIn("usermod -aG devbox-bridge devbox-mcp", self.text)
 
     def test_devbox_mcp_not_granted_sudo(self):
         # The only `usermod -aG sudo` in the image is for node (firewall

@@ -171,6 +171,29 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(payload[pos["i"] :], b"EXTRA-STREAM-BYTES")
 
 
+class SocketPathBridgeTests(unittest.TestCase):
+    """The broker socket path is on the neutral devbox-bridge runtime path and is
+    the single source of truth shared by the broker (bind) and the relay (connect).
+    """
+
+    def test_default_socket_on_neutral_bridge_not_secret_dir(self):
+        # ADR 0014 issue 19: the socket lives on /run/devbox-bridge (node reaches
+        # it via the devbox-bridge group), NOT inside the 0700 devbox-mcp secret
+        # runtime root — connecting must never require traversing the secret dir.
+        self.assertEqual(broker.DEFAULT_SOCKET_PATH, "/run/devbox-bridge/broker.sock")
+        self.assertFalse(
+            broker.DEFAULT_SOCKET_PATH.startswith("/run/devbox-mcp/"),
+            "socket must not live under the devbox-mcp secret runtime root",
+        )
+
+    def test_relay_uses_the_same_socket_path_source(self):
+        # The relay imports socket_path() FROM broker (single source of truth), so
+        # broker.bind and relay.connect can never drift to different paths.
+        from mcp import relay
+
+        self.assertIs(relay.socket_path, broker.socket_path)
+
+
 class BrokerScopeTests(_EnvIsolation, unittest.TestCase):
     """_load_in_scope_spec accepts in-scope names and refuses the rest."""
 
@@ -340,7 +363,7 @@ class BrokerSpawnBuildTests(_EnvIsolation, unittest.TestCase):
         # so a compromised in-scope server that inherited DEVBOX_MCP_SECRETS_DIR
         # could follow it straight to the staged store and read another scope's
         # secret file. The broker must never volunteer the path.
-        self._set_env(**{broker._SOCKET_PATH_ENV: "/run/devbox-mcp/broker.sock"})
+        self._set_env(**{broker._SOCKET_PATH_ENV: "/run/devbox-bridge/broker.sock"})
         with open(os.path.join(self.cfg_root, "profile.json"), "w") as fh:
             json.dump(
                 {"version": 1, "servers": {"ctx": {"command": {"argv": ["mycmd"]}}}},

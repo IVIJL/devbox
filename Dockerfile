@@ -97,23 +97,35 @@ ARG USERNAME=node
 #     without polluting node's cache or needing write access to node's HOME;
 #   * NO sudo and NO membership in any privileged group (ADR 0003: no path back
 #     to root from inside the Container).
-# `node` is added to the `devbox-mcp` group ONLY so it can connect to the broker
-# socket, which lives in the runtime dir `/run/devbox-mcp` (0750 group
-# devbox-mcp), NOT in this HOME. The service-account HOME is therefore kept
-# 0700 OWNER-only: node never needs to enter it, and a group-traversable HOME
-# would let node list/read group-readable files an MCP server might drop there
-# (npm/npx state, tokens, caches) — defeating the UID boundary. Group membership
-# grants the agent nothing here: devbox-mcp-private files stay 0400/0700
-# OWNER-only, and node only ever traverses `/run/devbox-mcp` to the socket.
-# `.config` is pre-created (writable) so a spawned MCP server's XDG_CONFIG_HOME
-# (which the broker points at this HOME, not node's profile mount) has a home.
+# node and devbox-mcp DELIBERATELY do NOT share each other's primary group
+# (ADR 0014 "peer-equal citizen", 2026-05-31): neither account is a member of
+# the other's group, so the service-account HOME stays 0700 OWNER-only (node
+# never sees group-readable files an MCP server might drop there — npm/npx
+# state, tokens, caches) and node's home stays owner-only to node. The two
+# identities meet ONLY at an explicit bridge: the `devbox-bridge` group below,
+# which owns the broker socket. `.config` is pre-created (writable) so a spawned
+# MCP server's XDG_CONFIG_HOME (which the broker points at this HOME, not node's
+# profile mount) has a home.
 RUN groupadd --system devbox-mcp && \
     useradd --system --gid devbox-mcp --create-home \
         --home-dir /home/devbox-mcp --shell /usr/sbin/nologin devbox-mcp && \
-    usermod -aG devbox-mcp node && \
     mkdir -p /home/devbox-mcp/.npm /home/devbox-mcp/.cache /home/devbox-mcp/.config && \
     chown -R devbox-mcp:devbox-mcp /home/devbox-mcp && \
     chmod 0700 /home/devbox-mcp
+
+# devbox-bridge group (ADR 0014, issue 19) — the SHARED-RUNTIME-SOCKET bridge.
+# Created ONLY inside the image, never on the host: the sockets that use it live
+# in /run (broker socket; future Docker socket), so the group never reaches host
+# files and the system-assigned GID is irrelevant (it never leaves the
+# Container). BOTH node and devbox-mcp are members. This is how the relay (node)
+# reaches the broker socket WITHOUT being in devbox-mcp's primary group: the
+# socket is group-owned `devbox-bridge` 0660 in a 0770 dir, so the broker
+# (devbox-mcp) owns/serves it and node connects via the bridge — credentials and
+# private homes stay owner-only and out of reach. The bridge is ONLY for sockets,
+# never for the secret store (which stays 0700/0400 owner-only to devbox-mcp).
+RUN groupadd --system devbox-bridge && \
+    usermod -aG devbox-bridge node && \
+    usermod -aG devbox-bridge devbox-mcp
 
 
 # Create workspace and config directories

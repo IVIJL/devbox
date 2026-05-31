@@ -93,20 +93,28 @@ if [ "$(id -u)" = "0" ]; then
     #   holds ONLY devbox-mcp's own groups (ADR 0014). Owned by devbox-mcp, the
     #   broker is unsignalable / unptraceable by node.
     #
-    # The socket dir is created here (root) and handed to devbox-mcp so the
-    # broker can create its socket; it lives OUTSIDE any 0700 secret dir
-    # (connecting exposes only a stdio pipe, no credential). 0750 group-owned
-    # devbox-mcp lets node (a member of the devbox-mcp group) traverse to the
-    # socket without granting world access. The broker always runs, even with no
-    # profile, so a server imported into a running Container works next session.
+    # The broker socket lives on the NEUTRAL `devbox-bridge` runtime path (ADR
+    # 0014, issue 19), created here (root) OUTSIDE any 0700 secret dir
+    # (connecting exposes only a stdio pipe, no credential). The dir is owned
+    # devbox-mcp:devbox-bridge mode 2770 (setgid): the broker (devbox-mcp) owns
+    # it and creates the socket there, while node — a member of `devbox-bridge`,
+    # NOT of devbox-mcp's primary group — traverses+connects via the bridge. The
+    # setgid bit forces the socket the broker creates to inherit group
+    # `devbox-bridge` (otherwise it would take devbox-mcp's primary group and
+    # node could not reach it). The broker always runs, even with no profile, so
+    # a server imported into a running Container works next session.
     #
-    # The PRIVATE staged secret dir is created 0700 devbox-mcp:devbox-mcp — node
-    # cannot traverse it. The root phase below stages the in-scope secret files
+    # The devbox-mcp runtime root /run/devbox-mcp stays 0700 devbox-mcp-OWNER-only
+    # (no bridge group here): it holds the PRIVATE staged secret dir and the gated
+    # profile mount, none of which node may ever traverse. The bridge is for
+    # SOCKETS ONLY — never for secrets. The staged secret dir is 0700
+    # devbox-mcp:devbox-mcp; the root phase below stages the in-scope secret files
     # (global + THIS Container's Project) into it as 0400 devbox-mcp files (issue
     # 16, scripts/stage-mcp-secrets.sh); the broker reads secret VALUES only from
     # here, never from the node-owned profile mount.
     if id devbox-mcp >/dev/null 2>&1; then
-        install -d -o devbox-mcp -g devbox-mcp -m 0750 /run/devbox-mcp
+        install -d -o devbox-mcp -g devbox-bridge -m 2770 /run/devbox-bridge
+        install -d -o devbox-mcp -g devbox-mcp -m 0700 /run/devbox-mcp
         install -d -o devbox-mcp -g devbox-mcp -m 0700 /run/devbox-mcp/secrets
 
         # Gate the host MCP store mount (ADR 0014, issue 16). docker-run.sh

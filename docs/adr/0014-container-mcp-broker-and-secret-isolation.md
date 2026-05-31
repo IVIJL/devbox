@@ -267,15 +267,38 @@ never touched** (no host-side group, no host permission changes):
   servers were never affected). Accepted trade-off: holding the Docker socket means
   node-level Docker capability, so a server that uses Docker can act through the
   rootless daemon as `node` would — Docker is a deliberately-shared tool.
-- **Workspace — idmapped bind-mount.** The workspace is exposed to `devbox-mcp`
-  through an idmapped mount so the `node`-owned (UID 1000) files appear owned by
-  `devbox-mcp` for read/write, **without altering the host files, their ownership,
-  or their permissions**. This needs nothing on the host and cannot be broken by an
-  on-host `chmod`/`chgrp`. Requires kernel ≥ 5.12 (the WSL2 6.6 kernel qualifies)
-  and Docker-runtime support for idmapped mounts — verified at build; the fallback
-  if unavailable is a fixed-GID `devbox-bridge` ownership on the workspace
-  (re-applied at container start), which is the only path that would touch host
-  file metadata.
+- **Workspace — per-broker mount namespace with an idmapped remount.** `node` keeps
+  the workspace as a plain direct bind-mount in the main namespace — no overhead, no
+  change. The broker is started inside its **own mount namespace**
+  (`unshare --mount --propagation private`) in which the *same absolute*
+  `$PROJECT_PATH` is re-mounted as an **idmapped bind** — using util-linux
+  `mount -o X-mount.idmap=u:1000:<devbox-mcp-uid>:1 g:1000:<devbox-mcp-gid>:1`, NOT
+  the Docker `--mount …,idmap` field (this environment's Docker rejects it). The MCP
+  servers the broker spawns inherit that namespace, so they see `$PROJECT_PATH` with
+  the files appearing owned by `devbox-mcp` for **read and write**, while the host
+  (and `node`'s view in the main namespace) stay `1000:1000`. Host files, ownership,
+  and permissions are **never altered**, and an on-host `chmod`/`chgrp` cannot break
+  it. Why this and not the earlier ideas:
+  - A single idmapped mount can't serve both identities on one path (one mapping per
+    mount); **two mount namespaces** (node's plain mount, the broker's idmapped
+    remount of the same path) give each its own mapping — that is the missing piece.
+  - The remount runs in the entrypoint **root phase before `exec setpriv … 
+    devbox-mcp-broker`**, so there is **no setuid helper and no residual root**
+    (unlike a FUSE/`bindfs` path, which would need setuid `fusermount3` or a
+    long-lived privileged helper). The namespace is kept alive by the broker running
+    as `devbox-mcp`; `node` (no root, no `CAP_SYS_ADMIN`) cannot enter it.
+  - `$PROJECT_PATH` stays the **same absolute host path** in both worlds, preserving
+    ADR 0004's cwd/session-key parity, so the shared host↔Container session history
+    keeps working. The runtime sockets in `/run` (broker socket, Docker socket,
+    secret store) live on tmpfs mounts inherited before `unshare`, so they remain
+    visible/connectable across the boundary — the relay still reaches the broker.
+
+  Requires kernel ≥ 5.12 (WSL2 6.6 qualifies) and an **idmap-capable filesystem** for
+  the source bind: ext4 (the WSL2-native project store) works; a Windows-mounted
+  `9p`/`drvfs` project does not. Detected at start; if unavailable the server falls
+  back to **read-only** workspace access (reads are free — project files are
+  world-readable) rather than touching host metadata, and the downgrade is logged
+  (no silent fallback).
 
 Consequences of this update:
 

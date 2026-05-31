@@ -373,6 +373,55 @@ class BrokerSpawnBuildTests(_EnvIsolation, unittest.TestCase):
         self.assertNotIn(broker._SECRETS_DIR_ENV, env)
         self.assertNotIn(broker._SOCKET_PATH_ENV, env)
 
+    def test_build_spawn_propagates_docker_env(self):
+        # ADR 0014 "Update 2026-05-31": a docker-launcher server must point at the
+        # Container's rootless daemon, so DOCKER_HOST + XDG_RUNTIME_DIR (the image
+        # ENV the broker inherits) are propagated into the child.
+        self._set_env(
+            DOCKER_HOST="unix:///run/user/1000/docker.sock",
+            XDG_RUNTIME_DIR="/run/user/1000",
+        )
+        with open(os.path.join(self.cfg_root, "profile.json"), "w") as fh:
+            json.dump(
+                {"version": 1, "servers": {"ctx": {"command": {"argv": ["mycmd"]}}}},
+                fh,
+            )
+        _argv, env, _cwd = broker._build_spawn("ctx", None)
+        self.assertEqual(env["DOCKER_HOST"], "unix:///run/user/1000/docker.sock")
+        self.assertEqual(env["XDG_RUNTIME_DIR"], "/run/user/1000")
+
+    def test_build_spawn_docker_env_propagation_keeps_issue15_stripping(self):
+        # The Docker vars are the ONLY additions: the issue-15 hardening that
+        # strips DEVBOX_MCP_SECRETS_DIR and the broker socket pointer must still
+        # hold even with DOCKER_HOST/XDG_RUNTIME_DIR present in the broker env.
+        self._set_env(
+            DOCKER_HOST="unix:///run/user/1000/docker.sock",
+            XDG_RUNTIME_DIR="/run/user/1000",
+            **{broker._SOCKET_PATH_ENV: "/run/devbox-bridge/broker.sock"},
+        )
+        with open(os.path.join(self.cfg_root, "profile.json"), "w") as fh:
+            json.dump(
+                {"version": 1, "servers": {"ctx": {"command": {"argv": ["mycmd"]}}}},
+                fh,
+            )
+        _argv, env, _cwd = broker._build_spawn("ctx", None)
+        self.assertNotIn(broker._SECRETS_DIR_ENV, env)
+        self.assertNotIn(broker._SOCKET_PATH_ENV, env)
+        self.assertEqual(env["DOCKER_HOST"], "unix:///run/user/1000/docker.sock")
+
+    def test_build_spawn_omits_docker_env_when_broker_lacks_it(self):
+        # On an image without rootless Docker the broker has no DOCKER_HOST, so a
+        # (non-Docker) server is spawned without it rather than with an empty value.
+        self._unset_env("DOCKER_HOST", "XDG_RUNTIME_DIR")
+        with open(os.path.join(self.cfg_root, "profile.json"), "w") as fh:
+            json.dump(
+                {"version": 1, "servers": {"ctx": {"command": {"argv": ["mycmd"]}}}},
+                fh,
+            )
+        _argv, env, _cwd = broker._build_spawn("ctx", None)
+        self.assertNotIn("DOCKER_HOST", env)
+        self.assertNotIn("XDG_RUNTIME_DIR", env)
+
     def test_build_spawn_profile_override_wins_over_redirect(self):
         # An explicit per-server XDG_CONFIG_HOME in the profile must still win
         # over the broker's devbox-mcp default redirect.

@@ -324,6 +324,20 @@ def _build_spawn(
     # profile still wins.
     home = child_env.get("HOME") or os.path.expanduser("~")
     child_env["XDG_CONFIG_HOME"] = os.path.join(home, ".config")
+    # Point a docker/podman-launcher server at the Container's rootless Docker
+    # daemon (ADR 0014 "Update 2026-05-31"). DOCKER_HOST + XDG_RUNTIME_DIR are
+    # the image ENV the broker inherits; they are NOT secrets and are the ONLY
+    # variables added back here (issue 15 strips the broker's control-plane vars
+    # above — that hardening stays intact). XDG_RUNTIME_DIR is the docker socket's
+    # RUNTIME dir, distinct from XDG_CONFIG_HOME (config) set just above. We only
+    # propagate a value the broker actually has, so an image without rootless
+    # Docker simply leaves the child without these (a non-Docker server is
+    # unaffected). The socket itself is reachable because start-rootless-docker.sh
+    # re-groups it to devbox-bridge, of which devbox-mcp is a member.
+    for _docker_var in ("DOCKER_HOST", "XDG_RUNTIME_DIR"):
+        _docker_val = os.environ.get(_docker_var)
+        if _docker_val:
+            child_env[_docker_var] = _docker_val
     child_env.update(overlay)
     # Spawn the server in the agent session's cwd (relay-supplied) so project-
     # local servers resolve relative paths against the session, not the broker's

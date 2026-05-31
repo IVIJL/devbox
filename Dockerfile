@@ -1,4 +1,9 @@
-FROM node:22
+# Debian trixie base: needed for util-linux >= 2.39, whose `mount -o X-mount.idmap`
+# the per-broker workspace remount relies on (ADR 0014 issue 21). Bookworm ships
+# util-linux 2.38.1 (no idmap option) -> workspace write would degrade to
+# read-only. trixie ships 2.41. (trixie also has GLIBC 2.41, well past the 2.39 the
+# tree-sitter binaries want.)
+FROM node:22-trixie
 
 ARG TZ=Europe/Prague
 ENV TZ="$TZ"
@@ -15,17 +20,15 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     iptables ipset iproute2 dnsutils aggregate jq nano vim dnsmasq iputils-ping socat \
     # util-linux: setpriv (broker credential drop) + unshare/mount (ADR 0014
     # issue 21 per-broker mount namespace + X-mount.idmap workspace remount).
-    # Already pulled in by the base image, listed here to make the broker's hard
-    # dependency explicit and survive a future slimmer base.
+    # X-mount.idmap needs util-linux >= 2.39; the trixie base ships 2.41. Listed
+    # explicitly to make the broker's hard dependency survive a future base change.
     util-linux \
     # Rootless Docker prerequisites
     uidmap fuse-overlayfs slirp4netns \
-    # User packages
-    ncdu mc nala libfuse2 xauth xclip ripgrep fd-find \
+    # User packages (tmux is current in trixie, so no backports needed)
+    ncdu mc nala libfuse2 xauth xclip ripgrep fd-find tmux \
     build-essential libclang-dev \
     grc curl wget ca-certificates shellcheck rsync \
-    && echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/backports.list \
-    && apt-get update && apt-get install -y --no-install-recommends -t bookworm-backports tmux \
     && ln -s "$(which fdfind)" /usr/local/bin/fd
 
 # =============================================================================

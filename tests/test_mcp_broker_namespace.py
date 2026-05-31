@@ -198,14 +198,23 @@ class FallbackDecisionTests(unittest.TestCase):
 
     def test_broker_env_matches_credential_drop(self):
         # The launch must carry the issue-15 clean devbox-mcp env: own HOME, npm
-        # cache, gated profile mount, private secrets dir.
+        # cache, gated profile mount, private secrets dir — plus the issue-20
+        # Docker daemon pointers forwarded from the image ENV (so the broker can
+        # propagate them to docker-launcher servers it spawns).
         body = (
             self._EXEC_STUB
             + "\n"
             + "remount_workspace_idmapped() { return 0; }\n"
             + "main"
         )
-        out = _run_harness(body, env={"DEVBOX_PROJECT_HOST_PATH": self.workspace})
+        out = _run_harness(
+            body,
+            env={
+                "DEVBOX_PROJECT_HOST_PATH": self.workspace,
+                "DOCKER_HOST": "unix:///run/user/1000/docker.sock",
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+            },
+        )
         self.assertEqual(out.returncode, 0, out.stderr)
         for token in (
             "--regid=devbox-mcp",
@@ -215,6 +224,8 @@ class FallbackDecisionTests(unittest.TestCase):
             "npm_config_cache=/home/devbox-mcp/.npm",
             "XDG_CONFIG_HOME=/run/devbox-mcp/host",
             "DEVBOX_MCP_SECRETS_DIR=/run/devbox-mcp/secrets",
+            "DOCKER_HOST=unix:///run/user/1000/docker.sock",
+            "XDG_RUNTIME_DIR=/run/user/1000",
         ):
             self.assertIn(token, out.stdout, f"missing {token!r} in launch")
 

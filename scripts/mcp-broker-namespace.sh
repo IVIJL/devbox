@@ -136,6 +136,11 @@ main() {
     #   * XDG_CONFIG_HOME -> the GATED host MCP store mount so the broker reads the
     #     live secret-free profile (node-unreadable 0700 parent);
     #   * DEVBOX_MCP_SECRETS_DIR -> the private staged secret dir (issue 16);
+    #   * DOCKER_HOST + XDG_RUNTIME_DIR -> the rootless Docker daemon, so the broker
+    #     can forward them to docker-launcher servers it spawns (issue 20). Passed
+    #     from the (image-ENV) environment so they are not duplicated here; empty if
+    #     this image has no rootless Docker, in which case the broker forwards
+    #     nothing (broker.py only propagates non-empty values).
     #   * a minimal PATH including npm-global bin (npx/node) + system dirs.
     exec setpriv --reuid=devbox-mcp --regid=devbox-mcp --init-groups \
         -- env -i \
@@ -144,6 +149,8 @@ main() {
             LOGNAME=devbox-mcp \
             XDG_CONFIG_HOME=/run/devbox-mcp/host \
             DEVBOX_MCP_SECRETS_DIR=/run/devbox-mcp/secrets \
+            DOCKER_HOST="$DOCKER_HOST" \
+            XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
             npm_config_cache=/home/devbox-mcp/.npm \
             XDG_CACHE_HOME=/home/devbox-mcp/.cache \
             PATH=/usr/local/share/npm-global/bin:/usr/local/bin:/usr/bin:/bin \

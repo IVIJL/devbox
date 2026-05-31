@@ -212,6 +212,21 @@ privileged runtime path:
 - The wrapper's behavior shifts from "exec the server directly" (ADR 0013) to
   "relay stdio to the broker"; the rendered command name is unchanged, preserving
   ADR 0013's stable control point.
+- **A server's environment comes from its profile/secret store, not the agent
+  session.** The old `exec`-the-server wrapper ran as `node` and so *inherited the
+  agent session's environment*; a non-secret variable the user `export`ed in the
+  session reached the server for free. The broker runs with a deliberately **clean
+  environment** (`env -i`, for the same isolation reason it runs under a separate
+  UID), and the relay forwards only the server name, project, and cwd — not the
+  session env. So a server's configuration must live where devbox can deliver it:
+  non-secret values **inline in the profile** (ADR 0013 already copies these from
+  the source config at import, precisely so a server starts without the user
+  re-exporting them) and credentials in the **secret store**. A server that declares
+  a required env key with no value in either place **fails fast as misconfigured**
+  rather than silently depending on whatever the current session happened to export.
+  Session-env inheritance was an artifact of the exec wrapper that the broker model
+  intentionally replaces; "peer-equal" (above) is about access to *resources*
+  (workspace, Docker), not inheriting the agent's shell environment.
 - Secret rotation requires `devbox mcp reload` (or a restart) to reach a running
   Container; it never auto-propagates to already-running server processes.
 - ADR 0003's invariants are preserved unchanged: no NOPASSWD sudoers, no setuid

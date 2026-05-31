@@ -27,6 +27,7 @@ import unittest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENTRYPOINT = os.path.join(REPO_ROOT, "scripts", "devbox-entrypoint.sh")
 DOCKERFILE = os.path.join(REPO_ROOT, "Dockerfile")
+DOCKER_RUN = os.path.join(REPO_ROOT, "docker-run.sh")
 
 
 def _read(path):
@@ -88,10 +89,33 @@ class EntrypointBrokerTests(unittest.TestCase):
         self.assertRegex(self.text, r"HOME=/home/devbox-mcp")
         self.assertRegex(self.text, r"npm_config_cache=/home/devbox-mcp/\.npm")
 
-    def test_broker_reads_profile_mount_not_own_home(self):
-        # XDG_CONFIG_HOME must point at the node-readable profile mount so the
-        # broker reads the same (secret-free) profile the host writes.
-        self.assertRegex(self.text, r"XDG_CONFIG_HOME=/home/node/\.config")
+    def test_broker_reads_profile_from_gated_mount(self):
+        # XDG_CONFIG_HOME must point at the GATED host MCP store mount (ADR 0014
+        # issue 16) so mcp.profile.config_root() (XDG + /devbox/mcp) reads the
+        # live, secret-free profile through the devbox-mcp-only 0700 parent —
+        # never node's own config tree.
+        self.assertRegex(self.text, r"XDG_CONFIG_HOME=/run/devbox-mcp/host")
+
+    def test_host_store_parent_chain_gated_0700_devbox_mcp(self):
+        # The mount-point parents docker creates root:root 0755 must be re-owned
+        # devbox-mcp 0700 so node cannot traverse to the 0600 secret files.
+        self.assertRegex(
+            self.text, r"chown devbox-mcp:devbox-mcp /run/devbox-mcp/host\b"
+        )
+        self.assertRegex(self.text, r"chmod 0700 /run/devbox-mcp/host\b")
+        self.assertRegex(
+            self.text,
+            r"chown devbox-mcp:devbox-mcp /run/devbox-mcp/host/devbox\b",
+        )
+
+    def test_secrets_staged_root_side_before_node_drop(self):
+        # The reusable staging step runs in the root phase, before the node drop.
+        stage_idx = self.text.find("stage-mcp-secrets")
+        node_drop_idx = self.text.find("--reuid=node")
+        self.assertNotEqual(stage_idx, -1, "staging step missing from entrypoint")
+        self.assertLess(
+            stage_idx, node_drop_idx, "secrets must be staged before the node drop"
+        )
 
     def test_private_staged_secret_dir_is_0700_devbox_mcp(self):
         # Secret VALUES come from a devbox-mcp-private 0700 dir node cannot
@@ -150,6 +174,39 @@ class DockerfileAccountTests(unittest.TestCase):
         # The shared MCP package must be readable+executable by devbox-mcp.
         self.assertRegex(
             self.text, r"chmod -R a\+rX /usr/local/share/devbox/mcp"
+        )
+
+    def test_staging_script_shipped_and_executable(self):
+        # The reusable secret-staging step (issue 16) ships on PATH as root.
+        self.assertIn(
+            "COPY scripts/stage-mcp-secrets.sh /usr/local/bin/stage-mcp-secrets",
+            self.text,
+        )
+        self.assertIn("/usr/local/bin/stage-mcp-secrets", self.text)
+
+
+class DockerRunMountTests(unittest.TestCase):
+    def setUp(self):
+        self.text = _read(DOCKER_RUN)
+
+    def test_host_mcp_store_mounted_read_only_under_gated_path(self):
+        # The host MCP store reaches the Container read-only under the root/
+        # devbox-mcp-gated path the entrypoint re-owns (ADR 0014 issue 16), NOT a
+        # node-readable path.
+        self.assertRegex(
+            self.text,
+            r'\$DEVBOX_MCP_HOST_STORE:/run/devbox-mcp/host/devbox/mcp:ro',
+        )
+        self.assertRegex(
+            self.text, r'DEVBOX_MCP_HOST_STORE="\$HOME/\.config/devbox/mcp"'
+        )
+
+    def test_host_mcp_store_mounted_only_when_present(self):
+        # Mounted only when the host store dir exists (no imported servers ->
+        # nothing to mount).
+        self.assertRegex(
+            self.text,
+            r'if \[ -d "\$DEVBOX_MCP_HOST_STORE" \]',
         )
 
 

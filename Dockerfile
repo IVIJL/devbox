@@ -371,6 +371,11 @@ COPY scripts/mcp-run.sh /usr/local/bin/devbox-mcp-run
 # Container MCP broker launcher (ADR 0014, issue 15). Runs the Python broker as
 # devbox-mcp (started from the entrypoint root phase before the node drop).
 COPY scripts/mcp-broker.sh /usr/local/bin/devbox-mcp-broker
+# Container MCP secret staging (ADR 0014, issue 16). Run as root from the
+# entrypoint root phase (and issue 17's `devbox mcp reload`) to copy the
+# in-scope secret stores out of the gated read-only host mount into the
+# devbox-mcp-private 0400 store the broker reads.
+COPY scripts/stage-mcp-secrets.sh /usr/local/bin/stage-mcp-secrets
 COPY init-firewall.sh /usr/local/bin/
 COPY scripts/setup-chezmoi.sh /usr/local/bin/
 COPY scripts/n scripts/nx /usr/local/bin/
@@ -415,6 +420,7 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/agent-browser \
     /usr/local/bin/devbox-mcp-run \
     /usr/local/bin/devbox-mcp-broker \
+    /usr/local/bin/stage-mcp-secrets \
     /usr/local/bin/devbox-identity-context.sh
 
 # The MCP runtime (Python package + launchers) must be readable+executable by

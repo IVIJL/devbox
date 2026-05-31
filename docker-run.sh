@@ -3491,6 +3491,21 @@ DOCKER_ARGS+=(-v "$HOME/.claude:/home/node/.claude")
 mkdir -p "$HOME/.codex"
 DOCKER_ARGS+=(-v "$HOME/.codex:/home/node/.codex")
 
+# Host MCP store (ADR 0014, issue 16): the canonical devbox MCP profile +
+# scoped secret stores live in ~/.config/devbox/mcp. They reach the Container
+# read-only under a ROOT/devbox-mcp-gated parent chain (NOT a node-readable
+# path): the entrypoint root phase chowns the parent chain to devbox-mcp 0700 so
+# node cannot traverse it, the broker reads the (secret-free) profile live from
+# this mount, and the root phase stages the in-scope 0600 secret files out of it
+# into a devbox-mcp-private 0400 store. A plain node-readable mount would expose
+# the secrets to the agent (host 0600 -> node UID), so it MUST stay gated.
+# Mounted only when the host store exists (no MCP servers imported -> nothing to
+# mount; the broker then has an empty profile and stages nothing).
+DEVBOX_MCP_HOST_STORE="$HOME/.config/devbox/mcp"
+if [ -d "$DEVBOX_MCP_HOST_STORE" ]; then
+    DOCKER_ARGS+=(-v "$DEVBOX_MCP_HOST_STORE:/run/devbox-mcp/host/devbox/mcp:ro")
+fi
+
 # SSH config: --ssh-config uses full host config, otherwise devbox-specific config
 DEVBOX_SSH_CONFIG="$HOME/.config/devbox/ssh_config"
 if [ "$SSH_CONFIG_MOUNT" = true ]; then

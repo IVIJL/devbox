@@ -25,6 +25,7 @@ output can be emitted directly without a redaction pass.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from typing import Optional
 
@@ -1264,6 +1265,130 @@ def _run_wrapper(argv: list[str]) -> int:
         return 1
 
 
+def _resolve_owner(token: str) -> Optional[tuple[int, int]]:
+    """Resolve an owner token (name or uid) to a (uid, gid) pair, or None.
+
+    Accepts a user NAME (looked up via ``pwd``, taking its primary GID) or a
+    numeric uid (its gid is taken from the passwd entry when present, else equal
+    to the uid). Returns None and writes a SECRET-FREE error to stderr when the
+    account does not exist, so a typo never silently leaves staged files
+    root-owned (which node could not read either, but would defeat the broker).
+    """
+    import pwd
+
+    try:
+        entry = pwd.getpwnam(token)
+        return (entry.pw_uid, entry.pw_gid)
+    except KeyError:
+        pass
+    if token.isdigit():
+        uid = int(token)
+        try:
+            entry = pwd.getpwuid(uid)
+            return (uid, entry.pw_gid)
+        except KeyError:
+            return (uid, uid)
+    sys.stderr.write(f"mcp.cli: stage-secrets: unknown owner {token!r}\n")
+    return None
+
+
+def _cmd_stage_secrets(argv: list[str], as_json: bool) -> int:
+    """`stage-secrets`: root-side secret staging into the private store (issue 16).
+
+    Args: ``--source <dir> --dest <dir> [--project <key>] [--owner <user|uid>]``.
+    SECRET-FREE: reports scope labels + staged basenames + counts only, never an
+    env-key NAME or a secret VALUE.
+    """
+    from .staging import stage_secrets
+
+    source = ""
+    dest = ""
+    project_key: Optional[str] = None
+    owner: Optional[str] = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--source":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: stage-secrets: --source requires a value\n")
+                return 2
+            source = argv[i]
+        elif arg == "--dest":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: stage-secrets: --dest requires a value\n")
+                return 2
+            dest = argv[i]
+        elif arg == "--project":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: stage-secrets: --project requires a value\n")
+                return 2
+            project_key = argv[i] or None
+        elif arg == "--owner":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: stage-secrets: --owner requires a value\n")
+                return 2
+            owner = argv[i]
+        else:
+            sys.stderr.write(f"mcp.cli: stage-secrets: unknown argument {arg!r}\n")
+            return 2
+        i += 1
+
+    if not source or not dest:
+        sys.stderr.write(
+            "mcp.cli: stage-secrets requires --source <dir> and --dest <dir>\n"
+        )
+        return 2
+
+    owner_uid: Optional[int] = None
+    owner_gid: Optional[int] = None
+    if owner:
+        resolved_owner = _resolve_owner(owner)
+        if resolved_owner is None:
+            return 2
+        owner_uid, owner_gid = resolved_owner
+
+    # A missing source root is not an error: a host without any imported MCP
+    # secrets simply has nothing to stage (the broker then reports missing env
+    # for a secret-declaring server). Stage nothing rather than fail container
+    # start.
+    if not os.path.isdir(source):
+        sys.stdout.write(
+            f"No MCP secret store at {source}; nothing to stage.\n"
+        )
+        return 0
+
+    try:
+        result = stage_secrets(
+            source,
+            dest,
+            project_key=project_key,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+        )
+    except OSError as exc:
+        # Names/paths only — staging never surfaces a secret value.
+        sys.stderr.write(f"mcp.cli: stage-secrets: {exc}\n")
+        return 1
+
+    if as_json:
+        return _emit(result.to_dict())
+
+    if result.staged:
+        for label, basename in result.staged:
+            sys.stdout.write(f"Staged {label} secrets -> {basename}\n")
+    else:
+        sys.stdout.write("No in-scope MCP secret stores to stage.\n")
+    if result.removed_stale:
+        sys.stdout.write(
+            f"Removed {len(result.removed_stale)} stale staged file(s).\n"
+        )
+    return 0
+
+
 def _cmd_add(argv: list[str], as_json: bool) -> int:
     """`add-{json,text}`: record a new Devbox MCP server from a command spec.
 
@@ -1553,6 +1678,15 @@ def main(argv: list[str]) -> int:
     if command == "run":
         # The devbox-mcp-run wrapper core. Args: [--project <key>] <server>.
         return _run_wrapper(rest)
+    if command == "stage-secrets":
+        # Root-side secret staging (issue 16). Args:
+        #   --source <gated-mount-mcp-dir> --dest <devbox-mcp-private-dir>
+        #   [--project <full-project-key>] [--owner <user-or-uid>]
+        # Copies the in-scope (global + this Project) secret stores out of the
+        # read-only host mount into the devbox-mcp-private staged dir as 0400
+        # files owned by devbox-mcp. Run as root from the entrypoint (and issue
+        # 17's reload). SECRET-FREE output (scope labels + basenames only).
+        return _cmd_stage_secrets(rest, as_json=False)
     if command == "project-keys":
         # Emit known Claude project record keys, one per line. These are
         # directory paths (Claude's own map keys) — not secret. Used by the

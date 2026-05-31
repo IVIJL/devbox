@@ -101,13 +101,40 @@ if [ "$(id -u)" = "0" ]; then
     # profile, so a server imported into a running Container works next session.
     #
     # The PRIVATE staged secret dir is created 0700 devbox-mcp:devbox-mcp — node
-    # cannot traverse it. It is EMPTY in this issue (issue 16 stages per-server
-    # secrets here, root-side, into 0400 devbox-mcp files); the broker reads
-    # secret VALUES only from here, never from the node-owned profile mount, so a
-    # secret-declaring server cleanly reports missing env until issue 16.
+    # cannot traverse it. The root phase below stages the in-scope secret files
+    # (global + THIS Container's Project) into it as 0400 devbox-mcp files (issue
+    # 16, scripts/stage-mcp-secrets.sh); the broker reads secret VALUES only from
+    # here, never from the node-owned profile mount.
     if id devbox-mcp >/dev/null 2>&1; then
         install -d -o devbox-mcp -g devbox-mcp -m 0750 /run/devbox-mcp
         install -d -o devbox-mcp -g devbox-mcp -m 0700 /run/devbox-mcp/secrets
+
+        # Gate the host MCP store mount (ADR 0014, issue 16). docker-run.sh
+        # bind-mounts host ~/.config/devbox/mcp read-only at
+        # /run/devbox-mcp/host/devbox/mcp. Docker creates the mount-point PARENTS
+        # (/run/devbox-mcp/host, .../host/devbox) as root:root 0755 before this
+        # script runs, so node could otherwise traverse to the (node-UID-readable)
+        # 0600 secret files. Re-own the parent chain to devbox-mcp 0700 so ONLY
+        # devbox-mcp can traverse it: node — even as a member of the devbox-mcp
+        # group — gets nothing from 0700, and the broker (running as devbox-mcp)
+        # reads the live secret-free profile through it. The :ro mount itself is
+        # left untouched (its perms come from the host file). Done only when the
+        # mount is present (no host store -> nothing imported -> nothing to gate).
+        if [ -d /run/devbox-mcp/host ]; then
+            chown devbox-mcp:devbox-mcp /run/devbox-mcp/host
+            chmod 0700 /run/devbox-mcp/host
+            if [ -d /run/devbox-mcp/host/devbox ]; then
+                chown devbox-mcp:devbox-mcp /run/devbox-mcp/host/devbox
+                chmod 0700 /run/devbox-mcp/host/devbox
+            fi
+            # Stage the in-scope secrets root-side (root reads the host 0600
+            # files through the gated mount; node never can). The reusable
+            # staging step also serves issue 17's `devbox mcp reload`. It copies
+            # only global + THIS Project's store into the private 0400 dir; a
+            # secret value is never logged (scope labels/basenames only).
+            /usr/local/bin/stage-mcp-secrets || \
+                echo "devbox: WARNING: MCP secret staging failed; secret-bearing servers may report missing env." >&2
+        fi
         # setpriv switches credentials but PRESERVES the (root) environment, so
         # the broker — and every MCP server it spawns as devbox-mcp — would
         # otherwise inherit root's HOME and npm settings and try to write under
@@ -115,9 +142,14 @@ if [ "$(id -u)" = "0" ]; then
         # set exactly devbox-mcp's runtime env:
         #   * HOME + npm/npx cache under devbox-mcp's own writable HOME, so
         #     on-demand `npx` MCP servers run under the service account;
-        #   * XDG_CONFIG_HOME -> the bind-mounted host MCP PROFILE so
-        #     mcp.profile.config_root() reads the same (secret-free) store the
-        #     host writes — NOT an empty store under devbox-mcp's HOME;
+        #   * XDG_CONFIG_HOME -> the GATED host MCP store mount so
+        #     mcp.profile.config_root() (XDG_CONFIG_HOME + /devbox/mcp) reads the
+        #     same (secret-free) profile the host writes, LIVE — enable/disable/
+        #     add take effect next session with no restart (ADR 0014). The mount
+        #     parent is 0700 devbox-mcp, so the broker traverses it but node
+        #     cannot; the broker reads only the secret-FREE profile here, never
+        #     the 0600 secret files (wrong UID). With no host store mounted this
+        #     path is absent and the broker cleanly sees an empty profile.
         #   * DEVBOX_MCP_SECRETS_DIR -> the private staged secret dir above, the
         #     ONLY place the broker reads secret VALUES from;
         #   * a minimal PATH including npm-global bin (npx/node) + system dirs.
@@ -126,7 +158,7 @@ if [ "$(id -u)" = "0" ]; then
                 HOME=/home/devbox-mcp \
                 USER=devbox-mcp \
                 LOGNAME=devbox-mcp \
-                XDG_CONFIG_HOME=/home/node/.config \
+                XDG_CONFIG_HOME=/run/devbox-mcp/host \
                 DEVBOX_MCP_SECRETS_DIR=/run/devbox-mcp/secrets \
                 npm_config_cache=/home/devbox-mcp/.npm \
                 XDG_CACHE_HOME=/home/devbox-mcp/.cache \

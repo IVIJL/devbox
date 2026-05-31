@@ -23,6 +23,9 @@ from __future__ import annotations
 
 import os
 import re
+import stat
+import subprocess
+import tempfile
 import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -321,6 +324,100 @@ class DockerRunMountTests(unittest.TestCase):
         # would leave a Container started before any import with no live mount.
         self.assertRegex(self.text, r'mkdir -p "\$DEVBOX_MCP_HOST_STORE"')
         self.assertNotRegex(self.text, r'if \[ -d "\$DEVBOX_MCP_HOST_STORE" \]')
+
+    def test_existing_store_normalized_broker_readable_before_mount(self):
+        # save_profile() only fixes NEWLY written profiles; an existing store
+        # from an older version (0700/0600) or one created under a restrictive
+        # host umask must be normalized broker-readable BEFORE the mount (issue
+        # 16). The dir + projects/ subdir are made traversable (o+rx) and
+        # non-secret profile files readable (o+r).
+        self.assertRegex(self.text, r'chmod o\+rx "\$DEVBOX_MCP_HOST_STORE"')
+        self.assertRegex(
+            self.text, r'chmod o\+rx "\$DEVBOX_MCP_HOST_STORE/projects"'
+        )
+        self.assertRegex(self.text, r"chmod o\+r ")
+        # The normalization runs before the bind-mount line.
+        norm_idx = self.text.find('chmod o+rx "$DEVBOX_MCP_HOST_STORE"')
+        mount_idx = self.text.find(
+            "$DEVBOX_MCP_HOST_STORE:/run/devbox-mcp/host/devbox/mcp:ro"
+        )
+        self.assertNotEqual(norm_idx, -1)
+        self.assertNotEqual(mount_idx, -1)
+        self.assertLess(norm_idx, mount_idx)
+
+    def test_secret_files_excluded_from_profile_chmod(self):
+        # *.secrets.json carry credentials and MUST stay 0600 — the find that
+        # selects non-secret profile files for o+r must prune them explicitly.
+        self.assertRegex(self.text, r"!\s+-name '\*\.secrets\.json'")
+
+
+class DockerRunStorePermLogicTests(unittest.TestCase):
+    """Functional regression of the store-perm normalization algorithm.
+
+    Re-runs the exact find/chmod logic from docker-run.sh against a temp store
+    to lock in the contract: dir + projects -> 0755-traversable, profile.json +
+    projects/*.json -> world-readable, while secrets.json (global) and
+    *.secrets.json (project) stay 0600.
+    """
+
+    def _normalize(self, store):
+        # Mirror of the docker-run.sh host-side normalization (issue 16).
+        script = r"""
+set -e
+STORE="$1"
+chmod o+rx "$STORE" 2>/dev/null || true
+if [ -d "$STORE/projects" ]; then
+    chmod o+rx "$STORE/projects" 2>/dev/null || true
+fi
+while IFS= read -r -d '' f; do
+    chmod o+r "$f" 2>/dev/null || true
+done < <(find "$STORE" -maxdepth 2 -type f \
+    \( -name 'profile.json' -o \( -path "$STORE/projects/*.json" -a ! -name '*.secrets.json' \) \) \
+    -print0 2>/dev/null)
+"""
+        subprocess.run(
+            ["bash", "-c", script, "bash", store],
+            check=True,
+        )
+
+    def _mode(self, path):
+        return stat.S_IMODE(os.stat(path).st_mode)
+
+    def test_normalizes_only_non_secret_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "mcp")
+            projects = os.path.join(store, "projects")
+            os.makedirs(projects)
+            profile = os.path.join(store, "profile.json")
+            global_secrets = os.path.join(store, "secrets.json")
+            proj_profile = os.path.join(projects, "api-abc.json")
+            proj_secrets = os.path.join(projects, "api-abc.secrets.json")
+            for p in (profile, global_secrets, proj_profile, proj_secrets):
+                with open(p, "w", encoding="utf-8") as fh:
+                    fh.write("{}")
+            os.chmod(store, 0o700)
+            os.chmod(projects, 0o700)
+            for p in (profile, global_secrets, proj_profile, proj_secrets):
+                os.chmod(p, 0o600)
+
+            self._normalize(store)
+
+            # Dirs traversable+readable by others.
+            self.assertTrue(self._mode(store) & 0o005)
+            self.assertTrue(self._mode(projects) & 0o005)
+            # Non-secret profile files world-readable.
+            self.assertTrue(self._mode(profile) & 0o004)
+            self.assertTrue(self._mode(proj_profile) & 0o004)
+            # Secret files UNTOUCHED at 0600.
+            self.assertEqual(self._mode(global_secrets), 0o600)
+            self.assertEqual(self._mode(proj_secrets), 0o600)
+
+    def test_fresh_and_idempotent_no_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "mcp")
+            os.makedirs(store)  # fresh: no projects/, no files
+            self._normalize(store)  # must not error
+            self._normalize(store)  # idempotent
 
 
 if __name__ == "__main__":  # pragma: no cover

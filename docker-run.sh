@@ -3511,6 +3511,29 @@ DOCKER_ARGS+=(-v "$HOME/.codex:/home/node/.codex")
 # entrypoint root phase gates the in-container mount to devbox-mcp 0700 regardless.
 DEVBOX_MCP_HOST_STORE="$HOME/.config/devbox/mcp"
 mkdir -p "$DEVBOX_MCP_HOST_STORE"
+# Normalize EXISTING store perms to broker-readable BEFORE the mount (host-side).
+# save_profile()/ensure_store_dir() only fix NEWLY written profiles; a store dir
+# or profile created by an older version (0700/0600) or under a restrictive host
+# umask (e.g. 077) would still be untraversable/unreadable by the broker, which
+# runs as devbox-mcp (a different UID). The profile is NON-SECRET (ADR 0014:
+# world-readable, the broker must read it), so loosening its host metadata is
+# intentional. Secret files (*.secrets.json) MUST stay 0600 and are explicitly
+# excluded from the file pass. Idempotent and safe when nothing exists yet.
+chmod o+rx "$DEVBOX_MCP_HOST_STORE" 2>/dev/null \
+    || echo "WARN: could not make $DEVBOX_MCP_HOST_STORE broker-traversable; imported MCP servers may be unreadable in the container" >&2
+if [ -d "$DEVBOX_MCP_HOST_STORE/projects" ]; then
+    chmod o+rx "$DEVBOX_MCP_HOST_STORE/projects" 2>/dev/null \
+        || echo "WARN: could not make $DEVBOX_MCP_HOST_STORE/projects broker-traversable; imported project MCP servers may be unreadable in the container" >&2
+fi
+# Non-secret profile files -> o+r. Match profile.json and projects/*.json but
+# NEVER *.secrets.json (those carry credentials and stay 0600). find prunes the
+# secret files explicitly so the glob does not loosen them.
+while IFS= read -r -d '' mcp_profile_file; do
+    chmod o+r "$mcp_profile_file" 2>/dev/null \
+        || echo "WARN: could not make $mcp_profile_file broker-readable; that imported MCP server may be unreadable in the container" >&2
+done < <(find "$DEVBOX_MCP_HOST_STORE" -maxdepth 2 -type f \
+    \( -name 'profile.json' -o \( -path "$DEVBOX_MCP_HOST_STORE/projects/*.json" -a ! -name '*.secrets.json' \) \) \
+    -print0 2>/dev/null)
 DOCKER_ARGS+=(-v "$DEVBOX_MCP_HOST_STORE:/run/devbox-mcp/host/devbox/mcp:ro")
 
 # SSH config: --ssh-config uses full host config, otherwise devbox-specific config

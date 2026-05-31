@@ -797,8 +797,15 @@ _start_proxy() {
             </dev/null \
             >"$6/proxy.stdout.log" \
             2>"$6/proxy.stderr.log"
-    ' agent-browser-proxy "$AGENT_PROXY_BIN" "$proxy_port" "$staged_allowlist" "$staged_mode" "$proxy_log_live" "$profile_dir" &
+    ' agent-browser-proxy "$AGENT_PROXY_BIN" "$proxy_port" "$staged_allowlist" "$staged_mode" "$proxy_log_live" "$profile_dir" >/dev/null 2>&1 &
     disown 2>/dev/null || true
+    # Defensive hardening (not a live bug fix — start works without it): this
+    # backgrounded job runs inside a command substitution ("$(_start_proxy ...)").
+    # The inner `sh -c` already redirects the PROXY's own stdout/stderr to log
+    # files, and the detach prefix + sudo currently close the inherited
+    # command-substitution pipe in practice. Redirecting the wrapper's stdout/stderr
+    # to /dev/null too removes any timing-dependent risk that the substitution waits
+    # on the pipe's write end, which is the standard idiom for a bg job in $().
 
     # Reconcile PID via the unique listen-port arg in cmdline. The marker
     # mirrors the Chrome/relay reconciliation pattern.

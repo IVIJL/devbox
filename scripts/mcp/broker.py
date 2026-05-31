@@ -56,6 +56,7 @@ from .profile import global_profile_path, load_profile, project_profile_path
 from .protocol import (
     ProtocolError,
     decode_request,
+    encode_exit,
     encode_reply,
     read_line,
 )
@@ -387,7 +388,12 @@ def _proxy(conn: socket.socket, child) -> None:
 
     We wait on the stdout->socket pump (the session is over once the server
     stops producing output), then reap the child so no zombie ``devbox-mcp``
-    process lingers.
+    process lingers. Finally we send the server's exit status as a NUL-prefixed
+    trailer and half-close our write side, so the relay can reflect a non-zero
+    server exit as its own exit code (a clean session still ends at 0). The
+    trailer is sent AFTER the from_child pump has drained the child's stdout to
+    EOF, so it can never interleave with raw MCP output, and the NUL prefix is a
+    sentinel impossible inside an MCP JSON-RPC frame.
     """
     conn_fd = conn.fileno()
     child_stdin = child.stdin
@@ -415,17 +421,37 @@ def _proxy(conn: socket.socket, child) -> None:
     # an EOF-driven server exits and from_child then returns.)
     from_child.join()
     _close_child_stdin()
+    # Reap the child so no zombie devbox-mcp process lingers, and capture its
+    # exit status to forward to the relay. A server that started fine but then
+    # exited non-zero (e.g. bad runtime config) must NOT look like a clean exit.
     try:
-        child.terminate()
-    except OSError:
-        pass
-    try:
-        child.wait(timeout=10)
+        returncode = child.wait(timeout=10)
     except Exception:  # noqa: BLE001 - best-effort reap; never crash the broker
         try:
             child.kill()
         except OSError:
             pass
+        # We terminated it ourselves; report a non-zero status so the relay does
+        # not mistake a killed-after-hang server for a clean exit.
+        try:
+            returncode = child.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            returncode = None
+    # Send the exit trailer, then half-close so the relay sees EOF after it.
+    # Wrapped because the relay may already be gone (broken pipe is harmless: the
+    # broker stays up and the next session is unaffected).
+    if returncode is None:
+        # Could not determine the child's status; surface a generic failure so a
+        # hung/unreapable server is never reported to the agent as clean.
+        returncode = 1
+    try:
+        conn.sendall(encode_exit(returncode))
+    except OSError:
+        pass
+    try:
+        conn.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
     to_child.join(timeout=1)
     # Close the child's stdio pipe objects so their fds are released. The broker
     # is long-lived and services many connections; leaking the Popen-owned

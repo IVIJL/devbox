@@ -144,6 +144,32 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(protocol.ProtocolError):
             protocol.decode_request(b"not json at all")
 
+    def test_exit_trailer_round_trip(self):
+        frame = protocol.encode_exit(3)
+        self.assertTrue(frame.startswith(protocol.EXIT_TRAILER_SENTINEL))
+        self.assertEqual(protocol.decode_exit(frame[1:]), 3)
+        self.assertEqual(
+            protocol.decode_exit(protocol.encode_exit(0)[1:]), 0
+        )
+
+    def test_decode_exit_rejects_non_object(self):
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.decode_exit(b"[1]")
+
+    def test_decode_exit_rejects_missing_int(self):
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.decode_exit(b'{"exit":"3"}')
+
+    def test_decode_exit_rejects_bool(self):
+        # bool is an int subclass; an exit field of true/false is malformed.
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.decode_exit(b'{"exit":true}')
+
+    def test_exit_sentinel_is_nul(self):
+        # The sentinel must be the NUL byte: impossible inside an MCP JSON-RPC
+        # frame, so it unambiguously separates stdout from the trailer.
+        self.assertEqual(protocol.EXIT_TRAILER_SENTINEL, b"\x00")
+
     def test_read_line_bounded(self):
         # A stream that never sends a newline must raise once the cap is hit,
         # not buffer forever.
@@ -681,6 +707,13 @@ class BrokerSocketRoundTripTests(_EnvIsolation, unittest.TestCase):
                         # `pwd` reports the spawn cwd, so a round trip proves the
                         # broker honored the relay-supplied working directory.
                         "pwd": {"command": {"argv": ["pwd"]}},
+                        # A server that starts fine but exits non-zero, so a round
+                        # trip proves the broker forwards the real exit status.
+                        "fail3": {
+                            "command": {"argv": ["sh", "-c", "exit 3"]}
+                        },
+                        # A server that exits cleanly (0) after closing stdout.
+                        "ok0": {"command": {"argv": ["sh", "-c", "exit 0"]}},
                     },
                 },
                 fh,
@@ -743,15 +776,11 @@ class BrokerSocketRoundTripTests(_EnvIsolation, unittest.TestCase):
         payload = b"hello mcp stream\n"
         client.sendall(payload)
         client.shutdown(socket.SHUT_WR)
-        got = b""
-        client.settimeout(5)
-        while True:
-            chunk = client.recv(4096)
-            if not chunk:
-                break
-            got += chunk
+        got = self._drain(client)
         client.close()
-        self.assertEqual(got, payload)
+        # The stream is now followed by the NUL-prefixed exit trailer; the
+        # genuine MCP stdout is everything before the first NUL.
+        self.assertEqual(got[: got.find(protocol.EXIT_TRAILER_SENTINEL)], payload)
 
     def test_spawn_uses_relay_supplied_cwd_over_socket(self):
         # End-to-end: a server spawned by the broker must run in the cwd the
@@ -768,15 +797,74 @@ class BrokerSocketRoundTripTests(_EnvIsolation, unittest.TestCase):
         ok, err = protocol.decode_reply(protocol.read_line(client.recv))
         self.assertTrue(ok, err)
         client.shutdown(socket.SHUT_WR)
-        got = b""
+        got = self._drain(client)
+        client.close()
+        # Strip the trailing NUL-prefixed exit trailer; the pwd output is before.
+        stdout = got[: got.find(protocol.EXIT_TRAILER_SENTINEL)]
+        self.assertEqual(stdout.decode().strip(), expected)
+
+    def _drain(self, client):
+        """Read everything the broker sends until EOF (its SHUT_WR)."""
         client.settimeout(5)
+        got = b""
         while True:
             chunk = client.recv(4096)
             if not chunk:
                 break
             got += chunk
+        return got
+
+    def test_exit_trailer_carries_nonzero_status_over_socket(self):
+        # A server that starts then exits non-zero must reach the relay as a
+        # NUL-prefixed exit trailer carrying that status (the P2 regression: the
+        # old broker/relay split reported every exit as clean).
+        self._start_broker()
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(self.sock_path)
+        client.sendall(protocol.encode_request("fail3", None))
+        ok, err = protocol.decode_reply(protocol.read_line(client.recv))
+        self.assertTrue(ok, err)
+        client.shutdown(socket.SHUT_WR)
+        got = self._drain(client)
         client.close()
-        self.assertEqual(got.decode().strip(), expected)
+        # No raw MCP stdout from this server, so the whole stream is the trailer.
+        nul = got.find(protocol.EXIT_TRAILER_SENTINEL)
+        self.assertNotEqual(nul, -1, "no exit trailer sentinel sent")
+        self.assertEqual(protocol.decode_exit(got[nul + 1 :]), 3)
+
+    def test_exit_trailer_carries_zero_status_over_socket(self):
+        self._start_broker()
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(self.sock_path)
+        client.sendall(protocol.encode_request("ok0", None))
+        ok, err = protocol.decode_reply(protocol.read_line(client.recv))
+        self.assertTrue(ok, err)
+        client.shutdown(socket.SHUT_WR)
+        got = self._drain(client)
+        client.close()
+        nul = got.find(protocol.EXIT_TRAILER_SENTINEL)
+        self.assertNotEqual(nul, -1, "no exit trailer sentinel sent")
+        self.assertEqual(protocol.decode_exit(got[nul + 1 :]), 0)
+
+    def test_exit_trailer_follows_echoed_stream(self):
+        # The trailer must come AFTER all genuine MCP stdout, separated by the
+        # NUL sentinel: bytes before the NUL are the echoed payload, the rest is
+        # the trailer. Proves the trailer never interleaves with raw output.
+        self._start_broker()
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(self.sock_path)
+        client.sendall(protocol.encode_request("echo", None))
+        ok, err = protocol.decode_reply(protocol.read_line(client.recv))
+        self.assertTrue(ok, err)
+        payload = b"hello mcp stream\n"
+        client.sendall(payload)
+        client.shutdown(socket.SHUT_WR)
+        got = self._drain(client)
+        client.close()
+        nul = got.find(protocol.EXIT_TRAILER_SENTINEL)
+        self.assertNotEqual(nul, -1, "no exit trailer sentinel sent")
+        self.assertEqual(got[:nul], payload)
+        self.assertEqual(protocol.decode_exit(got[nul + 1 :]), 0)
 
     def test_refuse_out_of_scope_over_socket(self):
         self._start_broker()
@@ -818,6 +906,109 @@ class BrokerSocketRoundTripTests(_EnvIsolation, unittest.TestCase):
             fh.write("")  # stale non-socket file at the path
         self._start_broker()  # must remove the stale file and bind cleanly
         self.assertTrue(os.path.exists(self.sock_path))
+
+
+class RelayExitStatusOverBrokerTests(_EnvIsolation, unittest.TestCase):
+    """End-to-end: relay.run() against a REAL broker reflects the server's exit.
+
+    This exercises the full chain over the socket — broker spawns the server,
+    server exits, broker sends the NUL-prefixed exit trailer, relay decodes it
+    and returns it as its own exit code — rather than mocking any leg, so it
+    proves the actual status propagation the P2 finding asked for.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg_root = os.path.join(self._tmp.name, "devbox", "mcp")
+        os.makedirs(self.cfg_root, exist_ok=True)
+        with open(os.path.join(self.cfg_root, "profile.json"), "w") as fh:
+            json.dump(
+                {
+                    "version": 1,
+                    "servers": {
+                        "fail3": {"command": {"argv": ["sh", "-c", "exit 3"]}},
+                        "ok0": {"command": {"argv": ["sh", "-c", "exit 0"]}},
+                        "echo": {"command": {"argv": ["cat"]}},
+                    },
+                },
+                fh,
+            )
+        self.sock_path = os.path.join(self._tmp.name, "broker.sock")
+        # A Container identity file so the relay's require_container() passes.
+        ident = os.path.join(self._tmp.name, "identity.json")
+        with open(ident, "w", encoding="utf-8") as fh:
+            fh.write('{"project":"p"}')
+        self._set_env(
+            XDG_CONFIG_HOME=self._tmp.name,
+            DEVBOX_MCP_BROKER_SOCKET=self.sock_path,
+            DEVBOX_MCP_IDENTITY_PATH=ident,
+        )
+
+    def _start_broker(self):
+        self._broker_stop = threading.Event()
+        t = threading.Thread(
+            target=broker.serve,
+            args=(self.sock_path,),
+            kwargs={"stop_event": self._broker_stop},
+            daemon=True,
+        )
+        t.start()
+        self.addCleanup(self._stop_broker, t)
+        for _ in range(200):
+            if _is_socket(self.sock_path):
+                break
+            time.sleep(0.01)
+        self.assertTrue(_is_socket(self.sock_path), "broker socket never appeared")
+
+    def _stop_broker(self, thread):
+        self._broker_stop.set()
+        thread.join(timeout=5)
+
+    def _run_relay(self, server, stdin_payload=b""):
+        """Run relay.run(server) with a controlled stdin/stdout, return rc."""
+        from mcp import relay
+
+        stdin_r, stdin_w = os.pipe()
+        stdout_r, stdout_w = os.pipe()
+        open_fds = {stdin_r, stdin_w, stdout_r, stdout_w}
+
+        def _close_fds():
+            for fd in open_fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        self.addCleanup(_close_fds)
+        os.write(stdin_w, stdin_payload)
+        os.close(stdin_w)  # EOF: relay half-closes, server sees EOF and exits
+        open_fds.discard(stdin_w)
+
+        with mock.patch.object(sys, "stdin") as fake_in, mock.patch.object(
+            sys, "stdout"
+        ) as fake_out:
+            fake_in.fileno.return_value = stdin_r
+            fake_out.fileno.return_value = stdout_w
+            rc = relay.run(server)
+        return rc
+
+    def test_relay_returns_nonzero_server_exit(self):
+        self._start_broker()
+        rc = self._run_relay("fail3")
+        self.assertEqual(rc, 3)
+
+    def test_relay_returns_zero_on_clean_server_exit(self):
+        self._start_broker()
+        rc = self._run_relay("ok0")
+        self.assertEqual(rc, 0)
+
+    def test_relay_returns_zero_on_clean_echo_session(self):
+        # A normal session with real MCP-like stdout still ends at 0; the trailer
+        # is separated from the echoed bytes by the NUL sentinel.
+        self._start_broker()
+        rc = self._run_relay("echo", stdin_payload=b"frame-1\nframe-2\n")
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":  # pragma: no cover

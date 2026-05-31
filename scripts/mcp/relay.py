@@ -33,7 +33,10 @@ from typing import Optional
 from .broker import socket_path
 from .identity import require_container
 from .protocol import (
+    EXIT_TRAILER_SENTINEL,
+    MAX_EXIT_TRAILER_BYTES,
     ProtocolError,
+    decode_exit,
     decode_reply,
     encode_request,
     read_line,
@@ -61,13 +64,22 @@ def _connect(path: str) -> socket.socket:
     return sock
 
 
-def _proxy(sock: socket.socket, stdin_fd: int, stdout_fd: int) -> None:
+def _proxy(sock: socket.socket, stdin_fd: int, stdout_fd: int) -> int:
     """Bidirectionally proxy stdin/stdout <-> the broker socket until EOF.
 
     A single-threaded selector loop avoids spawning threads in the per-server
     relay process (one runs per MCP server the agent uses). When the agent's
     stdin closes we half-close the socket's write side so the server sees EOF;
     when the socket closes (server exited) we stop.
+
+    Returns the spawned server's exit code, which the broker sends as a final
+    NUL-prefixed trailer after the server's stdout reaches EOF (see protocol.py).
+    A raw NUL never appears inside an MCP JSON-RPC frame, so the first NUL byte
+    from the socket marks the boundary: bytes before it are real MCP stdout
+    (written straight through), the NUL and everything after it are the trailer
+    (buffered, then decoded once the socket closes). If the trailer is absent or
+    unparseable (e.g. a broker that predates this protocol, or a broken pipe), we
+    fall back to 0 so the change never breaks an otherwise-clean session.
     """
     sel = selectors.DefaultSelector()
     sock.setblocking(False)
@@ -76,6 +88,8 @@ def _proxy(sock: socket.socket, stdin_fd: int, stdout_fd: int) -> None:
     sel.register(stdin_fd, selectors.EVENT_READ, "stdin")
 
     stdin_open = True
+    trailer = bytearray()  # bytes from the first NUL onward (sentinel included)
+    in_trailer = False
     try:
         while True:
             for key, _mask in sel.select():
@@ -85,8 +99,23 @@ def _proxy(sock: socket.socket, stdin_fd: int, stdout_fd: int) -> None:
                     except (BlockingIOError, InterruptedError):
                         continue
                     if not data:
-                        return  # server/broker closed: done
-                    _write_all_fd(stdout_fd, data)
+                        return _exit_from_trailer(trailer)  # broker closed: done
+                    if in_trailer:
+                        trailer.extend(data)
+                        # Bound post-stream buffering against a NUL-then-flood.
+                        del trailer[MAX_EXIT_TRAILER_BYTES + 1 :]
+                        continue
+                    nul = data.find(EXIT_TRAILER_SENTINEL)
+                    if nul == -1:
+                        _write_all_fd(stdout_fd, data)
+                    else:
+                        # Everything before the NUL is genuine MCP stdout; the
+                        # NUL and the rest begin the exit trailer.
+                        if nul:
+                            _write_all_fd(stdout_fd, data[:nul])
+                        in_trailer = True
+                        trailer.extend(data[nul:])
+                        del trailer[MAX_EXIT_TRAILER_BYTES + 1 :]
                 elif key.data == "stdin":
                     try:
                         data = os.read(stdin_fd, _PROXY_CHUNK)
@@ -104,8 +133,9 @@ def _proxy(sock: socket.socket, stdin_fd: int, stdout_fd: int) -> None:
                         continue
                     _send_all(sock, data)
     except OSError:
-        # A broken pipe in either direction ends the session cleanly.
-        pass
+        # A broken pipe in either direction ends the session. We could not read a
+        # complete trailer, so fall back to whatever we buffered (0 if none).
+        return _exit_from_trailer(trailer)
     finally:
         sel.close()
         if stdin_open:
@@ -113,6 +143,22 @@ def _proxy(sock: socket.socket, stdin_fd: int, stdout_fd: int) -> None:
                 sock.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
+
+
+def _exit_from_trailer(trailer: bytearray) -> int:
+    """Decode the buffered exit trailer into an exit code (0 if none/garbled).
+
+    ``trailer`` includes the leading NUL sentinel when present. An absent trailer
+    (older broker, or a connection dropped before the server reported) is treated
+    as a clean exit so the relay never invents a failure; a present-but-garbled
+    trailer also degrades to 0 rather than a misleading non-zero code.
+    """
+    if not trailer.startswith(EXIT_TRAILER_SENTINEL):
+        return 0
+    try:
+        return decode_exit(bytes(trailer[len(EXIT_TRAILER_SENTINEL) :]))
+    except ProtocolError:
+        return 0
 
 
 def _write_all_fd(fd: int, data: bytes) -> None:
@@ -142,7 +188,11 @@ def run(server_name: str, project_key: Optional[str] = None) -> int:
 
     The same signature as the ADR 0013 runner so ``mcp.cli run`` is unchanged.
     On any actionable failure raises :class:`RelayError` with a SECRET-FREE
-    message; on a clean session returns 0.
+    message; otherwise returns the spawned server's own exit code (0 on a clean
+    session, non-zero when the broker-spawned server exited non-zero). The ADR
+    0013 exec wrapper propagated the server's exit code as its own; the broker/
+    relay split preserves that by forwarding the status the broker sends after
+    the server's stdout reaches EOF.
     """
     # Container identity gate — refuse on the host before opening any socket.
     require_container()
@@ -172,8 +222,7 @@ def run(server_name: str, project_key: Optional[str] = None) -> int:
                 f"the devbox MCP broker refused server {server_name!r}: "
                 f"{error or 'no reason given'}"
             )
-        _proxy(sock, sys.stdin.fileno(), sys.stdout.fileno())
-        return 0
+        return _proxy(sock, sys.stdin.fileno(), sys.stdout.fileno())
     finally:
         try:
             sock.close()

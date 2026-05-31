@@ -62,10 +62,11 @@ class _StubBroker:
     ``addCleanup`` so nothing leaks even when an assertion fails mid-test.
     """
 
-    def __init__(self, path, reply_ok=True, error=None):
+    def __init__(self, path, reply_ok=True, error=None, exit_code=0):
         self.path = path
         self.reply_ok = reply_ok
         self.error = error
+        self.exit_code = exit_code
         self.received_request = None
         self._conn = None
         self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -98,10 +99,17 @@ class _StubBroker:
         except OSError:
             pass
         finally:
-            # Half-close OUR write side so the relay's proxy loop sees EOF on the
-            # socket and relay.run() returns. Without this the relay blocks
-            # forever in select() on a socket the stub never closes (the round
-            # trip would hang the whole suite). stop() still does the final close.
+            # Mirror the real broker: after the (echoed) MCP stream ends, send the
+            # NUL-prefixed exit trailer carrying the spawned server's status, THEN
+            # half-close OUR write side so the relay's proxy loop sees EOF and
+            # relay.run() returns that status. Without the SHUT_WR the relay would
+            # block forever in select() on a socket the stub never closes (the
+            # round trip would hang the whole suite). stop() still does the final
+            # close.
+            try:
+                conn.sendall(protocol.encode_exit(self.exit_code))
+            except OSError:
+                pass
             try:
                 conn.shutdown(socket.SHUT_WR)
             except OSError:

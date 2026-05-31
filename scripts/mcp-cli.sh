@@ -84,6 +84,8 @@ Subcommands:
   enable      Resume rendering a previously disabled MCP server.
   disable     Keep a definition but stop rendering it.
   remove      Delete a devbox-managed MCP server definition for one scope.
+  reload      Re-stage changed MCP secrets into running Container(s) without a
+              stop/start (host-initiated momentary root exec; no restart).
 
 Read-only commands in this version:
   devbox mcp import [scope] [--json]            Dry-run discovery report.
@@ -162,6 +164,20 @@ Add (record a new server) path:
       credential) is written to the scope-correct 0600 secret store; values are
       never echoed. A successful add auto-renders unless --no-render. Distinct
       from 'import' (discovers inherited) and 'install' (materializes runtime).
+
+Reload (re-stage secrets into a running Container) path:
+  devbox mcp reload [--global | --project <p>] [--json]
+      Re-stage changed MCP secrets into the running in-scope Container(s) via a
+      momentary 'docker exec -u 0' of the same staging step container start
+      uses — no 'devbox stop'/'start' and no persistent in-container root
+      process. The broker re-reads the staged secrets per spawn, so the NEXT MCP
+      server session in each Container uses the new value (a server already
+      running keeps its environment, the same limit as a restart). Default scope
+      = current Project + global: a global secret change reaches every running
+      devbox Container (each re-stages only its own scope); --project <p> targets
+      that Project's Container only; --global targets every running Container.
+      Run this after an 'import --apply' / 'add' that copied a secret value into
+      a scope whose Container is already running (the command tells you when).
 
 Scope flags (import / list):
   (default)                 Current Project record + global Claude config.
@@ -444,12 +460,16 @@ cmd_import_apply() {
     fi
 
     if [ "$json" = true ]; then
-        _run_py apply-json "${_scope_args[@]}" "${sel_args[@]}" || return $?
-        _maybe_auto_render "$no_render" true
-        return $?
+        _run_py_secret_write apply-json "${_scope_args[@]}" "${sel_args[@]}" || return $?
+        _maybe_auto_render "$no_render" true || { _finish_secret_write; return $?; }
+        _finish_secret_write
+        return 0
     fi
-    _run_py apply-text "${_scope_args[@]}" "${sel_args[@]}" || return $?
+    _run_py_secret_write apply-text "${_scope_args[@]}" "${sel_args[@]}" || return $?
     _maybe_auto_render "$no_render" false
+    local render_rc=$?
+    _finish_secret_write
+    return "$render_rc"
 }
 
 # Auto-render after a successful apply (ADR 0013, issue 07). A mutating profile
@@ -476,6 +496,112 @@ _maybe_auto_render() {
     echo >&2
     echo "Auto-rendering devbox-managed agent entries..." >&2
     _run_py render-write-text >&2
+}
+
+# =============================================================================
+# Secret-change detection prompt (ADR 0014, issue 17)
+# =============================================================================
+# A secret-writing command (`import --apply` / `add` that copies a secret VALUE)
+# stages the value on the host, but a Container that is ALREADY running captured
+# its secrets at start — so the new value does not reach it until a re-stage.
+# After such a command, if a relevant Container is running, tell the user that
+# `devbox mcp reload` will load the staged secrets into it. When no relevant
+# Container is running, stay quiet: the value stages at the Container's next
+# start, so there is nothing to do now.
+#
+# The Python core writes the AFFECTED scopes (global / project<TAB><key>, never a
+# secret value or env name) to the file named by DEVBOX_MCP_SCOPES_OUT when a
+# write copies a secret value. This function reads that file and decides whether
+# any in-scope Container is currently running.
+
+# Print the detection prompt when a relevant Container is running for one of the
+# scopes a secret value was just staged into. SECRET-FREE: names scope/Container
+# and the exact `devbox mcp reload` command only.
+#   $1  path to the scopes file the Python core wrote (may be absent/empty)
+_maybe_secret_reload_prompt() {
+    local scopes_file="$1"
+    [ -f "$scopes_file" ] || return 0
+
+    # docker is required to reach a running Container; without it there is
+    # nothing to reload and nothing to prompt about.
+    command -v docker >/dev/null 2>&1 || return 0
+
+    # Snapshot the running devbox Containers once.
+    local -a running=()
+    local line
+    while IFS= read -r line; do
+        [ -n "$line" ] && running+=("$line")
+    done < <(_running_devbox_containers)
+    [ "${#running[@]}" -eq 0 ] && return 0
+
+    local scope key container c
+    local prompt_global=false
+    local -a prompt_projects=()
+    while IFS=$'\t' read -r scope key; do
+        [ -n "$scope" ] || continue
+        if [ "$scope" = "global" ]; then
+            # A global secret change is relevant to EVERY running Container.
+            prompt_global=true
+        elif [ "$scope" = "project" ] && [ -n "$key" ]; then
+            container="$(_container_for_project_key "$key")"
+            for c in "${running[@]}"; do
+                if [ "$c" = "$container" ]; then
+                    prompt_projects+=("${container#devbox-}")
+                    break
+                fi
+            done
+        fi
+    done < "$scopes_file"
+
+    if [ "$prompt_global" != true ] && [ "${#prompt_projects[@]}" -eq 0 ]; then
+        # Secrets were staged on the host, but no in-scope Container is running —
+        # stay quiet; they stage at the next Container start.
+        return 0
+    fi
+
+    echo >&2
+    echo "Secrets were staged on the host. A running Container captured its" >&2
+    echo "secrets at start, so re-stage to load the new value(s) into it:" >&2
+    if [ "$prompt_global" = true ]; then
+        echo "  devbox mcp reload            (all running Containers; each its own scope)" >&2
+    else
+        # Project-only scope(s): name the specific Container(s) to reload.
+        local p
+        for p in "${prompt_projects[@]}"; do
+            echo "  devbox mcp reload --project ${p}" >&2
+        done
+    fi
+    echo "Without a reload, the new value reaches a Container at its next start." >&2
+}
+
+# Run a secret-writing Python core command (apply-*/add-*) with the scopes-out
+# side channel enabled, then emit the detection prompt. The command and its args
+# are passed positionally; the caller handles its exit status via the returned
+# code. A temp file collects the affected scopes (secret-free) for the prompt.
+#   $1.. the _run_py command and arguments
+_run_py_secret_write() {
+    local scopes_file rc=0
+    scopes_file="$(mktemp "${TMPDIR:-/tmp}/devbox-mcp-scopes.XXXXXX")" || scopes_file=""
+    if [ -n "$scopes_file" ]; then
+        DEVBOX_MCP_SCOPES_OUT="$scopes_file" _run_py "$@" || rc=$?
+    else
+        _run_py "$@" || rc=$?
+    fi
+    # Stash the path so the caller can prompt after auto-render (which prints its
+    # own output); the prompt belongs last so it is the final thing the user sees.
+    _LAST_SECRET_SCOPES_FILE="$scopes_file"
+    return "$rc"
+}
+
+# Clean up and prompt from the last secret-write's scopes file. Call after
+# auto-render so the reload hint is the final line. Removes the temp file.
+_finish_secret_write() {
+    local scopes_file="${_LAST_SECRET_SCOPES_FILE:-}"
+    _LAST_SECRET_SCOPES_FILE=""
+    if [ -n "$scopes_file" ]; then
+        _maybe_secret_reload_prompt "$scopes_file"
+        rm -f "$scopes_file"
+    fi
 }
 
 # =============================================================================
@@ -1087,6 +1213,90 @@ cmd_remove() {
     _maybe_auto_render "$no_render" false
 }
 
+# --- reload (re-stage secrets into running Containers) -----------------------
+
+# `devbox mcp reload [--global|--project <p>] [--json]` re-stages changed MCP
+# secrets into the running in-scope Container(s) via a momentary root exec of the
+# reusable staging step (no stop/start, no persistent root — ADR 0003/0014).
+# Targeting and the docker exec live in the Python core (mcp.reload), so it is
+# unit-tested with a mocked docker; this front-end only resolves the scope and
+# (for a Project) the target Container name.
+#   * default / --global -> every running devbox Container (each re-stages only
+#     its own scope: global + its own Project — never a foreign Project's);
+#   * --project <p>       -> that Project's Container only.
+cmd_reload() {
+    local json=false is_global=false project_token=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -h|--help) _usage; return 0 ;;
+            --json) json=true ;;
+            --global) is_global=true ;;
+            --project)
+                shift
+                if [ "$#" -eq 0 ]; then
+                    echo "'mcp reload --project' requires a name or path." >&2
+                    return 2
+                fi
+                project_token="$1"
+                ;;
+            --project=*)
+                project_token="${1#--project=}"
+                if [ -z "$project_token" ]; then
+                    echo "'mcp reload --project=' requires a non-empty name or path." >&2
+                    return 2
+                fi
+                ;;
+            -*)
+                echo "Unknown flag for 'mcp reload': $1" >&2
+                return 2
+                ;;
+            *)
+                echo "Unexpected argument for 'mcp reload': $1" >&2
+                return 2
+                ;;
+        esac
+        shift
+    done
+
+    if [ "$is_global" = true ] && [ -n "$project_token" ]; then
+        echo "'mcp reload': --global and --project are mutually exclusive." >&2
+        return 2
+    fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "'mcp reload' re-stages secrets into a running Container and needs Docker." >&2
+        return 2
+    fi
+
+    local py_cmd
+    if [ "$json" = true ]; then
+        py_cmd="reload-json"
+    else
+        py_cmd="reload-text"
+    fi
+
+    if [ -n "$project_token" ]; then
+        # A Project reload targets that Project's Container only. Resolve the
+        # token to its absolute key, derive the container name from the sanitized
+        # basename (ADR 0005), and pass a display label for the summary.
+        local key container label
+        if ! key="$(_resolve_project_key "$project_token")"; then
+            return 2
+        fi
+        container="$(_container_for_project_key "$key")"
+        label="${container#devbox-}"
+        _run_py "$py_cmd" --scope project --container "$container" \
+            --project-label "$label"
+        return $?
+    fi
+
+    # Default scope (and --global): re-stage every running devbox Container. Each
+    # one stages only its OWN scope (global + its own Project), so a global secret
+    # change reaches all of them without leaking one Project's secrets to another,
+    # AND the current Project's Container is covered too.
+    _run_py "$py_cmd" --scope global
+}
+
 cmd_doctor() {
     local json=false
     local -a args=()
@@ -1610,12 +1820,16 @@ cmd_add() {
     fi
 
     if [ "$json" = true ]; then
-        _run_py "$py_cmd" "${scope_args[@]}" "$name" -- "${spec[@]}" || return $?
-        _maybe_auto_render "$no_render" true
-        return $?
+        _run_py_secret_write "$py_cmd" "${scope_args[@]}" "$name" -- "${spec[@]}" || return $?
+        _maybe_auto_render "$no_render" true || { _finish_secret_write; return $?; }
+        _finish_secret_write
+        return 0
     fi
-    _run_py "$py_cmd" "${scope_args[@]}" "$name" -- "${spec[@]}" || return $?
+    _run_py_secret_write "$py_cmd" "${scope_args[@]}" "$name" -- "${spec[@]}" || return $?
     _maybe_auto_render "$no_render" false
+    local render_rc=$?
+    _finish_secret_write
+    return "$render_rc"
 }
 
 # --- Dispatch ----------------------------------------------------------------
@@ -1636,6 +1850,7 @@ main() {
         enable)  cmd_enable "$@" ;;
         disable) cmd_disable "$@" ;;
         remove)  cmd_remove "$@" ;;
+        reload)  cmd_reload "$@" ;;
         doctor)  cmd_doctor "$@" ;;
         install) cmd_install "$@" ;;
         add)     cmd_add "$@" ;;

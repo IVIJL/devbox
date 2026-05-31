@@ -82,6 +82,43 @@ def _emit(payload: dict) -> int:
     return 0
 
 
+def _emit_secret_scopes(scopes: list[tuple[str, str]]) -> None:
+    """Write the SECRET-FREE scopes a write copied a secret VALUE into.
+
+    Issue 17 detection-prompt plumbing. When the host shell front-end sets
+    ``DEVBOX_MCP_SCOPES_OUT`` to a file path, an ``apply`` / ``add`` that copies
+    a secret VALUE writes the affected scopes there (one ``global`` or
+    ``project<TAB><absolute-key>`` line each, de-duplicated), so the front-end
+    can decide whether a running Container needs ``devbox mcp reload``. The file
+    is host-side plumbing and carries scope labels + project KEYS only — never an
+    env-key NAME or a secret VALUE. When the env var is unset (the normal direct
+    invocation), nothing is written.
+
+    Best-effort: a write failure must never fail the user's apply/add, so any
+    OSError is swallowed (the prompt is an advisory, not a correctness gate).
+    """
+    out_path = os.environ.get("DEVBOX_MCP_SCOPES_OUT")
+    if not out_path:
+        return
+    seen: set[tuple[str, str]] = set()
+    lines: list[str] = []
+    for scope, project_key in scopes:
+        key = (scope, project_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        if scope == "project" and project_key:
+            lines.append(f"project\t{project_key}")
+        else:
+            lines.append("global")
+    try:
+        with open(out_path, "w", encoding="utf-8") as fh:
+            for line in lines:
+                fh.write(line + "\n")
+    except OSError:
+        pass
+
+
 class _Scope:
     def __init__(self) -> None:
         self.project_keys: list[str] = []
@@ -488,6 +525,9 @@ def _apply_payload(merged: list[MergedCandidate], sel: _Selection) -> dict:
     except ApplyConflictError as exc:
         sys.stderr.write(f"mcp.cli: {exc}\n")
         return {"error": "conflict"}
+    _emit_secret_scopes(
+        [(a.scope, a.project_key) for a in result.applied if a.copied_secret_keys]
+    )
     return result.to_dict()
 
 
@@ -508,6 +548,12 @@ def _render_apply_text(merged: list[MergedCandidate], sel: _Selection) -> int:
     except ApplyConflictError as exc:
         sys.stderr.write(f"mcp.cli: {exc}\n")
         return 2
+
+    # Issue 17: surface the scopes a secret VALUE landed in so the host front-end
+    # can prompt for `devbox mcp reload` when a relevant Container is running.
+    _emit_secret_scopes(
+        [(a.scope, a.project_key) for a in result.applied if a.copied_secret_keys]
+    )
 
     if not result.applied and not result.skipped:
         sys.stdout.write("No candidates applied.\n")
@@ -1459,6 +1505,12 @@ def _cmd_add(argv: list[str], as_json: bool) -> int:
         sys.stderr.write(f"mcp.cli: {exc}\n")
         return 2
 
+    # Issue 17: an add that copied an inline secret VALUE may need a
+    # `devbox mcp reload` to reach a running Container; tell the host front-end
+    # which scope (labels/keys only, never a secret value).
+    if result.copied_secret_keys:
+        _emit_secret_scopes([(result.scope, result.project_key)])
+
     if as_json:
         return _emit(result.to_dict())
 
@@ -1483,6 +1535,123 @@ def _cmd_add(argv: list[str], as_json: bool) -> int:
         "render step that follows (use --no-render to skip it).\n"
     )
     return 0
+
+
+def _render_reload_text(result) -> int:
+    """Human-readable `devbox mcp reload` summary (SECRET-FREE).
+
+    Reports which running Containers were re-staged for the resolved scope, and
+    names a requested Project Container that was not running (a no-op: the
+    changed secret stages at its next start). Exit code is 1 when any re-stage
+    failed, so a scripted reload sees the failure.
+    """
+    if not result.reloaded and not result.not_running:
+        sys.stdout.write(
+            "No running devbox Container in scope; nothing to reload. "
+            "Changed secrets will be staged at the next Container start.\n"
+        )
+        return 0
+    for c in result.reloaded:
+        if c.ok:
+            sys.stdout.write(
+                f"Re-staged MCP secrets into running Container {c.container!r} "
+                f"({result.scope_label} scope).\n"
+            )
+        else:
+            sys.stdout.write(
+                f"Failed to re-stage MCP secrets into {c.container!r}: "
+                f"{c.output or 'unknown error'}\n"
+            )
+    for name in result.not_running:
+        sys.stdout.write(
+            f"Container {name!r} is not running; nothing to reload "
+            "(secrets stage at its next start).\n"
+        )
+    if result.reloaded:
+        sys.stdout.write(
+            "\nThe broker re-reads staged secrets per spawn, so the NEXT MCP "
+            "server session in each Container uses the new value. A server "
+            "already running keeps its environment (same limit as a restart).\n"
+        )
+    return 1 if result.any_failed else 0
+
+
+def _cmd_reload(argv: list[str], as_json: bool) -> int:
+    """`devbox mcp reload`: re-stage secrets into running in-scope Container(s).
+
+    Args: ``--scope <global|project> [--container <name>] [--project-label <l>]
+    [--docker-bin <path>]``. The host shell front-end resolves the scope and (for
+    a Project) the target Container name + display label before invoking; this
+    core owns only the targeting + the momentary ``docker exec -u 0`` of the
+    reusable staging step (``mcp.reload``). SECRET-FREE: container names + scope
+    labels only.
+    """
+    from .reload import DockerExec, ReloadError, reload_secrets
+
+    scope = ""
+    container = ""
+    project_label = ""
+    docker_bin = "docker"
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--scope":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: reload: --scope requires a value\n")
+                return 2
+            scope = argv[i]
+        elif arg == "--container":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: reload: --container requires a value\n")
+                return 2
+            container = argv[i]
+        elif arg == "--project-label":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write(
+                    "mcp.cli: reload: --project-label requires a value\n"
+                )
+                return 2
+            project_label = argv[i]
+        elif arg == "--docker-bin":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: reload: --docker-bin requires a value\n")
+                return 2
+            docker_bin = argv[i]
+        else:
+            sys.stderr.write(f"mcp.cli: reload: unknown argument {arg!r}\n")
+            return 2
+        i += 1
+
+    if scope not in ("global", "project"):
+        sys.stderr.write(
+            "mcp.cli: reload requires --scope global|project\n"
+        )
+        return 2
+    if scope == "project" and not container:
+        sys.stderr.write(
+            "mcp.cli: reload --scope project requires --container <name>\n"
+        )
+        return 2
+
+    try:
+        result = reload_secrets(
+            scope,
+            container_name=container or None,
+            project_label=project_label or None,
+            docker=DockerExec(docker_bin=docker_bin),
+        )
+    except ReloadError as exc:
+        sys.stderr.write(f"mcp.cli: reload: {exc}\n")
+        return 2
+
+    if as_json:
+        _emit(result.to_dict())
+        return 1 if result.any_failed else 0
+    return _render_reload_text(result)
 
 
 def _cmd_project_targets(argv: list[str], as_json: bool) -> int:
@@ -1694,6 +1863,10 @@ def main(argv: list[str]) -> int:
         for key in ClaudeProvider().project_keys():
             sys.stdout.write(key + "\n")
         return 0
+    if command == "reload-json":
+        return _cmd_reload(rest, as_json=True)
+    if command == "reload-text":
+        return _cmd_reload(rest, as_json=False)
     if command == "project-targets-json":
         return _cmd_project_targets(rest, as_json=True)
     if command == "project-targets-text":

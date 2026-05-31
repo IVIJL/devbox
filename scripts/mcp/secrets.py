@@ -29,7 +29,7 @@ import os
 import stat
 from typing import Any, Optional
 
-from .profile import _sanitize_project, config_root
+from .profile import _sanitize_project, config_root, ensure_store_dir
 
 SECRETS_VERSION = 1
 
@@ -96,8 +96,14 @@ def save_secrets(path: str, store: dict[str, Any]) -> None:
     values never momentarily exist in a world-readable file. The final file is
     chmodded again after ``os.replace`` to defend against a pre-existing target
     with looser permissions.
+
+    The store dir is made traversable+readable (o+rx via `ensure_store_dir`)
+    so the broker can always reach the NON-SECRET profile that shares this dir
+    (ADR 0014), even when the secret store is written first under a restrictive
+    umask. Secret VALUES stay protected by the per-FILE 0600 below, never by
+    the dir mode.
     """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ensure_store_dir(os.path.dirname(path))
     tmp = path + ".tmp"
     # Remove any stale temp file first so O_EXCL below always creates a fresh
     # one. A pre-existing temp (from a crashed run or manual creation) could

@@ -32,6 +32,39 @@ from typing import Any, Optional
 # future migrations can branch on it.
 PROFILE_VERSION = 1
 
+# The profile store dir (and its ``projects/`` subdir) hold NON-SECRET profile
+# JSON that the Container MCP broker, running as ``devbox-mcp`` (a different UID
+# than the host writer), must always be able to traverse and read over the
+# read-only bind-mount (ADR 0014). The dir is force-set traversable+readable
+# (o+rx) and non-secret profile files force-set readable (o+r), independent of
+# the host umask, so a restrictive host umask never makes the secret-free
+# profile unreadable to the broker. Secret VALUES are protected per-file: the
+# secret store force-chmods its own files 0600 (mcp.secrets), so a traversable
+# shared dir does not expose them.
+_STORE_DIR_MODE = 0o755
+_PROFILE_FILE_MODE = 0o644
+
+
+def ensure_store_dir(path: str) -> None:
+    """Create ``path`` and force it traversable+readable (o+rx), umask-proof.
+
+    Used for the MCP store dir and its ``projects/`` subdir so the broker
+    (a distinct UID) can always reach the bind-mounted NON-SECRET profile.
+    Secret files inside are still protected per-file (mcp.secrets force-chmods
+    them 0600), so a traversable dir does not leak any credential.
+
+    Both ``path`` and the store root (``config_root()``) are force-chmodded.
+    When writing a project file, ``path`` is the ``projects/`` subdir and its
+    parent ``config_root()`` is only an implicit ``makedirs`` parent — it would
+    otherwise keep the host umask and block the broker from traversing down to
+    the profile mounted at the store root.
+    """
+    os.makedirs(path, exist_ok=True)
+    os.chmod(path, _STORE_DIR_MODE)
+    root = config_root()
+    if os.path.isdir(root):
+        os.chmod(root, _STORE_DIR_MODE)
+
 
 def config_root() -> str:
     """Root of devbox's MCP state, honoring ``XDG_CONFIG_HOME``.
@@ -130,15 +163,24 @@ def load_profile(path: str) -> dict[str, Any]:
 def save_profile(path: str, profile: dict[str, Any]) -> None:
     """Write a profile file atomically (parent dirs created as needed).
 
-    The profile is non-secret, so default permissions are fine — unlike the
-    secret store, which is force-chmodded 0600 in `mcp.secrets`.
+    The profile is NON-SECRET, but the Container MCP broker (a different UID
+    than the host writer) must always be able to read it over the read-only
+    bind-mount (ADR 0014). So both the store dir and the file are force-set
+    broker-readable independent of the host umask: the dir is made traversable
+    (o+rx via `ensure_store_dir`) and the file readable (o+r). Unlike the
+    secret store — force-chmodded 0600 in `mcp.secrets` — these carry no
+    credential, and secrets in the same dir stay protected per-file.
     """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ensure_store_dir(os.path.dirname(path))
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(profile, fh, indent=2, sort_keys=False)
         fh.write("\n")
     os.replace(tmp, path)
+    # Force the final file broker-readable regardless of the host umask (it is
+    # non-secret). chmod the post-replace path so a pre-existing stricter file
+    # is loosened too.
+    os.chmod(path, _PROFILE_FILE_MODE)
 
 
 def build_server_entry(

@@ -220,3 +220,13 @@ privileged runtime path:
   trust-boundary subsection): peers share the `devbox-mcp` UID and can read each
   other's secrets via `/proc/<pid>/environ`. This is an accepted non-goal,
   documented here and in the README MCP section.
+- Spawned servers run as `devbox-mcp`, not as the agent user `node` (host UID
+  1000), so they have **no write access to the workspace** bind-mount (owned by
+  `node`/UID 1000) and **cannot read private `0600` project files**; ordinary
+  group/other-readable `0644` files they can still read. The v1 Container servers
+  (`context7`, `taskmaster-ai`) are read-only/API-based and do not touch the
+  workspace, so they are unaffected. **Filesystem-type servers that MUTATE the
+  workspace are not supported in this version.** This is the same trade-off
+  family as peer isolation above — running servers under `node` would re-expose
+  their secrets to the agent — and closing it is the same future decision
+  (per-server distinct UIDs requiring runtime privilege outside ADR 0003).

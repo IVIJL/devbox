@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -50,6 +51,7 @@ from mcp.profile import (  # noqa: E402
     global_profile_path,
     project_profile_path,
     load_profile,
+    save_profile,
 )
 from mcp.secrets import (  # noqa: E402
     file_mode,
@@ -679,6 +681,59 @@ class DoctorFixTests(LifecycleEnv):
         joined = " ".join(result.actions).lower()
         for forbidden in ("install", "allow", "purge", "enable"):
             self.assertNotIn(forbidden, joined)
+
+
+def _mode(path: str) -> int:
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+class StorePermsBrokerReadable(LifecycleEnv):
+    """The Container MCP broker (a distinct UID) must always be able to
+    traverse the store dir and read the NON-SECRET profile (ADR 0014),
+    independent of the host umask. Secret files stay 0600."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._saved_umask = os.umask(0o077)
+        self.addCleanup(os.umask, self._saved_umask)
+
+    def test_profile_and_dir_broker_readable_under_restrictive_umask(self) -> None:
+        path = global_profile_path()
+        save_profile(path, {"version": 1, "servers": {}})
+        # Profile file is o+r despite umask 0077.
+        self.assertEqual(_mode(path), 0o644)
+        # Store dir is traversable+readable (o+rx).
+        self.assertEqual(_mode(os.path.dirname(path)), 0o755)
+
+    def test_project_profile_subdir_broker_readable(self) -> None:
+        path = project_profile_path(_PROJECT_KEY)
+        save_profile(path, {"version": 1, "servers": {}})
+        self.assertEqual(_mode(path), 0o644)
+        # The projects/ subdir must also be traversable for the broker.
+        self.assertEqual(_mode(os.path.dirname(path)), 0o755)
+        # config_root() itself (parent of projects/) is traversable too.
+        self.assertEqual(
+            _mode(os.path.dirname(os.path.dirname(path))), 0o755
+        )
+
+    def test_secret_file_stays_0600_with_traversable_dir(self) -> None:
+        # Write a secret first (under restrictive umask) ...
+        spath = global_secrets_path()
+        store_server_secrets(spath, "gh", {"GITHUB_TOKEN": _SECRET_VALUE})
+        # ... then a profile into the shared dir.
+        save_profile(global_profile_path(), {"version": 1, "servers": {}})
+        # Secret file is owner-only despite the dir being traversable.
+        self.assertEqual(file_mode(spath), 0o600)
+        # Shared dir is traversable so the broker can reach the profile.
+        self.assertEqual(_mode(os.path.dirname(spath)), 0o755)
+
+    def test_secret_written_first_still_leaves_dir_traversable(self) -> None:
+        # If the secret store is the first writer (restrictive umask), the
+        # shared dir must still end up traversable for the broker.
+        spath = global_secrets_path()
+        store_server_secrets(spath, "gh", {"GITHUB_TOKEN": _SECRET_VALUE})
+        self.assertEqual(_mode(os.path.dirname(spath)), 0o755)
+        self.assertEqual(file_mode(spath), 0o600)
 
 
 if __name__ == "__main__":
